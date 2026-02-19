@@ -12,6 +12,9 @@ const KIRO_AUTH_PORTAL_URL: &str = "https://app.kiro.dev/signin";
 const KIRO_TOKEN_ENDPOINT: &str = "https://prod.us-east-1.auth.desktop.kiro.dev/oauth/token";
 const KIRO_REFRESH_ENDPOINT: &str = "https://prod.us-east-1.auth.desktop.kiro.dev/refreshToken";
 const KIRO_RUNTIME_DEFAULT_ENDPOINT: &str = "https://q.us-east-1.amazonaws.com";
+const KIRO_ACCOUNT_STATUS_NORMAL: &str = "normal";
+const KIRO_ACCOUNT_STATUS_BANNED: &str = "banned";
+const KIRO_ACCOUNT_STATUS_ERROR: &str = "error";
 const OAUTH_TIMEOUT_SECONDS: u64 = 600;
 const OAUTH_POLL_INTERVAL_MS: u64 = 250;
 const CALLBACK_PORT_CANDIDATES: [u16; 10] = [
@@ -85,6 +88,46 @@ fn normalize_email(value: Option<String>) -> Option<String> {
             Some(trimmed.to_string())
         }
     })
+}
+
+fn set_payload_status(payload: &mut KiroOAuthCompletePayload, status: &str, reason: Option<String>) {
+    payload.status = Some(status.to_string());
+    payload.status_reason = reason.and_then(|raw| normalize_non_empty(Some(raw.as_str())));
+}
+
+fn parse_runtime_error_reason(body: &str) -> Option<String> {
+    let parsed = serde_json::from_str::<Value>(body).ok()?;
+    let direct_reason = pick_string(
+        Some(&parsed),
+        &[
+            &["reason"],
+            &["message"],
+            &["errorMessage"],
+            &["error", "message"],
+            &["error", "reason"],
+            &["detail"],
+            &["details"],
+        ],
+    );
+    if let Some(reason) = direct_reason.and_then(|raw| normalize_non_empty(Some(raw.as_str()))) {
+        return Some(reason);
+    }
+
+    if let Some(code) = pick_string(
+        Some(&parsed),
+        &[&["error"], &["code"], &["errorCode"], &["error", "code"]],
+    )
+    .and_then(|raw| normalize_non_empty(Some(raw.as_str())))
+    {
+        return Some(code);
+    }
+
+    None
+}
+
+fn parse_banned_reason_from_error(err: &str) -> Option<String> {
+    err.strip_prefix("BANNED:")
+        .and_then(|raw| normalize_non_empty(Some(raw)))
 }
 
 fn get_path_value<'a>(root: &'a Value, path: &[&str]) -> Option<&'a Value> {
@@ -1164,6 +1207,8 @@ pub(crate) fn build_payload_from_snapshot(
         kiro_auth_token_raw: Some(auth_token),
         kiro_profile_raw: normalized_profile,
         kiro_usage_raw: usage,
+        status: None,
+        status_reason: None,
     })
 }
 
@@ -1192,6 +1237,8 @@ pub fn payload_from_account(account: &KiroAccount) -> KiroOAuthCompletePayload {
         kiro_auth_token_raw: account.kiro_auth_token_raw.clone(),
         kiro_profile_raw: account.kiro_profile_raw.clone(),
         kiro_usage_raw: account.kiro_usage_raw.clone(),
+        status: account.status.clone(),
+        status_reason: account.status_reason.clone(),
     }
 }
 
@@ -1262,6 +1309,11 @@ async fn fetch_usage_limits_via_runtime(
         .unwrap_or_else(|_| "<no-body>".to_string());
 
     if !status.is_success() {
+        let reason = parse_runtime_error_reason(&body)
+            .or_else(|| (status == reqwest::StatusCode::FORBIDDEN).then(|| body.clone()));
+        if let Some(reason) = reason {
+            return Err(format!("BANNED:{}", reason));
+        }
         return Err(format!(
             "Kiro runtime usage 接口返回异常: status={}, body={}",
             status, body
@@ -1494,9 +1546,15 @@ pub async fn enrich_payload_with_runtime_usage(
     match first_try {
         Ok(usage) => {
             apply_runtime_usage_to_payload(&mut payload, usage);
+            set_payload_status(&mut payload, KIRO_ACCOUNT_STATUS_NORMAL, None);
             return payload;
         }
         Err(err) => {
+            if let Some(reason) = parse_banned_reason_from_error(&err) {
+                set_payload_status(&mut payload, KIRO_ACCOUNT_STATUS_BANNED, Some(reason));
+                return payload;
+            }
+            set_payload_status(&mut payload, KIRO_ACCOUNT_STATUS_ERROR, Some(err.clone()));
             logger::log_warn(&format!(
                 "[Kiro Refresh] runtime usage 首次请求失败，准备尝试 refresh token: {}",
                 err
@@ -1517,6 +1575,7 @@ pub async fn enrich_payload_with_runtime_usage(
             merge_refreshed_auth_token_into_payload(&mut payload, auth_token);
         }
         Err(err) => {
+            set_payload_status(&mut payload, KIRO_ACCOUNT_STATUS_ERROR, Some(err.clone()));
             logger::log_warn(&format!(
                 "[Kiro Refresh] refresh token 失败，跳过 runtime usage 回填: {}",
                 err
@@ -1531,8 +1590,14 @@ pub async fn enrich_payload_with_runtime_usage(
     {
         Ok(usage) => {
             apply_runtime_usage_to_payload(&mut payload, usage);
+            set_payload_status(&mut payload, KIRO_ACCOUNT_STATUS_NORMAL, None);
         }
         Err(err) => {
+            if let Some(reason) = parse_banned_reason_from_error(&err) {
+                set_payload_status(&mut payload, KIRO_ACCOUNT_STATUS_BANNED, Some(reason));
+            } else {
+                set_payload_status(&mut payload, KIRO_ACCOUNT_STATUS_ERROR, Some(err.clone()));
+            }
             logger::log_warn(&format!(
                 "[Kiro Refresh] runtime usage 二次请求失败: {}",
                 err

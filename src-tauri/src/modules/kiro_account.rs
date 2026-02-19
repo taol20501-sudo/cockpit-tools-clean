@@ -24,6 +24,40 @@ fn now_ts() -> i64 {
     chrono::Utc::now().timestamp()
 }
 
+fn normalize_status_value(value: Option<&str>) -> Option<String> {
+    value.and_then(|raw| {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_ascii_lowercase())
+        }
+    })
+}
+
+fn is_banned_status(value: Option<&str>) -> bool {
+    matches!(
+        normalize_status_value(value).as_deref(),
+        Some("banned") | Some("ban") | Some("forbidden")
+    )
+}
+
+fn is_banned_reason(value: Option<&str>) -> bool {
+    let Some(reason) = normalize_status_value(value) else {
+        return false;
+    };
+    reason.contains("banned")
+        || reason.contains("forbidden")
+        || reason.contains("suspended")
+        || reason.contains("disabled")
+        || reason.contains("封禁")
+        || reason.contains("禁用")
+}
+
+fn is_banned_account(account: &KiroAccount) -> bool {
+    is_banned_status(account.status.as_deref()) || is_banned_reason(account.status_reason.as_deref())
+}
+
 fn get_data_dir() -> Result<PathBuf, String> {
     account::get_data_dir()
 }
@@ -375,6 +409,8 @@ fn merge_duplicate_account(primary: &mut KiroAccount, duplicate: &KiroAccount) {
     );
     fill_if_none(&mut primary.kiro_profile_raw, &duplicate.kiro_profile_raw);
     fill_if_none(&mut primary.kiro_usage_raw, &duplicate.kiro_usage_raw);
+    fill_if_none(&mut primary.status, &duplicate.status);
+    fill_if_none(&mut primary.status_reason, &duplicate.status_reason);
 
     primary.tags = merge_string_list(primary.tags.clone(), duplicate.tags.clone());
     primary.created_at = primary.created_at.min(duplicate.created_at);
@@ -568,6 +604,8 @@ fn apply_payload(account: &mut KiroAccount, payload: KiroOAuthCompletePayload) {
     account.kiro_auth_token_raw = payload.kiro_auth_token_raw;
     account.kiro_profile_raw = payload.kiro_profile_raw;
     account.kiro_usage_raw = payload.kiro_usage_raw;
+    account.status = payload.status;
+    account.status_reason = payload.status_reason;
     account.last_used = now_ts();
 }
 
@@ -644,6 +682,8 @@ pub fn upsert_account(payload: KiroOAuthCompletePayload) -> Result<KiroAccount, 
         kiro_auth_token_raw: payload.kiro_auth_token_raw.clone(),
         kiro_profile_raw: payload.kiro_profile_raw.clone(),
         kiro_usage_raw: payload.kiro_usage_raw.clone(),
+        status: payload.status.clone(),
+        status_reason: payload.status_reason.clone(),
         created_at,
         last_used: now,
     });
@@ -698,8 +738,21 @@ pub async fn refresh_all_tokens() -> Result<Vec<(String, Result<KiroAccount, Str
 
     const MAX_CONCURRENT: usize = 5;
     let accounts = list_accounts();
+    let total = accounts.len();
+    let active_accounts: Vec<KiroAccount> = accounts
+        .into_iter()
+        .filter(|account| !is_banned_account(account))
+        .collect();
+    let skipped_banned = total.saturating_sub(active_accounts.len());
+    if skipped_banned > 0 {
+        logger::log_info(&format!(
+            "[Kiro Refresh] 跳过封禁账号: skipped={}, total={}",
+            skipped_banned, total
+        ));
+    }
+
     let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT));
-    let tasks: Vec<_> = accounts
+    let tasks: Vec<_> = active_accounts
         .into_iter()
         .map(|account| {
             let id = account.id;
@@ -1070,6 +1123,7 @@ fn pick_quota_alert_recommendation(
     let mut candidates: Vec<KiroAccount> = accounts
         .iter()
         .filter(|account| account.id != current_id)
+        .filter(|account| !is_banned_account(account))
         .filter(|account| !extract_quota_metrics(account).is_empty())
         .cloned()
         .collect();
@@ -1108,6 +1162,9 @@ pub fn run_quota_alert_if_needed(
         Some(account) => account,
         None => return Ok(None),
     };
+    if is_banned_account(current) {
+        return Ok(None);
+    }
 
     let metrics = extract_quota_metrics(current);
     let low_models: Vec<(String, i32)> = metrics
