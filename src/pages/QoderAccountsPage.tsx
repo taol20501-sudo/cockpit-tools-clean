@@ -200,6 +200,7 @@ export function QoderAccountsPage() {
   const [oauthUrlCopied, setOauthUrlCopied] = useState(false);
   const oauthSessionRef = useRef<string | null>(null);
   const oauthCompletingLoginIdRef = useRef<string | null>(null);
+  const oauthAttemptSeqRef = useRef(0);
   const handlePrepareOauthRef = useRef<(() => Promise<void>) | undefined>(undefined);
   const [message, setMessage] = useState<{ text: string; tone?: 'error' } | null>(null);
   const [refreshing, setRefreshing] = useState<string | null>(null);
@@ -247,6 +248,7 @@ export function QoderAccountsPage() {
   }, []);
 
   const resetOauthState = useCallback(() => {
+    oauthAttemptSeqRef.current += 1;
     oauthSessionRef.current = null;
     oauthCompletingLoginIdRef.current = null;
     setOauthLoginId(null);
@@ -303,6 +305,7 @@ export function QoderAccountsPage() {
 
   useEffect(() => {
     if (!showAddModal) {
+      oauthAttemptSeqRef.current += 1;
       const loginId = oauthSessionRef.current ?? oauthLoginId ?? undefined;
       if (loginId) {
         logQoderOauthUi('session:cancel-on-modal-close', { loginId });
@@ -318,6 +321,7 @@ export function QoderAccountsPage() {
 
   useEffect(() => {
     if (!showAddModal || addTab === 'oauth') return;
+    oauthAttemptSeqRef.current += 1;
     const loginId = oauthSessionRef.current ?? oauthLoginId ?? undefined;
     if (loginId) {
       logQoderOauthUi('session:cancel-on-tab-change', { loginId, addTab });
@@ -325,6 +329,20 @@ export function QoderAccountsPage() {
     }
     resetOauthState();
   }, [addTab, oauthLoginId, resetOauthState, showAddModal]);
+
+  useEffect(
+    () => () => {
+      oauthAttemptSeqRef.current += 1;
+      const loginId = oauthSessionRef.current ?? undefined;
+      if (loginId) {
+        logQoderOauthUi('session:cancel-on-unmount', { loginId });
+        void qoderService.qoderOauthLoginCancel(loginId).catch(() => {});
+      }
+      oauthSessionRef.current = null;
+      oauthCompletingLoginIdRef.current = null;
+    },
+    [],
+  );
 
   useEffect(() => {
     if (!showTagFilter) return;
@@ -685,10 +703,12 @@ export function QoderAccountsPage() {
 
   const handlePrepareOauth = useCallback(async () => {
     if (oauthPreparing || oauthCompleting) return;
+    const attemptSeq = ++oauthAttemptSeqRef.current;
     logQoderOauthUi('prepare:start', {
       oauthPreparing,
       oauthCompleting,
       hasExistingSession: Boolean(oauthSessionRef.current ?? oauthLoginId),
+      attemptSeq,
     });
     const previousLoginId = oauthSessionRef.current ?? oauthLoginId ?? undefined;
     if (previousLoginId) {
@@ -715,6 +735,7 @@ export function QoderAccountsPage() {
           .qoderOauthLoginComplete(loginId)
           .then(async () => {
             logQoderOauthUi('complete:resolved', { loginId });
+            if (attemptSeq !== oauthAttemptSeqRef.current) return;
             if (oauthSessionRef.current !== loginId) return;
             await store.fetchAccounts();
             setAddStatus('success');
@@ -730,6 +751,7 @@ export function QoderAccountsPage() {
               loginId,
               error: String(error),
             });
+            if (attemptSeq !== oauthAttemptSeqRef.current) return;
             if (oauthSessionRef.current !== loginId) return;
             const msg = String(error);
             setOauthError(msg);
@@ -748,6 +770,14 @@ export function QoderAccountsPage() {
           QODER_OAUTH_START_TIMEOUT_MS,
           QODER_OAUTH_START_TIMEOUT_ERROR,
         );
+        if (attemptSeq !== oauthAttemptSeqRef.current) {
+          void qoderService.qoderOauthLoginCancel(response.loginId).catch(() => {});
+          logQoderOauthUi('prepare:start-stale-after-start', {
+            loginId: response.loginId,
+            attemptSeq,
+          });
+          return;
+        }
         logQoderOauthUi('prepare:invoke-resolved', {
           loginId: response.loginId,
           verificationUri: response.verificationUri?.slice(0, 60),
@@ -769,6 +799,7 @@ export function QoderAccountsPage() {
 
         let peeked: qoderService.QoderOAuthStartResponse | null = null;
         for (let attempt = 1; attempt <= QODER_OAUTH_PEEK_RETRY_MAX; attempt += 1) {
+          if (attemptSeq !== oauthAttemptSeqRef.current) return;
           const pending = await withTimeout(
             qoderService.qoderOauthLoginPeek(),
             QODER_OAUTH_PEEK_TIMEOUT_MS,
@@ -782,6 +813,12 @@ export function QoderAccountsPage() {
             });
             return null;
           });
+          if (attemptSeq !== oauthAttemptSeqRef.current) {
+            if (pending?.loginId) {
+              void qoderService.qoderOauthLoginCancel(pending.loginId).catch(() => {});
+            }
+            return;
+          }
           if (pending?.loginId && pending?.verificationUri) {
             peeked = pending;
             logQoderOauthUi('prepare:peek-hit', {
@@ -798,6 +835,15 @@ export function QoderAccountsPage() {
           throw startError;
         }
         response = peeked;
+      }
+
+      if (attemptSeq !== oauthAttemptSeqRef.current) {
+        void qoderService.qoderOauthLoginCancel(response.loginId).catch(() => {});
+        logQoderOauthUi('prepare:start-stale-before-apply', {
+          loginId: response.loginId,
+          attemptSeq,
+        });
+        return;
       }
 
       const loginId = response.loginId;
@@ -826,6 +872,7 @@ export function QoderAccountsPage() {
       logQoderOauthUi('prepare:state-set-done', { loginId });
       startCompletePolling(loginId);
     } catch (error) {
+      if (attemptSeq !== oauthAttemptSeqRef.current) return;
       logQoderOauthUi('prepare:start-failed', { error: String(error) });
       const msg = String(error);
       setOauthPreparing(false);
