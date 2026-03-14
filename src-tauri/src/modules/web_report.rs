@@ -1433,7 +1433,7 @@ fn render_html(generated_at: &str, rows: &[ReportRow]) -> String {
     );
     output.push_str("<title>Cockpit Tools Usage Report</title>");
     output.push_str(
-        "<style>body{margin:0;background:#f6f8fb;color:#0f172a;font-family:ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif}main{max-width:1120px;margin:24px auto;padding:0 16px 24px}h1{font-size:22px;margin:0 0 12px}p{margin:4px 0 0;color:#334155}table{width:100%;border-collapse:collapse;background:#fff;border:1px solid #e2e8f0;border-radius:10px;overflow:hidden;margin-top:16px}th,td{font-size:13px;padding:10px 12px;border-bottom:1px solid #e2e8f0;text-align:left;vertical-align:top}th{background:#f8fafc;color:#334155;font-weight:600}tr:last-child td{border-bottom:none}.group-even td{background:#ffffff}.group-odd td{background:#f8fafc}.status-disabled{color:#b45309}.status-normal{color:#166534}.mono{font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace}</style>",
+        "<style>body{margin:0;background:#f6f8fb;color:#0f172a;font-family:ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif}main{max-width:1120px;margin:24px auto;padding:0 16px 24px}h1{font-size:22px;margin:0 0 12px}p{margin:4px 0 0;color:#334155}table{width:100%;border-collapse:collapse;background:#fff;border:1px solid #e2e8f0;border-radius:10px;overflow:hidden;margin-top:16px}th,td{font-size:13px;padding:10px 12px;border-bottom:1px solid #e2e8f0;text-align:left;vertical-align:top}th{background:#f8fafc;color:#334155;font-weight:600}tr:last-child td{border-bottom:none}.group-even td{background:#ffffff}.group-odd td{background:#f8fafc}.status-disabled{color:#b45309}.status-normal{color:#166534}.mono{font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace}.reset-friendly-col{min-width:180px;white-space:nowrap}</style>",
     );
     output.push_str("</head><body><main>");
     output.push_str("<h1>Cockpit Tools Usage Report</h1>");
@@ -1442,7 +1442,7 @@ fn render_html(generated_at: &str, rows: &[ReportRow]) -> String {
         html_escape(generated_at)
     ));
     output.push_str(&format!("<p>Rows: {}</p>", rows.len()));
-    output.push_str("<table><thead><tr><th>Service</th><th>Account</th><th>Metric</th><th>Used</th><th>Remaining</th><th>Reset Cycle</th><th>Reset Friendly</th><th>Status</th><th>Note</th></tr></thead><tbody>");
+    output.push_str("<table><thead><tr><th>Service</th><th>Account</th><th>Metric</th><th>Used</th><th>Remaining</th><th class=\"reset-friendly-col\">Reset Friendly</th><th>Status</th><th>Note</th></tr></thead><tbody>");
 
     let mut previous_group_key = String::new();
     let mut group_index: usize = 0;
@@ -1473,11 +1473,7 @@ fn render_html(generated_at: &str, rows: &[ReportRow]) -> String {
             html_escape(&row.remaining)
         ));
         output.push_str(&format!(
-            "<td class=\"mono\">{}</td>",
-            html_escape(&row.reset_cycle)
-        ));
-        output.push_str(&format!(
-            "<td class=\"mono\">{}</td>",
+            "<td class=\"mono reset-friendly-col\">{}</td>",
             html_escape(&reset_friendly)
         ));
         output.push_str(&format!(
