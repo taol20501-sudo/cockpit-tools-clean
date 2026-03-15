@@ -7,6 +7,22 @@ All notable changes to Cockpit Tools will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
+## [0.15.0] - 2026-03-15
+
+### Added
+- **WorkBuddy platform full integration with account sync and instance management**: Added WorkBuddy backend/frontend modules, OAuth/Token/JSON/local import flows, account switching via local credential injection, dashboard/settings/quick-settings/tray integration, and bidirectional account sync with CodeBuddy CN.
+- **Token-protected HTTP usage report service with optional HTML rendering**: Added configurable `/report` endpoint (`report_enabled` + port + token) that aggregates multi-platform quota summaries and supports raw Markdown/YAML output plus `render=true` HTML view for browser inspection.
+
+### Changed
+- **CodeBuddy, CodeBuddy CN, and WorkBuddy runtime flows are now structurally aligned**: Moved cross-platform sync/injection paths into WorkBuddy domain modules, unified command registration, and reduced duplicated maintenance paths.
+- **Account injection/startup reliability and operator guidance are improved**: CodeBuddy/CodeBuddy CN/WorkBuddy instance injection now includes post-write verification and clearer “sign in manually first” guidance for keychain/state-db failure cases.
+- **Rendered report readability and staleness metadata are enhanced**: Report pages now group rows more clearly, show human-readable local timestamps, and expose delayed-refresh/stale-data notes directly in report metadata.
+
+### Contributors
+- `PR #213` by `@lihongjing-2023`: WorkBuddy platform integration and account sync.
+- `PR #212` by `@lovitus`: tokenized web report service and rendered report improvements.
+
+---
 ## [0.14.5] - 2026-03-15
 
 ### Changed

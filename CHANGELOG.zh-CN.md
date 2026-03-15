@@ -7,6 +7,22 @@
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.0.0/)。
 
 ---
+## [0.15.0] - 2026-03-15
+
+### 新增
+- **WorkBuddy 平台已完成全链路接入，并支持与 CodeBuddy CN 账号同步及实例管理**：新增 WorkBuddy 前后端模块、OAuth/Token/JSON/本机导入、基于本地凭证注入的切号、仪表盘/设置/快捷设置/托盘接入，以及与 CodeBuddy CN 的双向账号同步。
+- **新增带 Token 保护的 HTTP 用量报表服务，并支持可选网页渲染**：新增可配置 `/report` 接口（`report_enabled` + 端口 + token），聚合多平台配额摘要，支持 Markdown/YAML 原始输出和 `render=true` 的 HTML 渲染视图。
+
+### 变更
+- **CodeBuddy、CodeBuddy CN 与 WorkBuddy 三端运行时链路已统一结构**：跨平台同步与注入链路迁移至 WorkBuddy 领域模块，统一命令注册，减少重复维护路径。
+- **账号注入与实例启动链路的稳定性和提示信息已增强**：CodeBuddy/CodeBuddy CN/WorkBuddy 注入现增加写后校验，并在 keychain/state.vscdb 异常时提供更明确的“先手动登录”引导。
+- **报表渲染可读性与数据新鲜度元信息已增强**：渲染视图分组展示更清晰，时间字段增加本地可读格式，并在元信息中明确展示延迟刷新与历史数据提示。
+
+### 贡献者
+- `PR #213` by `@lihongjing-2023`：WorkBuddy 平台接入与账号同步。
+- `PR #212` by `@lovitus`：带 Token 的网页报表服务与渲染视图优化。
+
+---
 ## [0.14.5] - 2026-03-15
 
 ### 变更
