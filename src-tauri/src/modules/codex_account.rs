@@ -8,10 +8,12 @@ use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, AUTHORIZATION};
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
 static CODEX_QUOTA_ALERT_LAST_SENT: std::sync::LazyLock<Mutex<HashMap<String, i64>>> =
     std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+static CODEX_AUTO_SWITCH_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 const CODEX_QUOTA_ALERT_COOLDOWN_SECONDS: i64 = 300;
 const ACCOUNT_CHECK_URL: &str = "https://chatgpt.com/backend-api/wham/accounts/check";
 
@@ -1214,6 +1216,10 @@ fn normalize_quota_alert_threshold(raw: i32) -> i32 {
     raw.clamp(0, 100)
 }
 
+fn normalize_auto_switch_threshold(raw: i32) -> i32 {
+    raw.clamp(0, 100)
+}
+
 fn format_codex_quota_metric_label(window_minutes: Option<i64>, fallback: &str) -> String {
     const HOUR_MINUTES: i64 = 60;
     const DAY_MINUTES: i64 = 24 * HOUR_MINUTES;
@@ -1245,7 +1251,14 @@ fn format_codex_quota_metric_label(window_minutes: Option<i64>, fallback: &str) 
     format!("{}m", minutes)
 }
 
-fn extract_quota_metrics(account: &CodexAccount) -> Vec<(String, i32)> {
+#[derive(Debug, Clone)]
+struct CodexQuotaMetric {
+    key: &'static str,
+    label: String,
+    percentage: i32,
+}
+
+fn extract_quota_metrics(account: &CodexAccount) -> Vec<CodexQuotaMetric> {
     let Some(quota) = account.quota.as_ref() else {
         return Vec::new();
     };
@@ -1255,39 +1268,138 @@ fn extract_quota_metrics(account: &CodexAccount) -> Vec<(String, i32)> {
     let mut metrics = Vec::new();
 
     if !has_presence || quota.hourly_window_present.unwrap_or(false) {
-        metrics.push((
-            format_codex_quota_metric_label(quota.hourly_window_minutes, "5h"),
-            quota.hourly_percentage.clamp(0, 100),
-        ));
+        metrics.push(CodexQuotaMetric {
+            key: "primary_window",
+            label: format_codex_quota_metric_label(quota.hourly_window_minutes, "5h"),
+            percentage: quota.hourly_percentage.clamp(0, 100),
+        });
     }
 
     if !has_presence || quota.weekly_window_present.unwrap_or(false) {
-        metrics.push((
-            format_codex_quota_metric_label(quota.weekly_window_minutes, "Weekly"),
-            quota.weekly_percentage.clamp(0, 100),
-        ));
+        metrics.push(CodexQuotaMetric {
+            key: "secondary_window",
+            label: format_codex_quota_metric_label(quota.weekly_window_minutes, "Weekly"),
+            percentage: quota.weekly_percentage.clamp(0, 100),
+        });
     }
 
     if metrics.is_empty() {
-        metrics.push((
-            format_codex_quota_metric_label(quota.hourly_window_minutes, "5h"),
-            quota.hourly_percentage.clamp(0, 100),
-        ));
+        metrics.push(CodexQuotaMetric {
+            key: "primary_window",
+            label: format_codex_quota_metric_label(quota.hourly_window_minutes, "5h"),
+            percentage: quota.hourly_percentage.clamp(0, 100),
+        });
     }
 
     metrics
 }
 
-fn average_quota_percentage(metrics: &[(String, i32)]) -> f64 {
+fn average_quota_percentage(metrics: &[CodexQuotaMetric]) -> f64 {
     if metrics.is_empty() {
         return 0.0;
     }
-    let sum: i32 = metrics.iter().map(|(_, pct)| *pct).sum();
+    let sum: i32 = metrics.iter().map(|metric| metric.percentage).sum();
     sum as f64 / metrics.len() as f64
 }
 
-fn build_quota_alert_cooldown_key(account_id: &str, threshold: i32) -> String {
-    format!("codex:{}:{}", account_id, threshold)
+fn metric_crossed_threshold(metric: &CodexQuotaMetric, primary_threshold: i32, secondary_threshold: i32) -> bool {
+    match metric.key {
+        "primary_window" => metric.percentage <= primary_threshold,
+        "secondary_window" => metric.percentage <= secondary_threshold,
+        _ => false,
+    }
+}
+
+fn metric_above_threshold(metric: &CodexQuotaMetric, primary_threshold: i32, secondary_threshold: i32) -> bool {
+    match metric.key {
+        "primary_window" => metric.percentage > primary_threshold,
+        "secondary_window" => metric.percentage > secondary_threshold,
+        _ => true,
+    }
+}
+
+fn metric_margin_over_threshold(
+    metric: &CodexQuotaMetric,
+    primary_threshold: i32,
+    secondary_threshold: i32,
+) -> Option<i32> {
+    match metric.key {
+        "primary_window" => Some(metric.percentage - primary_threshold),
+        "secondary_window" => Some(metric.percentage - secondary_threshold),
+        _ => None,
+    }
+}
+
+#[derive(Debug, Clone)]
+struct CodexSwitchCandidate {
+    account: CodexAccount,
+    min_margin: i32,
+    min_percentage: i32,
+    average_percentage: f64,
+}
+
+fn build_switch_candidate(
+    account: &CodexAccount,
+    primary_threshold: i32,
+    secondary_threshold: i32,
+) -> Option<CodexSwitchCandidate> {
+    let metrics = extract_quota_metrics(account);
+    if metrics.is_empty() {
+        return None;
+    }
+    if !metrics
+        .iter()
+        .all(|metric| metric_above_threshold(metric, primary_threshold, secondary_threshold))
+    {
+        return None;
+    }
+
+    let min_margin = metrics
+        .iter()
+        .filter_map(|metric| {
+            metric_margin_over_threshold(metric, primary_threshold, secondary_threshold)
+        })
+        .min()?;
+    let min_percentage = metrics.iter().map(|metric| metric.percentage).min()?;
+    let average_percentage = average_quota_percentage(&metrics);
+
+    Some(CodexSwitchCandidate {
+        account: account.clone(),
+        min_margin,
+        min_percentage,
+        average_percentage,
+    })
+}
+
+fn pick_best_candidate(mut candidates: Vec<CodexSwitchCandidate>) -> Option<CodexAccount> {
+    if candidates.is_empty() {
+        return None;
+    }
+
+    candidates.sort_by(|a, b| {
+        b.min_margin
+            .cmp(&a.min_margin)
+            .then_with(|| b.min_percentage.cmp(&a.min_percentage))
+            .then_with(|| {
+                b.average_percentage
+                    .partial_cmp(&a.average_percentage)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .then_with(|| a.account.last_used.cmp(&b.account.last_used))
+    });
+
+    candidates.into_iter().next().map(|candidate| candidate.account)
+}
+
+fn build_quota_alert_cooldown_key(
+    account_id: &str,
+    primary_threshold: i32,
+    secondary_threshold: i32,
+) -> String {
+    format!(
+        "codex:{}:{}:{}",
+        account_id, primary_threshold, secondary_threshold
+    )
 }
 
 fn should_emit_quota_alert(cooldown_key: &str, now: i64) -> bool {
@@ -1305,9 +1417,13 @@ fn should_emit_quota_alert(cooldown_key: &str, now: i64) -> bool {
     true
 }
 
-fn clear_quota_alert_cooldown(account_id: &str, threshold: i32) {
+fn clear_quota_alert_cooldown(account_id: &str, primary_threshold: i32, secondary_threshold: i32) {
     if let Ok(mut state) = CODEX_QUOTA_ALERT_LAST_SENT.lock() {
-        state.remove(&build_quota_alert_cooldown_key(account_id, threshold));
+        state.remove(&build_quota_alert_cooldown_key(
+            account_id,
+            primary_threshold,
+            secondary_threshold,
+        ));
     }
 }
 
@@ -1334,28 +1450,77 @@ fn resolve_current_account_id(accounts: &[CodexAccount]) -> Option<String> {
 fn pick_quota_alert_recommendation(
     accounts: &[CodexAccount],
     current_id: &str,
+    primary_threshold: i32,
+    secondary_threshold: i32,
 ) -> Option<CodexAccount> {
-    let mut candidates: Vec<CodexAccount> = accounts
+    let candidates: Vec<CodexSwitchCandidate> = accounts
         .iter()
         .filter(|account| account.id != current_id)
-        .filter(|account| !extract_quota_metrics(account).is_empty())
-        .cloned()
+        .filter_map(|account| build_switch_candidate(account, primary_threshold, secondary_threshold))
         .collect();
 
-    if candidates.is_empty() {
-        return None;
+    pick_best_candidate(candidates)
+}
+
+pub fn pick_auto_switch_target_if_needed() -> Result<Option<CodexAccount>, String> {
+    if CODEX_AUTO_SWITCH_IN_PROGRESS.swap(true, Ordering::SeqCst) {
+        logger::log_info("[AutoSwitch][Codex] 自动切号进行中，跳过本次检查");
+        return Ok(None);
     }
 
-    candidates.sort_by(|a, b| {
-        let avg_a = average_quota_percentage(&extract_quota_metrics(a));
-        let avg_b = average_quota_percentage(&extract_quota_metrics(b));
-        avg_b
-            .partial_cmp(&avg_a)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| a.last_used.cmp(&b.last_used))
-    });
+    let result = (|| {
+        let cfg = crate::modules::config::get_user_config();
+        if !cfg.codex_auto_switch_enabled {
+            return Ok(None);
+        }
 
-    candidates.into_iter().next()
+        let primary_threshold =
+            normalize_auto_switch_threshold(cfg.codex_auto_switch_primary_threshold);
+        let secondary_threshold =
+            normalize_auto_switch_threshold(cfg.codex_auto_switch_secondary_threshold);
+
+        let accounts = list_accounts();
+        let current_id = match resolve_current_account_id(&accounts) {
+            Some(id) => id,
+            None => return Ok(None),
+        };
+
+        let current = match accounts.iter().find(|account| account.id == current_id) {
+            Some(account) => account,
+            None => return Ok(None),
+        };
+
+        let current_metrics = extract_quota_metrics(current);
+        if current_metrics.is_empty() {
+            return Ok(None);
+        }
+
+        let should_switch = current_metrics
+            .iter()
+            .any(|metric| metric_crossed_threshold(metric, primary_threshold, secondary_threshold));
+        if !should_switch {
+            return Ok(None);
+        }
+
+        let candidates: Vec<CodexSwitchCandidate> = accounts
+            .iter()
+            .filter(|account| account.id != current_id)
+            .filter_map(|account| build_switch_candidate(account, primary_threshold, secondary_threshold))
+            .collect();
+
+        if candidates.is_empty() {
+            logger::log_warn(&format!(
+                "[AutoSwitch][Codex] 当前账号命中阈值 (primary<={}%, secondary<={}%)，但没有可切换候选账号",
+                primary_threshold, secondary_threshold
+            ));
+            return Ok(None);
+        }
+
+        Ok(pick_best_candidate(candidates))
+    })();
+
+    CODEX_AUTO_SWITCH_IN_PROGRESS.store(false, Ordering::SeqCst);
+    result
 }
 
 pub fn run_quota_alert_if_needed(
@@ -1365,7 +1530,10 @@ pub fn run_quota_alert_if_needed(
         return Ok(None);
     }
 
-    let threshold = normalize_quota_alert_threshold(cfg.codex_quota_alert_threshold);
+    let primary_threshold =
+        normalize_quota_alert_threshold(cfg.codex_quota_alert_primary_threshold);
+    let secondary_threshold =
+        normalize_quota_alert_threshold(cfg.codex_quota_alert_secondary_threshold);
     let accounts = list_accounts();
     let current_id = match resolve_current_account_id(&accounts) {
         Some(id) => id,
@@ -1380,27 +1548,38 @@ pub fn run_quota_alert_if_needed(
     let metrics = extract_quota_metrics(current);
     let low_models: Vec<(String, i32)> = metrics
         .into_iter()
-        .filter(|(_, pct)| *pct <= threshold)
+        .filter(|metric| metric_crossed_threshold(metric, primary_threshold, secondary_threshold))
+        .map(|metric| (metric.label, metric.percentage))
         .collect();
 
     if low_models.is_empty() {
-        clear_quota_alert_cooldown(&current_id, threshold);
+        clear_quota_alert_cooldown(&current_id, primary_threshold, secondary_threshold);
         return Ok(None);
     }
 
     let now = chrono::Utc::now().timestamp();
-    let cooldown_key = build_quota_alert_cooldown_key(&current_id, threshold);
+    let cooldown_key =
+        build_quota_alert_cooldown_key(&current_id, primary_threshold, secondary_threshold);
     if !should_emit_quota_alert(&cooldown_key, now) {
         return Ok(None);
     }
 
-    let recommendation = pick_quota_alert_recommendation(&accounts, &current_id);
+    let recommendation = pick_quota_alert_recommendation(
+        &accounts,
+        &current_id,
+        primary_threshold,
+        secondary_threshold,
+    );
     let lowest_percentage = low_models.iter().map(|(_, pct)| *pct).min().unwrap_or(0);
     let payload = crate::modules::account::QuotaAlertPayload {
         platform: "codex".to_string(),
         current_account_id: current_id,
         current_email: current.email.clone(),
-        threshold,
+        threshold: primary_threshold,
+        threshold_display: Some(format!(
+            "primary_window<={}%, secondary_window<={}%",
+            primary_threshold, secondary_threshold
+        )),
         lowest_percentage,
         low_models: low_models.into_iter().map(|(name, _)| name).collect(),
         recommended_account_id: recommendation.as_ref().map(|account| account.id.clone()),

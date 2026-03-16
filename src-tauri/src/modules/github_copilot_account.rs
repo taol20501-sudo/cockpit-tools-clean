@@ -547,6 +547,7 @@ pub fn run_quota_alert_if_needed(
         current_account_id: current_id,
         current_email: display_email(current),
         threshold,
+        threshold_display: None,
         lowest_percentage,
         low_models: low_models.into_iter().map(|(name, _)| name).collect(),
         recommended_account_id: recommendation.as_ref().map(|account| account.id.clone()),

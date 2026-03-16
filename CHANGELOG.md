@@ -7,6 +7,17 @@ All notable changes to Cockpit Tools will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
+## [0.15.1] - 2026-03-16
+
+### Changed
+- **Codex auto-switch and quota alerts now support independent `primary_window`/`secondary_window` thresholds end-to-end**: backend config normalization, candidate selection, cooldown keys, and post-refresh checks now evaluate dual thresholds and can switch accounts before alerting when a better candidate exists.
+- **Codex Quick Settings now expose dual-window controls for auto-switch and quota alerts**: added dedicated percentage inputs for `primary_window` and `secondary_window`, plus combined OR-condition hints and modal threshold display.
+- **Codex quota refresh scheduling now includes a 60-second current-account refresh when auto-switch or quota alerts are enabled**: improves trigger timeliness without changing existing full-refresh interval behavior.
+- **Default-instance launches triggered by switching now pass saved extra args for Antigravity and Codex**: switch flows and the default Codex instance start path now reuse configured `extra_args` instead of dropping them.
+- **Codex refresh flows now always update current-account state after refresh**: manual and batch refresh paths now hydrate both account list and current account for consistent UI state.
+- **Windows main window default width increased to 1250**: provides more horizontal space for account and quick-settings content.
+
+---
 ## [0.15.0] - 2026-03-15
 
 ### Added

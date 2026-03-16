@@ -47,10 +47,15 @@ interface GeneralConfig {
   codex_launch_on_switch: boolean;
   auto_switch_enabled: boolean;
   auto_switch_threshold: number;
+  codex_auto_switch_enabled: boolean;
+  codex_auto_switch_primary_threshold: number;
+  codex_auto_switch_secondary_threshold: number;
   quota_alert_enabled: boolean;
   quota_alert_threshold: number;
   codex_quota_alert_enabled: boolean;
   codex_quota_alert_threshold: number;
+  codex_quota_alert_primary_threshold: number;
+  codex_quota_alert_secondary_threshold: number;
   ghcp_quota_alert_enabled: boolean;
   ghcp_quota_alert_threshold: number;
   windsurf_quota_alert_enabled: boolean;
@@ -113,6 +118,11 @@ type QuotaAlertThresholdKey =
   | 'qoder_quota_alert_threshold'
   | 'trae_quota_alert_threshold'
   | 'workbuddy_quota_alert_threshold';
+type CodexWindowThresholdKey =
+  | 'codex_auto_switch_primary_threshold'
+  | 'codex_auto_switch_secondary_threshold'
+  | 'codex_quota_alert_primary_threshold'
+  | 'codex_quota_alert_secondary_threshold';
 
 interface QuickSettingsPopoverProps {
   type: QuickSettingsType;
@@ -131,6 +141,10 @@ export function QuickSettingsPopover({ type }: QuickSettingsPopoverProps) {
   const [customRefresh, setCustomRefresh] = useState('');
   const [customThreshold, setCustomThreshold] = useState('');
   const [quotaAlertCustomThreshold, setQuotaAlertCustomThreshold] = useState('');
+  const [codexAutoSwitchPrimaryCustomThreshold, setCodexAutoSwitchPrimaryCustomThreshold] = useState('');
+  const [codexAutoSwitchSecondaryCustomThreshold, setCodexAutoSwitchSecondaryCustomThreshold] = useState('');
+  const [codexQuotaAlertPrimaryCustomThreshold, setCodexQuotaAlertPrimaryCustomThreshold] = useState('');
+  const [codexQuotaAlertSecondaryCustomThreshold, setCodexQuotaAlertSecondaryCustomThreshold] = useState('');
   const [codexShowCodeReviewQuota, setCodexShowCodeReviewQuota] = useState(
     isCodexCodeReviewQuotaVisibleByDefault,
   );
@@ -188,6 +202,10 @@ export function QuickSettingsPopover({ type }: QuickSettingsPopoverProps) {
       setCustomRefresh('');
       setCustomThreshold('');
       setQuotaAlertCustomThreshold('');
+      setCodexAutoSwitchPrimaryCustomThreshold(String(cfg.codex_auto_switch_primary_threshold));
+      setCodexAutoSwitchSecondaryCustomThreshold(String(cfg.codex_auto_switch_secondary_threshold));
+      setCodexQuotaAlertPrimaryCustomThreshold(String(cfg.codex_quota_alert_primary_threshold));
+      setCodexQuotaAlertSecondaryCustomThreshold(String(cfg.codex_quota_alert_secondary_threshold));
     } catch (err) {
       console.error('Failed to load config:', err);
       setError(t('quickSettings.error.loadFailed', {
@@ -257,10 +275,15 @@ export function QuickSettingsPopover({ type }: QuickSettingsPopoverProps) {
           codexLaunchOnSwitch: merged.codex_launch_on_switch,
           autoSwitchEnabled: merged.auto_switch_enabled,
           autoSwitchThreshold: merged.auto_switch_threshold,
+          codexAutoSwitchEnabled: merged.codex_auto_switch_enabled,
+          codexAutoSwitchPrimaryThreshold: merged.codex_auto_switch_primary_threshold,
+          codexAutoSwitchSecondaryThreshold: merged.codex_auto_switch_secondary_threshold,
           quotaAlertEnabled: merged.quota_alert_enabled,
           quotaAlertThreshold: merged.quota_alert_threshold,
           codexQuotaAlertEnabled: merged.codex_quota_alert_enabled,
           codexQuotaAlertThreshold: merged.codex_quota_alert_threshold,
+          codexQuotaAlertPrimaryThreshold: merged.codex_quota_alert_primary_threshold,
+          codexQuotaAlertSecondaryThreshold: merged.codex_quota_alert_secondary_threshold,
           ghcpQuotaAlertEnabled: merged.ghcp_quota_alert_enabled,
           ghcpQuotaAlertThreshold: merged.ghcp_quota_alert_threshold,
           windsurfQuotaAlertEnabled: merged.windsurf_quota_alert_enabled,
@@ -637,6 +660,18 @@ export function QuickSettingsPopover({ type }: QuickSettingsPopoverProps) {
   const quotaAlertThresholdValue = config ? Number(config[quotaAlertThresholdKey]) : 20;
   const isQuotaAlertThresholdPreset = thresholdPresets.includes(String(quotaAlertThresholdValue));
   const showQuotaAlertThresholdInput = quotaAlertThresholdEditing;
+  const codexAutoSwitchPrimaryThresholdValue = config
+    ? Number(config.codex_auto_switch_primary_threshold)
+    : 20;
+  const codexAutoSwitchSecondaryThresholdValue = config
+    ? Number(config.codex_auto_switch_secondary_threshold)
+    : 20;
+  const codexQuotaAlertPrimaryThresholdValue = config
+    ? Number(config.codex_quota_alert_primary_threshold)
+    : 20;
+  const codexQuotaAlertSecondaryThresholdValue = config
+    ? Number(config.codex_quota_alert_secondary_threshold)
+    : 20;
 
   const handleRefreshSelectChange = (val: string) => {
     if (val === 'custom') {
@@ -707,84 +742,222 @@ export function QuickSettingsPopover({ type }: QuickSettingsPopoverProps) {
     setQuotaAlertThresholdEditing(false);
   };
 
-  /** 共用的配额预警 enable + threshold 控件 */
-  const renderQuotaAlertControls = () => (
-    <>
-      <div className="qs-row" style={{ marginTop: type === 'antigravity' ? 10 : 0 }}>
-        <div className="qs-row-label">
-          <span>{t('quickSettings.quotaAlert.enable', '超额预警')}</span>
-        </div>
-        <div className="qs-row-control">
-          <label className="qs-switch">
-            <input
-              type="checkbox"
-              checked={quotaAlertEnabledValue}
-              onChange={(e) =>
-                saveConfig({ [quotaAlertEnabledKey]: e.target.checked } as Partial<GeneralConfig>)
-              }
-            />
-            <span className="qs-switch-slider"></span>
-          </label>
-        </div>
-      </div>
+  const handleCodexWindowThresholdInputChange = (
+    rawValue: string,
+    setCustomValue: (value: string) => void,
+  ) => {
+    setCustomValue(rawValue.replace(/[^\d]/g, '').slice(0, 3));
+  };
 
-      {quotaAlertEnabledValue && (
-        <div className="qs-field-group" style={{ animation: 'qsFadeUp 0.2s ease both' }}>
-          <div className="qs-row">
-            <div className="qs-row-label">
-              <span>{t('quickSettings.quotaAlert.threshold', '预警阈值')}</span>
-            </div>
-            <div className="qs-row-control">
-              {showQuotaAlertThresholdInput ? (
-                <div className="qs-inline-input">
-                  <input
-                    type="number"
-                    min={0}
-                    max={100}
-                    className="qs-select qs-select--input-mode qs-select--with-unit"
-                    value={quotaAlertCustomThreshold}
-                    placeholder={t('quickSettings.inputPercent', '输入百分比')}
-                    onChange={(e) => setQuotaAlertCustomThreshold(e.target.value.replace(/[^\d]/g, ''))}
-                    onBlur={handleQuotaAlertCustomThresholdApply}
-                    onKeyDown={(e) => {
-                      if (e.key === 'Enter') {
-                        e.preventDefault();
-                        handleQuotaAlertCustomThresholdApply();
-                      }
-                    }}
-                  />
-                  <span className="qs-input-unit">%</span>
+  const handleCodexWindowCustomThresholdApply = (
+    customValue: string,
+    setCustomValue: (value: string) => void,
+    key: CodexWindowThresholdKey,
+    fallbackValue: number,
+  ) => {
+    const parsed = parseInt(customValue, 10);
+    if (!isNaN(parsed) && parsed >= 0 && parsed <= 100) {
+      saveConfig({ [key]: parsed } as Partial<GeneralConfig>);
+      setCustomValue(String(parsed));
+      return;
+    }
+    setCustomValue(String(fallbackValue));
+  };
+
+  /** 共用的配额预警 enable + threshold 控件 */
+  const renderQuotaAlertControls = () => {
+    const isCodexAlert = type === 'codex';
+    return (
+      <>
+        <div className="qs-row" style={{ marginTop: type === 'antigravity' ? 10 : 0 }}>
+          <div className="qs-row-label">
+            <span>{t('quickSettings.quotaAlert.enable', '超额预警')}</span>
+          </div>
+          <div className="qs-row-control">
+            <label className="qs-switch">
+              <input
+                type="checkbox"
+                checked={quotaAlertEnabledValue}
+                onChange={(e) =>
+                  saveConfig({ [quotaAlertEnabledKey]: e.target.checked } as Partial<GeneralConfig>)
+                }
+              />
+              <span className="qs-switch-slider"></span>
+            </label>
+          </div>
+        </div>
+
+        {quotaAlertEnabledValue && (
+          <div className="qs-field-group" style={{ animation: 'qsFadeUp 0.2s ease both' }}>
+            {isCodexAlert ? (
+              <>
+                <div className="qs-row">
+                  <div className="qs-row-label">
+                    <span>
+                      primary_window ({t('codex.quota.hourly', '5小时配额')}) {t('quickSettings.quotaAlert.threshold', '预警阈值')}
+                    </span>
+                  </div>
+                  <div className="qs-row-control">
+                    <div className="qs-inline-input">
+                      <input
+                        type="number"
+                        min={0}
+                        max={100}
+                        className="qs-select qs-select--input-mode qs-select--with-unit"
+                        value={codexQuotaAlertPrimaryCustomThreshold}
+                        placeholder={t('quickSettings.inputPercent', '输入百分比')}
+                        onChange={(e) =>
+                          handleCodexWindowThresholdInputChange(
+                            e.target.value,
+                            setCodexQuotaAlertPrimaryCustomThreshold,
+                          )
+                        }
+                        onBlur={() =>
+                          handleCodexWindowCustomThresholdApply(
+                            codexQuotaAlertPrimaryCustomThreshold,
+                            setCodexQuotaAlertPrimaryCustomThreshold,
+                            'codex_quota_alert_primary_threshold',
+                            codexQuotaAlertPrimaryThresholdValue,
+                          )
+                        }
+                        onKeyDown={(e) => {
+                          if (e.key === 'Enter') {
+                            e.preventDefault();
+                            handleCodexWindowCustomThresholdApply(
+                              codexQuotaAlertPrimaryCustomThreshold,
+                              setCodexQuotaAlertPrimaryCustomThreshold,
+                              'codex_quota_alert_primary_threshold',
+                              codexQuotaAlertPrimaryThresholdValue,
+                            );
+                          }
+                        }}
+                      />
+                      <span className="qs-input-unit">%</span>
+                    </div>
+                  </div>
                 </div>
-              ) : (
-                <select
-                  className="qs-select"
-                  value={String(quotaAlertThresholdValue)}
-                  onChange={(e) => handleQuotaAlertThresholdSelectChange(e.target.value)}
-                >
-                  {!isQuotaAlertThresholdPreset && (
-                    <option value={String(quotaAlertThresholdValue)}>
-                      {quotaAlertThresholdValue}%
-                    </option>
+
+                <div className="qs-hint" style={{ marginTop: 0, marginBottom: 4 }}>
+                  {t('quickSettings.codexWindow.orDivider', 'OR（命中任一即触发）')}
+                </div>
+
+                <div className="qs-row">
+                  <div className="qs-row-label">
+                    <span>
+                      secondary_window ({t('codex.quota.weekly', '周配额')}) {t('quickSettings.quotaAlert.threshold', '预警阈值')}
+                    </span>
+                  </div>
+                  <div className="qs-row-control">
+                    <div className="qs-inline-input">
+                      <input
+                        type="number"
+                        min={0}
+                        max={100}
+                        className="qs-select qs-select--input-mode qs-select--with-unit"
+                        value={codexQuotaAlertSecondaryCustomThreshold}
+                        placeholder={t('quickSettings.inputPercent', '输入百分比')}
+                        onChange={(e) =>
+                          handleCodexWindowThresholdInputChange(
+                            e.target.value,
+                            setCodexQuotaAlertSecondaryCustomThreshold,
+                          )
+                        }
+                        onBlur={() =>
+                          handleCodexWindowCustomThresholdApply(
+                            codexQuotaAlertSecondaryCustomThreshold,
+                            setCodexQuotaAlertSecondaryCustomThreshold,
+                            'codex_quota_alert_secondary_threshold',
+                            codexQuotaAlertSecondaryThresholdValue,
+                          )
+                        }
+                        onKeyDown={(e) => {
+                          if (e.key === 'Enter') {
+                            e.preventDefault();
+                            handleCodexWindowCustomThresholdApply(
+                              codexQuotaAlertSecondaryCustomThreshold,
+                              setCodexQuotaAlertSecondaryCustomThreshold,
+                              'codex_quota_alert_secondary_threshold',
+                              codexQuotaAlertSecondaryThresholdValue,
+                            );
+                          }
+                        }}
+                      />
+                      <span className="qs-input-unit">%</span>
+                    </div>
+                  </div>
+                </div>
+              </>
+            ) : (
+              <div className="qs-row">
+                <div className="qs-row-label">
+                  <span>{t('quickSettings.quotaAlert.threshold', '预警阈值')}</span>
+                </div>
+                <div className="qs-row-control">
+                  {showQuotaAlertThresholdInput ? (
+                    <div className="qs-inline-input">
+                      <input
+                        type="number"
+                        min={0}
+                        max={100}
+                        className="qs-select qs-select--input-mode qs-select--with-unit"
+                        value={quotaAlertCustomThreshold}
+                        placeholder={t('quickSettings.inputPercent', '输入百分比')}
+                        onChange={(e) => setQuotaAlertCustomThreshold(e.target.value.replace(/[^\d]/g, ''))}
+                        onBlur={handleQuotaAlertCustomThresholdApply}
+                        onKeyDown={(e) => {
+                          if (e.key === 'Enter') {
+                            e.preventDefault();
+                            handleQuotaAlertCustomThresholdApply();
+                          }
+                        }}
+                      />
+                      <span className="qs-input-unit">%</span>
+                    </div>
+                  ) : (
+                    <select
+                      className="qs-select"
+                      value={String(quotaAlertThresholdValue)}
+                      onChange={(e) => handleQuotaAlertThresholdSelectChange(e.target.value)}
+                    >
+                      {!isQuotaAlertThresholdPreset && (
+                        <option value={String(quotaAlertThresholdValue)}>
+                          {quotaAlertThresholdValue}%
+                        </option>
+                      )}
+                      <option value="0">0%</option>
+                      <option value="20">20%</option>
+                      <option value="40">40%</option>
+                      <option value="60">60%</option>
+                      <option value="custom">{t('quickSettings.customInput', '自定义')}</option>
+                    </select>
                   )}
-                  <option value="0">0%</option>
-                  <option value="20">20%</option>
-                  <option value="40">40%</option>
-                  <option value="60">60%</option>
-                  <option value="custom">{t('quickSettings.customInput', '自定义')}</option>
-                </select>
+                </div>
+              </div>
+            )}
+            <div className="qs-hint" style={{ marginTop: 6 }}>
+              {t(
+                'quickSettings.quotaAlert.hint',
+                '当当前账号任意模型配额低于阈值时，发送原生通知并在页面提示快捷切号。'
+              )}
+              {isCodexAlert && (
+                <>
+                  <div>
+                    {t(
+                      'quickSettings.codexWindow.primaryWindowMeaning',
+                      'primary_window 一般指 5 小时配额；免费用户下 primary_window 可能对应周配额，不同订阅可能不同。'
+                    )}
+                  </div>
+                  <div>
+                    {`primary_window <= ${codexQuotaAlertPrimaryThresholdValue}% OR secondary_window <= ${codexQuotaAlertSecondaryThresholdValue}%`}
+                  </div>
+                </>
               )}
             </div>
           </div>
-          <div className="qs-hint" style={{ marginTop: 6 }}>
-            {t(
-              'quickSettings.quotaAlert.hint',
-              '当当前账号任意模型配额低于阈值时，发送原生通知并在页面提示快捷切号。'
-            )}
-          </div>
-        </div>
-      )}
-    </>
-  );
+        )}
+      </>
+    );
+  };
 
   const handleCodexCodeReviewQuotaToggle = (checked: boolean) => {
     setCodexShowCodeReviewQuota(checked);
@@ -1007,6 +1180,144 @@ export function QuickSettingsPopover({ type }: QuickSettingsPopoverProps) {
                       <span className="qs-switch-slider"></span>
                     </label>
                   </div>
+                </div>
+
+                <div
+                  className="qs-field-group"
+                  style={{ marginTop: 6, paddingTop: 8, borderTop: '1px solid var(--border-light)' }}
+                >
+                  <div className="qs-row">
+                    <div className="qs-row-label">
+                      <Zap size={15} />
+                      <span>{t('quickSettings.autoSwitch.enable', '启用自动切号')}</span>
+                    </div>
+                    <div className="qs-row-control">
+                      <label className="qs-switch">
+                        <input
+                          type="checkbox"
+                          checked={config.codex_auto_switch_enabled}
+                          onChange={(e) => saveConfig({ codex_auto_switch_enabled: e.target.checked })}
+                        />
+                        <span className="qs-switch-slider"></span>
+                      </label>
+                    </div>
+                  </div>
+
+                  {config.codex_auto_switch_enabled && (
+                    <div className="qs-field-group" style={{ animation: 'qsFadeUp 0.2s ease both' }}>
+                      <div className="qs-row">
+                        <div className="qs-row-label">
+                          <span>
+                            primary_window ({t('codex.quota.hourly', '5小时配额')}) {t('quickSettings.autoSwitch.threshold', '切号阈值')}
+                          </span>
+                        </div>
+                        <div className="qs-row-control">
+                          <div className="qs-inline-input">
+                            <input
+                              type="number"
+                              min={0}
+                              max={100}
+                              className="qs-select qs-select--input-mode qs-select--with-unit"
+                              value={codexAutoSwitchPrimaryCustomThreshold}
+                              placeholder={t('quickSettings.inputPercent', '输入百分比')}
+                              onChange={(e) =>
+                                handleCodexWindowThresholdInputChange(
+                                  e.target.value,
+                                  setCodexAutoSwitchPrimaryCustomThreshold,
+                                )
+                              }
+                              onBlur={() =>
+                                handleCodexWindowCustomThresholdApply(
+                                  codexAutoSwitchPrimaryCustomThreshold,
+                                  setCodexAutoSwitchPrimaryCustomThreshold,
+                                  'codex_auto_switch_primary_threshold',
+                                  codexAutoSwitchPrimaryThresholdValue,
+                                )
+                              }
+                              onKeyDown={(e) => {
+                                if (e.key === 'Enter') {
+                                  e.preventDefault();
+                                  handleCodexWindowCustomThresholdApply(
+                                    codexAutoSwitchPrimaryCustomThreshold,
+                                    setCodexAutoSwitchPrimaryCustomThreshold,
+                                    'codex_auto_switch_primary_threshold',
+                                    codexAutoSwitchPrimaryThresholdValue,
+                                  );
+                                }
+                              }}
+                            />
+                            <span className="qs-input-unit">%</span>
+                          </div>
+                        </div>
+                      </div>
+
+                      <div className="qs-hint" style={{ marginTop: 0, marginBottom: 4 }}>
+                        {t('quickSettings.codexWindow.orDivider', 'OR（命中任一即触发）')}
+                      </div>
+
+                      <div className="qs-row">
+                        <div className="qs-row-label">
+                          <span>
+                            secondary_window ({t('codex.quota.weekly', '周配额')}) {t('quickSettings.autoSwitch.threshold', '切号阈值')}
+                          </span>
+                        </div>
+                        <div className="qs-row-control">
+                          <div className="qs-inline-input">
+                            <input
+                              type="number"
+                              min={0}
+                              max={100}
+                              className="qs-select qs-select--input-mode qs-select--with-unit"
+                              value={codexAutoSwitchSecondaryCustomThreshold}
+                              placeholder={t('quickSettings.inputPercent', '输入百分比')}
+                              onChange={(e) =>
+                                handleCodexWindowThresholdInputChange(
+                                  e.target.value,
+                                  setCodexAutoSwitchSecondaryCustomThreshold,
+                                )
+                              }
+                              onBlur={() =>
+                                handleCodexWindowCustomThresholdApply(
+                                  codexAutoSwitchSecondaryCustomThreshold,
+                                  setCodexAutoSwitchSecondaryCustomThreshold,
+                                  'codex_auto_switch_secondary_threshold',
+                                  codexAutoSwitchSecondaryThresholdValue,
+                                )
+                              }
+                              onKeyDown={(e) => {
+                                if (e.key === 'Enter') {
+                                  e.preventDefault();
+                                  handleCodexWindowCustomThresholdApply(
+                                    codexAutoSwitchSecondaryCustomThreshold,
+                                    setCodexAutoSwitchSecondaryCustomThreshold,
+                                    'codex_auto_switch_secondary_threshold',
+                                    codexAutoSwitchSecondaryThresholdValue,
+                                  );
+                                }
+                              }}
+                            />
+                            <span className="qs-input-unit">%</span>
+                          </div>
+                        </div>
+                      </div>
+
+                      <div className="qs-hint">
+                        {t(
+                          'quickSettings.autoSwitch.hint',
+                          '当任意模型配额低于阈值时，自动切换到配额最高的账号。'
+                        )}
+                        <div>
+                          {t(
+                            'quickSettings.codexWindow.primaryWindowMeaning',
+                            'primary_window 一般指 5 小时配额；免费用户下 primary_window 可能对应周配额，不同订阅可能不同。'
+                          )}
+                        </div>
+                        <div>
+                          {`primary_window <= ${codexAutoSwitchPrimaryThresholdValue}% OR secondary_window <= ${codexAutoSwitchSecondaryThresholdValue}%`}
+                        </div>
+                      </div>
+                    </div>
+                  )}
                 </div>
               </div>
             )}

@@ -1485,6 +1485,7 @@ pub fn run_quota_alert_if_needed() -> Result<(), String> {
         current_account_id: current_account.id,
         current_email: current_account.email,
         threshold,
+        threshold_display: None,
         lowest_percentage,
         low_models,
         recommended_account_id: recommendation.as_ref().map(|item| item.0.clone()),

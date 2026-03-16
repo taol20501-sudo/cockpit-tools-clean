@@ -2,8 +2,11 @@ use crate::models::codex::{CodexAccount, CodexQuota, CodexTokens};
 use crate::modules::{
     codex_account, codex_oauth, codex_quota, config, logger, opencode_auth, process,
 };
+use std::sync::atomic::{AtomicBool, Ordering};
 use tauri::AppHandle;
 use tauri::Emitter;
+
+static CODEX_POST_REFRESH_CHECK_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 
 /// 列出所有 Codex 账号
 #[tauri::command]
@@ -111,6 +114,48 @@ pub async fn switch_codex_account(
     Ok(account)
 }
 
+async fn run_codex_post_refresh_checks(app: &AppHandle) {
+    if CODEX_POST_REFRESH_CHECK_IN_PROGRESS.swap(true, Ordering::SeqCst) {
+        logger::log_info("[AutoSwitch][Codex] 后置检查进行中，跳过本次执行");
+        return;
+    }
+
+    let mut switched = false;
+
+    match codex_account::pick_auto_switch_target_if_needed() {
+        Ok(Some(target)) => {
+            let target_id = target.id.clone();
+            match switch_codex_account(app.clone(), target_id.clone()).await {
+                Ok(switched_account) => {
+                    logger::log_info(&format!(
+                        "[AutoSwitch][Codex] 自动切号完成: target_id={}, email={}",
+                        switched_account.id, switched_account.email
+                    ));
+                    switched = true;
+                }
+                Err(e) => {
+                    logger::log_warn(&format!(
+                        "[AutoSwitch][Codex] 自动切号失败: target_id={}, error={}",
+                        target_id, e
+                    ));
+                }
+            }
+        }
+        Ok(None) => {}
+        Err(e) => {
+            logger::log_warn(&format!("[AutoSwitch][Codex] 自动切号检查失败: {}", e));
+        }
+    }
+
+    if !switched {
+        if let Err(e) = codex_account::run_quota_alert_if_needed() {
+            logger::log_warn(&format!("[QuotaAlert][Codex] 预警检查失败: {}", e));
+        }
+    }
+
+    CODEX_POST_REFRESH_CHECK_IN_PROGRESS.store(false, Ordering::SeqCst);
+}
+
 /// 删除 Codex 账号
 #[tauri::command]
 pub fn delete_codex_account(account_id: String) -> Result<(), String> {
@@ -156,9 +201,7 @@ pub fn import_codex_from_files(
 pub async fn refresh_codex_quota(app: AppHandle, account_id: String) -> Result<CodexQuota, String> {
     let result = codex_quota::refresh_account_quota(&account_id).await;
     if result.is_ok() {
-        if let Err(e) = codex_account::run_quota_alert_if_needed() {
-            logger::log_warn(&format!("[QuotaAlert][Codex] 预警检查失败: {}", e));
-        }
+        run_codex_post_refresh_checks(&app).await;
         let _ = crate::modules::tray::update_tray_menu(&app);
     }
     result
@@ -171,12 +214,7 @@ pub async fn refresh_current_codex_quota(app: AppHandle) -> Result<(), String> {
     };
     let result = codex_quota::refresh_account_quota(&account.id).await;
     if result.is_ok() {
-        if let Err(e) = codex_account::run_quota_alert_if_needed() {
-            logger::log_warn(&format!(
-                "[QuotaAlert][Codex] 当前账号刷新后预警检查失败: {}",
-                e
-            ));
-        }
+        run_codex_post_refresh_checks(&app).await;
         let _ = crate::modules::tray::update_tray_menu(&app);
         Ok(())
     } else {
@@ -192,12 +230,7 @@ pub async fn refresh_all_codex_quotas(app: AppHandle) -> Result<i32, String> {
     let results = codex_quota::refresh_all_quotas().await?;
     let success_count = results.iter().filter(|(_, r)| r.is_ok()).count();
     if success_count > 0 {
-        if let Err(e) = codex_account::run_quota_alert_if_needed() {
-            logger::log_warn(&format!(
-                "[QuotaAlert][Codex] 全量刷新后预警检查失败: {}",
-                e
-            ));
-        }
+        run_codex_post_refresh_checks(&app).await;
     }
     let _ = crate::modules::tray::update_tray_menu(&app);
     Ok(success_count as i32)

@@ -185,6 +185,7 @@ type QuotaAlertPayload = {
   current_account_id: string;
   current_email: string;
   threshold: number;
+  threshold_display?: string | null;
   lowest_percentage: number;
   low_models: string[];
   recommended_account_id?: string | null;
@@ -1413,7 +1414,7 @@ function App() {
             </div>
             <div className="quota-alert-modal-row">
               <span>{t('quotaAlert.modal.threshold', '预警阈值')}</span>
-              <strong>{payload.threshold}%</strong>
+              <strong>{payload.threshold_display || `${payload.threshold}%`}</strong>
             </div>
             <div className="quota-alert-modal-row">
               <span>{t('quotaAlert.modal.lowest', '当前最低')}</span>

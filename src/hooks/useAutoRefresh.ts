@@ -27,6 +27,8 @@ interface GeneralConfig {
   qoder_auto_refresh_minutes: number;
   trae_auto_refresh_minutes: number;
   auto_switch_enabled: boolean;
+  codex_auto_switch_enabled?: boolean;
+  codex_quota_alert_enabled?: boolean;
   close_behavior: string;
   opencode_app_path?: string;
   antigravity_app_path?: string;
@@ -57,6 +59,8 @@ export function useAutoRefresh() {
   const fetchCurrentAccount = useAccountStore((state) => state.fetchCurrentAccount);
 
   const refreshAllCodexQuotas = useCodexAccountStore((state) => state.refreshAllQuotas);
+  const fetchCodexAccounts = useCodexAccountStore((state) => state.fetchAccounts);
+  const fetchCurrentCodexAccount = useCodexAccountStore((state) => state.fetchCurrentAccount);
   const refreshAllGhcpTokens = useGitHubCopilotAccountStore((state) => state.refreshAllTokens);
   const refreshAllWindsurfTokens = useWindsurfAccountStore((state) => state.refreshAllTokens);
   const refreshAllKiroTokens = useKiroAccountStore((state) => state.refreshAllTokens);
@@ -70,6 +74,7 @@ export function useAutoRefresh() {
   const agIntervalRef = useRef<number | null>(null);
   const autoSwitchIntervalRef = useRef<number | null>(null);
   const codexIntervalRef = useRef<number | null>(null);
+  const codexCurrentRefreshIntervalRef = useRef<number | null>(null);
   const ghcpIntervalRef = useRef<number | null>(null);
   const windsurfIntervalRef = useRef<number | null>(null);
   const kiroIntervalRef = useRef<number | null>(null);
@@ -82,6 +87,7 @@ export function useAutoRefresh() {
 
   const agRefreshingRef = useRef(false);
   const codexRefreshingRef = useRef(false);
+  const codexCurrentRefreshingRef = useRef(false);
   const ghcpRefreshingRef = useRef(false);
   const windsurfRefreshingRef = useRef(false);
   const kiroRefreshingRef = useRef(false);
@@ -105,6 +111,10 @@ export function useAutoRefresh() {
     if (codexIntervalRef.current) {
       window.clearInterval(codexIntervalRef.current);
       codexIntervalRef.current = null;
+    }
+    if (codexCurrentRefreshIntervalRef.current) {
+      window.clearInterval(codexCurrentRefreshIntervalRef.current);
+      codexCurrentRefreshIntervalRef.current = null;
     }
     if (ghcpIntervalRef.current) {
       window.clearInterval(ghcpIntervalRef.current);
@@ -302,6 +312,35 @@ export function useAutoRefresh() {
             }, codexMs);
           } else {
             console.log('[AutoRefresh] Codex 已禁用');
+          }
+
+          // Codex 自动切号或预警开启时，额外每 60 秒刷新当前账号（不影响原有 Codex 自动刷新规则）
+          if (config.codex_auto_switch_enabled || config.codex_quota_alert_enabled) {
+            const reasons = [
+              config.codex_auto_switch_enabled ? 'auto_switch' : null,
+              config.codex_quota_alert_enabled ? 'quota_alert' : null,
+            ]
+              .filter(Boolean)
+              .join('+');
+            console.log(`[AutoRefresh] Codex ${reasons} 已启用: 每 60 秒刷新当前账号`);
+            codexCurrentRefreshIntervalRef.current = window.setInterval(async () => {
+              if (codexCurrentRefreshingRef.current) {
+                return;
+              }
+              codexCurrentRefreshingRef.current = true;
+
+              try {
+                await invoke('refresh_current_codex_quota');
+                await fetchCodexAccounts();
+                await fetchCurrentCodexAccount();
+              } catch (e) {
+                console.error('[AutoRefresh] Codex 自动切号/预警-当前账号刷新失败:', e);
+              } finally {
+                codexCurrentRefreshingRef.current = false;
+              }
+            }, 60 * 1000);
+          } else {
+            console.log('[AutoRefresh] Codex 自动切号/预警未启用，跳过 60 秒当前账号刷新');
           }
 
           if (config.ghcp_auto_refresh_minutes > 0) {
@@ -540,6 +579,9 @@ export function useAutoRefresh() {
           const enabledPlatforms = [
             config.auto_refresh_minutes > 0 ? `antigravity=${config.auto_refresh_minutes}` : null,
             config.codex_auto_refresh_minutes > 0 ? `codex=${config.codex_auto_refresh_minutes}` : null,
+            config.codex_auto_switch_enabled || config.codex_quota_alert_enabled
+              ? 'codex_current=60s'
+              : null,
             config.ghcp_auto_refresh_minutes > 0 ? `ghcp=${config.ghcp_auto_refresh_minutes}` : null,
             config.windsurf_auto_refresh_minutes > 0 ? `windsurf=${config.windsurf_auto_refresh_minutes}` : null,
             config.kiro_auto_refresh_minutes > 0 ? `kiro=${config.kiro_auto_refresh_minutes}` : null,
@@ -572,6 +614,8 @@ export function useAutoRefresh() {
     }
   }, [
     clearAllIntervals,
+    fetchCodexAccounts,
+    fetchCurrentCodexAccount,
     fetchAccounts,
     fetchCurrentAccount,
     refreshAllCodexQuotas,

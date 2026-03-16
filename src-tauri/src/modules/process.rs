@@ -5864,8 +5864,8 @@ pub fn start_codex_with_args(codex_home: &str, extra_args: &[String]) -> Result<
     }
 }
 
-/// 启动 Codex 默认实例（不注入 CODEX_HOME/额外参数，支持 macOS / Windows）
-pub fn start_codex_default() -> Result<u32, String> {
+/// 启动 Codex 默认实例（不注入 CODEX_HOME，支持附加参数，支持 macOS / Windows）
+pub fn start_codex_default(extra_args: &[String]) -> Result<u32, String> {
     #[cfg(target_os = "macos")]
     {
         let app_root = resolve_macos_app_root_from_config("codex").or_else(|| {
@@ -5875,8 +5875,16 @@ pub fn start_codex_default() -> Result<u32, String> {
         });
         let app_root = app_root.ok_or_else(|| app_path_missing_error("codex"))?;
 
+        let mut args: Vec<String> = Vec::new();
+        for arg in extra_args {
+            let trimmed = arg.trim();
+            if !trimmed.is_empty() {
+                args.push(trimmed.to_string());
+            }
+        }
+
         // 使用 open -n -a 启动默认实例，避免复用已运行的其他 Codex 实例
-        let open_pid = spawn_open_app_with_options(&app_root, &[], true)
+        let open_pid = spawn_open_app_with_options(&app_root, &args, true)
             .map_err(|e| format!("启动 Codex 失败: {}", e))?;
         crate::modules::logger::log_info("Codex 启动命令已发送（open -n -a）");
         // 轮询获取真实 PID
@@ -5908,6 +5916,12 @@ pub fn start_codex_default() -> Result<u32, String> {
                 .stderr(Stdio::null());
         }
         // Codex 是 GUI 应用，不设置 CREATE_NO_WINDOW，否则会导致其内部 spawn CLI 子进程失败
+        for arg in extra_args {
+            let trimmed = arg.trim();
+            if !trimmed.is_empty() {
+                cmd.arg(trimmed);
+            }
+        }
 
         let child =
             spawn_command_with_trace(&mut cmd).map_err(|e| format!("启动 Codex 失败: {}", e))?;
@@ -5916,7 +5930,10 @@ pub fn start_codex_default() -> Result<u32, String> {
     }
 
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-    Err("Codex 启动仅支持 macOS 和 Windows".to_string())
+    {
+        let _ = extra_args;
+        Err("Codex 启动仅支持 macOS 和 Windows".to_string())
+    }
 }
 
 /// 关闭受管 Codex 实例（按 CODEX_HOME 匹配，包含默认实例目录）

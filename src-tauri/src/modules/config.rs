@@ -157,6 +157,15 @@ pub struct UserConfig {
     /// 自动切号阈值（百分比），任意模型配额低于此值触发
     #[serde(default = "default_auto_switch_threshold")]
     pub auto_switch_threshold: i32,
+    /// 是否启用 Codex 自动切号
+    #[serde(default = "default_codex_auto_switch_enabled")]
+    pub codex_auto_switch_enabled: bool,
+    /// Codex primary_window 自动切号阈值（百分比）
+    #[serde(default = "default_codex_auto_switch_primary_threshold")]
+    pub codex_auto_switch_primary_threshold: i32,
+    /// Codex secondary_window 自动切号阈值（百分比）
+    #[serde(default = "default_codex_auto_switch_secondary_threshold")]
+    pub codex_auto_switch_secondary_threshold: i32,
     /// 是否启用配额预警通知
     #[serde(default = "default_quota_alert_enabled")]
     pub quota_alert_enabled: bool,
@@ -169,6 +178,12 @@ pub struct UserConfig {
     /// Codex 配额预警阈值（百分比）
     #[serde(default = "default_codex_quota_alert_threshold")]
     pub codex_quota_alert_threshold: i32,
+    /// Codex primary_window 配额预警阈值（百分比）
+    #[serde(default = "default_codex_quota_alert_primary_threshold")]
+    pub codex_quota_alert_primary_threshold: i32,
+    /// Codex secondary_window 配额预警阈值（百分比）
+    #[serde(default = "default_codex_quota_alert_secondary_threshold")]
+    pub codex_quota_alert_secondary_threshold: i32,
     /// 是否启用 GitHub Copilot 配额预警通知
     #[serde(default = "default_ghcp_quota_alert_enabled")]
     pub ghcp_quota_alert_enabled: bool,
@@ -382,6 +397,15 @@ fn default_auto_switch_enabled() -> bool {
 fn default_auto_switch_threshold() -> i32 {
     5
 }
+fn default_codex_auto_switch_enabled() -> bool {
+    false
+}
+fn default_codex_auto_switch_primary_threshold() -> i32 {
+    20
+}
+fn default_codex_auto_switch_secondary_threshold() -> i32 {
+    20
+}
 fn default_quota_alert_enabled() -> bool {
     false
 }
@@ -392,6 +416,12 @@ fn default_codex_quota_alert_enabled() -> bool {
     false
 }
 fn default_codex_quota_alert_threshold() -> i32 {
+    20
+}
+fn default_codex_quota_alert_primary_threshold() -> i32 {
+    20
+}
+fn default_codex_quota_alert_secondary_threshold() -> i32 {
     20
 }
 fn default_ghcp_quota_alert_enabled() -> bool {
@@ -497,10 +527,15 @@ impl Default for UserConfig {
             codex_launch_on_switch: default_codex_launch_on_switch(),
             auto_switch_enabled: default_auto_switch_enabled(),
             auto_switch_threshold: default_auto_switch_threshold(),
+            codex_auto_switch_enabled: default_codex_auto_switch_enabled(),
+            codex_auto_switch_primary_threshold: default_codex_auto_switch_primary_threshold(),
+            codex_auto_switch_secondary_threshold: default_codex_auto_switch_secondary_threshold(),
             quota_alert_enabled: default_quota_alert_enabled(),
             quota_alert_threshold: default_quota_alert_threshold(),
             codex_quota_alert_enabled: default_codex_quota_alert_enabled(),
             codex_quota_alert_threshold: default_codex_quota_alert_threshold(),
+            codex_quota_alert_primary_threshold: default_codex_quota_alert_primary_threshold(),
+            codex_quota_alert_secondary_threshold: default_codex_quota_alert_secondary_threshold(),
             ghcp_quota_alert_enabled: default_ghcp_quota_alert_enabled(),
             ghcp_quota_alert_threshold: default_ghcp_quota_alert_threshold(),
             windsurf_quota_alert_enabled: default_windsurf_quota_alert_enabled(),
@@ -697,6 +732,15 @@ pub fn load_user_config() -> Result<UserConfig, String> {
             .and_then(|v| v.as_i64())
             .map(|v| v as i32)
             .unwrap_or_else(default_quota_alert_threshold);
+        let legacy_auto_switch_enabled = obj
+            .get("codex_auto_switch_enabled")
+            .and_then(|v| v.as_bool())
+            .unwrap_or_else(default_codex_auto_switch_enabled);
+        let legacy_auto_switch_threshold = obj
+            .get("codex_auto_switch_primary_threshold")
+            .and_then(|v| v.as_i64())
+            .map(|v| v as i32)
+            .unwrap_or_else(default_codex_auto_switch_primary_threshold);
 
         if !obj.contains_key("codex_quota_alert_enabled") {
             obj.insert(
@@ -708,6 +752,41 @@ pub fn load_user_config() -> Result<UserConfig, String> {
             obj.insert(
                 "codex_quota_alert_threshold".to_string(),
                 json!(legacy_threshold),
+            );
+        }
+        if !obj.contains_key("codex_auto_switch_enabled") {
+            obj.insert(
+                "codex_auto_switch_enabled".to_string(),
+                json!(legacy_auto_switch_enabled),
+            );
+        }
+        if !obj.contains_key("codex_auto_switch_primary_threshold") {
+            obj.insert(
+                "codex_auto_switch_primary_threshold".to_string(),
+                json!(legacy_auto_switch_threshold),
+            );
+        }
+        if !obj.contains_key("codex_auto_switch_secondary_threshold") {
+            obj.insert(
+                "codex_auto_switch_secondary_threshold".to_string(),
+                json!(legacy_auto_switch_threshold),
+            );
+        }
+        let codex_legacy_threshold = obj
+            .get("codex_quota_alert_threshold")
+            .and_then(|v| v.as_i64())
+            .map(|v| v as i32)
+            .unwrap_or(legacy_threshold);
+        if !obj.contains_key("codex_quota_alert_primary_threshold") {
+            obj.insert(
+                "codex_quota_alert_primary_threshold".to_string(),
+                json!(codex_legacy_threshold),
+            );
+        }
+        if !obj.contains_key("codex_quota_alert_secondary_threshold") {
+            obj.insert(
+                "codex_quota_alert_secondary_threshold".to_string(),
+                json!(codex_legacy_threshold),
             );
         }
         if !obj.contains_key("ghcp_quota_alert_enabled") {

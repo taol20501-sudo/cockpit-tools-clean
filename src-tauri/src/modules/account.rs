@@ -824,6 +824,7 @@ pub struct QuotaAlertPayload {
     pub current_account_id: String,
     pub current_email: String,
     pub threshold: i32,
+    pub threshold_display: Option<String>,
     pub lowest_percentage: i32,
     pub low_models: Vec<String>,
     pub recommended_account_id: Option<String>,
@@ -1113,6 +1114,7 @@ pub fn run_quota_alert_if_needed() -> Result<Option<QuotaAlertPayload>, String> 
         current_account_id: current_id.clone(),
         current_email: current.email.clone(),
         threshold,
+        threshold_display: None,
         lowest_percentage,
         low_models: low_models.into_iter().map(|(name, _)| name).collect(),
         recommended_account_id: recommendation.as_ref().map(|acc| acc.id.clone()),
@@ -1391,9 +1393,16 @@ pub async fn switch_account_internal(account_id: &str) -> Result<Account, String
     let _ = modules::instance::update_default_pid(None);
     modules::instance::inject_account_to_profile(&default_dir, account_id)?;
 
-    // 7. 启动 Antigravity（启动失败不阻断切号，保持原行为）
+    // 7. 启动 Antigravity（带默认实例自定义启动参数；启动失败不阻断切号，保持原行为）
     modules::logger::log_info("[Switch] 正在启动 Antigravity 默认实例...");
-    match modules::process::start_antigravity() {
+    let default_settings = modules::instance::load_default_settings()?;
+    let extra_args = modules::process::parse_extra_args(&default_settings.extra_args);
+    let launch_result = if extra_args.is_empty() {
+        modules::process::start_antigravity()
+    } else {
+        modules::process::start_antigravity_with_args("", &extra_args)
+    };
+    match launch_result {
         Ok(pid) => {
             let _ = modules::instance::update_default_pid(Some(pid));
         }

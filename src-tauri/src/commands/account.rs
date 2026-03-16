@@ -225,9 +225,16 @@ pub async fn switch_account(app: AppHandle, account_id: String) -> Result<models
     let _ = modules::instance::update_default_pid(None);
     modules::instance::inject_account_to_profile(&default_dir, &account_id)?;
 
-    // 7. 启动 Antigravity（启动失败不阻断切号，保持原行为）
+    // 7. 启动 Antigravity（带默认实例自定义启动参数；启动失败不阻断切号，保持原行为）
     modules::logger::log_info("正在启动 Antigravity 默认实例...");
-    let launch_error = match modules::process::start_antigravity() {
+    let default_settings = modules::instance::load_default_settings()?;
+    let extra_args = modules::process::parse_extra_args(&default_settings.extra_args);
+    let launch_result = if extra_args.is_empty() {
+        modules::process::start_antigravity()
+    } else {
+        modules::process::start_antigravity_with_args("", &extra_args)
+    };
+    let launch_error = match launch_result {
         Ok(pid) => {
             if let Err(e) = modules::instance::update_default_pid(Some(pid)) {
                 modules::logger::log_warn(&format!("更新默认实例 PID 失败: {}", e));

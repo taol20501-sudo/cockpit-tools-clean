@@ -129,12 +129,14 @@ export const useCodexAccountStore = create<CodexAccountState>((set, get) => ({
   refreshQuota: async (accountId: string) => {
     const quota = await codexService.refreshCodexQuota(accountId);
     await get().fetchAccounts();
+    await get().fetchCurrentAccount();
     return quota;
   },
   
   refreshAllQuotas: async () => {
     const successCount = await codexService.refreshAllCodexQuotas();
     await get().fetchAccounts();
+    await get().fetchCurrentAccount();
     return successCount;
   },
 

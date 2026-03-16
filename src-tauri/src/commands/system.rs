@@ -103,6 +103,12 @@ pub struct GeneralConfig {
     pub auto_switch_enabled: bool,
     /// 自动切号阈值（百分比）
     pub auto_switch_threshold: i32,
+    /// 是否启用 Codex 自动切号
+    pub codex_auto_switch_enabled: bool,
+    /// Codex primary_window 自动切号阈值（百分比）
+    pub codex_auto_switch_primary_threshold: i32,
+    /// Codex secondary_window 自动切号阈值（百分比）
+    pub codex_auto_switch_secondary_threshold: i32,
     /// 是否启用配额预警通知
     pub quota_alert_enabled: bool,
     /// 配额预警阈值（百分比）
@@ -111,6 +117,10 @@ pub struct GeneralConfig {
     pub codex_quota_alert_enabled: bool,
     /// Codex 配额预警阈值（百分比）
     pub codex_quota_alert_threshold: i32,
+    /// Codex primary_window 配额预警阈值（百分比）
+    pub codex_quota_alert_primary_threshold: i32,
+    /// Codex secondary_window 配额预警阈值（百分比）
+    pub codex_quota_alert_secondary_threshold: i32,
     /// 是否启用 GitHub Copilot 配额预警通知
     pub ghcp_quota_alert_enabled: bool,
     /// GitHub Copilot 配额预警阈值（百分比）
@@ -297,10 +307,15 @@ pub fn save_network_config(
         codex_launch_on_switch: current.codex_launch_on_switch,
         auto_switch_enabled: current.auto_switch_enabled,
         auto_switch_threshold: current.auto_switch_threshold,
+        codex_auto_switch_enabled: current.codex_auto_switch_enabled,
+        codex_auto_switch_primary_threshold: current.codex_auto_switch_primary_threshold,
+        codex_auto_switch_secondary_threshold: current.codex_auto_switch_secondary_threshold,
         quota_alert_enabled: current.quota_alert_enabled,
         quota_alert_threshold: current.quota_alert_threshold,
         codex_quota_alert_enabled: current.codex_quota_alert_enabled,
         codex_quota_alert_threshold: current.codex_quota_alert_threshold,
+        codex_quota_alert_primary_threshold: current.codex_quota_alert_primary_threshold,
+        codex_quota_alert_secondary_threshold: current.codex_quota_alert_secondary_threshold,
         ghcp_quota_alert_enabled: current.ghcp_quota_alert_enabled,
         ghcp_quota_alert_threshold: current.ghcp_quota_alert_threshold,
         windsurf_quota_alert_enabled: current.windsurf_quota_alert_enabled,
@@ -378,10 +393,15 @@ pub fn get_general_config() -> Result<GeneralConfig, String> {
         codex_launch_on_switch: user_config.codex_launch_on_switch,
         auto_switch_enabled: user_config.auto_switch_enabled,
         auto_switch_threshold: user_config.auto_switch_threshold,
+        codex_auto_switch_enabled: user_config.codex_auto_switch_enabled,
+        codex_auto_switch_primary_threshold: user_config.codex_auto_switch_primary_threshold,
+        codex_auto_switch_secondary_threshold: user_config.codex_auto_switch_secondary_threshold,
         quota_alert_enabled: user_config.quota_alert_enabled,
         quota_alert_threshold: user_config.quota_alert_threshold,
         codex_quota_alert_enabled: user_config.codex_quota_alert_enabled,
         codex_quota_alert_threshold: user_config.codex_quota_alert_threshold,
+        codex_quota_alert_primary_threshold: user_config.codex_quota_alert_primary_threshold,
+        codex_quota_alert_secondary_threshold: user_config.codex_quota_alert_secondary_threshold,
         ghcp_quota_alert_enabled: user_config.ghcp_quota_alert_enabled,
         ghcp_quota_alert_threshold: user_config.ghcp_quota_alert_threshold,
         windsurf_quota_alert_enabled: user_config.windsurf_quota_alert_enabled,
@@ -460,10 +480,15 @@ pub fn save_general_config(
     codex_launch_on_switch: bool,
     auto_switch_enabled: Option<bool>,
     auto_switch_threshold: Option<i32>,
+    codex_auto_switch_enabled: Option<bool>,
+    codex_auto_switch_primary_threshold: Option<i32>,
+    codex_auto_switch_secondary_threshold: Option<i32>,
     quota_alert_enabled: Option<bool>,
     quota_alert_threshold: Option<i32>,
     codex_quota_alert_enabled: Option<bool>,
     codex_quota_alert_threshold: Option<i32>,
+    codex_quota_alert_primary_threshold: Option<i32>,
+    codex_quota_alert_secondary_threshold: Option<i32>,
     ghcp_quota_alert_enabled: Option<bool>,
     ghcp_quota_alert_threshold: Option<i32>,
     windsurf_quota_alert_enabled: Option<bool>,
@@ -530,6 +555,8 @@ pub fn save_general_config(
         Some(_) | None => current.minimize_behavior.clone(),
     };
     let hide_dock_icon_value = hide_dock_icon.unwrap_or(current.hide_dock_icon);
+    let next_codex_quota_alert_threshold = codex_quota_alert_threshold
+        .unwrap_or(current.codex_quota_alert_threshold);
     #[cfg(target_os = "macos")]
     let hide_dock_icon_changed = current.hide_dock_icon != hide_dock_icon_value;
 
@@ -585,12 +612,21 @@ pub fn save_general_config(
         codex_launch_on_switch,
         auto_switch_enabled: auto_switch_enabled.unwrap_or(current.auto_switch_enabled),
         auto_switch_threshold: auto_switch_threshold.unwrap_or(current.auto_switch_threshold),
+        codex_auto_switch_enabled: codex_auto_switch_enabled
+            .unwrap_or(current.codex_auto_switch_enabled),
+        codex_auto_switch_primary_threshold: codex_auto_switch_primary_threshold
+            .unwrap_or(current.codex_auto_switch_primary_threshold),
+        codex_auto_switch_secondary_threshold: codex_auto_switch_secondary_threshold
+            .unwrap_or(current.codex_auto_switch_secondary_threshold),
         quota_alert_enabled: quota_alert_enabled.unwrap_or(current.quota_alert_enabled),
         quota_alert_threshold: quota_alert_threshold.unwrap_or(current.quota_alert_threshold),
         codex_quota_alert_enabled: codex_quota_alert_enabled
             .unwrap_or(current.codex_quota_alert_enabled),
-        codex_quota_alert_threshold: codex_quota_alert_threshold
-            .unwrap_or(current.codex_quota_alert_threshold),
+        codex_quota_alert_threshold: next_codex_quota_alert_threshold,
+        codex_quota_alert_primary_threshold: codex_quota_alert_primary_threshold
+            .unwrap_or(next_codex_quota_alert_threshold),
+        codex_quota_alert_secondary_threshold: codex_quota_alert_secondary_threshold
+            .unwrap_or(next_codex_quota_alert_threshold),
         ghcp_quota_alert_enabled: ghcp_quota_alert_enabled
             .unwrap_or(current.ghcp_quota_alert_enabled),
         ghcp_quota_alert_threshold: ghcp_quota_alert_threshold
