@@ -7,6 +7,13 @@ All notable changes to Cockpit Tools will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
+## [0.17.5] - 2026-03-20
+
+### Changed
+- **Windsurf account usage now follows the official billing mode presentation**: quota-billed accounts now show daily/weekly quota usage, reset times, and extra usage balance, while credits-billed accounts show combined credits left with prompt/add-on breakdown.
+- **Manual help entry is now unified across dashboard and overview headers**: dashboard and platform overview headers now reuse one shared help icon button with consistent sizing, hover feedback, and navigation behavior.
+
+---
 ## [0.17.4] - 2026-03-20
 
 ### Changed
