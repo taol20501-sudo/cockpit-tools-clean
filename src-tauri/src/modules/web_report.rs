@@ -898,12 +898,10 @@ fn append_windsurf_plan_status_candidate_rows(
     reset_fallback: &str,
     status: &str,
 ) -> usize {
-    let billing_strategy = pick_first_string(
-        plan_status,
-        &[&["billingStrategy"], &["billing_strategy"]],
-    )
-    .unwrap_or_default()
-    .to_ascii_lowercase();
+    let billing_strategy =
+        pick_first_string(plan_status, &[&["billingStrategy"], &["billing_strategy"]])
+            .unwrap_or_default()
+            .to_ascii_lowercase();
     let is_quota_strategy = billing_strategy.contains("quota");
 
     let daily_remaining_percent = pick_first_number(

@@ -11,6 +11,7 @@ use tauri::{AppHandle, Emitter};
 
 const TASKS_FILE: &str = "codex_wakeup_tasks.json";
 const HISTORY_FILE: &str = "codex_wakeup_history.json";
+const MANAGED_HOMES_DIR: &str = "codex_wakeup_homes";
 const MAX_HISTORY_ITEMS: usize = 300;
 const MAX_LOGGED_SEARCH_DIRS: usize = 8;
 pub const DEFAULT_PROMPT: &str = "hi";
@@ -206,6 +207,18 @@ fn history_path() -> Result<PathBuf, String> {
     Ok(data_dir()?.join(HISTORY_FILE))
 }
 
+fn managed_homes_root() -> Result<PathBuf, String> {
+    Ok(data_dir()?.join(MANAGED_HOMES_DIR))
+}
+
+fn managed_home_path(account_id: &str) -> Result<PathBuf, String> {
+    let trimmed = account_id.trim();
+    if trimmed.is_empty() {
+        return Err("账号 ID 为空，无法定位受管 CODEX_HOME".to_string());
+    }
+    Ok(managed_homes_root()?.join(trimmed))
+}
+
 fn install_hints() -> Vec<CodexCliInstallHint> {
     let mut hints = vec![CodexCliInstallHint {
         label: "npm".to_string(),
@@ -233,7 +246,10 @@ fn summarize_path_dirs_for_log(dirs: &[PathBuf]) -> String {
         .collect();
 
     if dirs.len() > MAX_LOGGED_SEARCH_DIRS {
-        preview.push(format!("...(+{} more)", dirs.len() - MAX_LOGGED_SEARCH_DIRS));
+        preview.push(format!(
+            "...(+{} more)",
+            dirs.len() - MAX_LOGGED_SEARCH_DIRS
+        ));
     }
 
     preview.join(" | ")
@@ -301,7 +317,8 @@ fn read_json_bool_map(
     object: &serde_json::Map<String, serde_json::Value>,
     keys: &[&str],
 ) -> Option<bool> {
-    keys.iter().find_map(|key| object.get(*key).and_then(|value| value.as_bool()))
+    keys.iter()
+        .find_map(|key| object.get(*key).and_then(|value| value.as_bool()))
 }
 
 fn extract_workspace_title(account: &crate::models::codex::CodexAccount) -> Option<String> {
@@ -309,7 +326,9 @@ fn extract_workspace_title(account: &crate::models::codex::CodexAccount) -> Opti
     let auth = payload
         .get("https://api.openai.com/auth")
         .and_then(|value| value.as_object())?;
-    let organizations = auth.get("organizations").and_then(|value| value.as_array())?;
+    let organizations = auth
+        .get("organizations")
+        .and_then(|value| value.as_array())?;
     let expected_org = normalize_text(account.organization_id.as_deref());
     let mut matched_title: Option<String> = None;
     let mut default_title: Option<String> = None;
@@ -322,7 +341,13 @@ fn extract_workspace_title(account: &crate::models::codex::CodexAccount) -> Opti
         let org_id = read_json_string_map(object, &["id", "organization_id", "workspace_id"]);
         let title = read_json_string_map(
             object,
-            &["title", "name", "display_name", "workspace_name", "organization_name"],
+            &[
+                "title",
+                "name",
+                "display_name",
+                "workspace_name",
+                "organization_name",
+            ],
         )
         .or_else(|| org_id.clone());
         let Some(title) = title else {
@@ -567,10 +592,7 @@ fn resolve_node_for_binary(binary_path: &Path) -> Result<Option<PathBuf>, String
                 ));
                 Ok(Some(path))
             } else {
-                let err = format!(
-                    "Codex CLI 指定的 Node.js 不存在: {}",
-                    path.display()
-                );
+                let err = format!("Codex CLI 指定的 Node.js 不存在: {}", path.display());
                 logger::log_warn(&format!(
                     "[CodexWakeup][CLI] {} | codex_path={}",
                     err,
@@ -595,8 +617,8 @@ fn resolve_node_for_binary(binary_path: &Path) -> Result<Option<PathBuf>, String
                 })
                 .ok_or_else(|| {
                     let err = format!(
-                    "Codex CLI 依赖 Node.js，但未找到可用的 node 解释器: {}",
-                    binary_path.display()
+                        "Codex CLI 依赖 Node.js，但未找到可用的 node 解释器: {}",
+                        binary_path.display()
                     );
                     logger::log_warn(&format!("[CodexWakeup][CLI] {}", err));
                     err
@@ -660,7 +682,10 @@ fn fetch_binary_version(path: &Path) -> Option<String> {
     let binary = match build_resolved_binary(path.to_path_buf(), "runtime".to_string()) {
         Ok(binary) => binary,
         Err(err) => {
-            logger::log_warn(&format!("[CodexWakeup][CLI] 版本探测前解析运行时失败: {}", err));
+            logger::log_warn(&format!(
+                "[CodexWakeup][CLI] 版本探测前解析运行时失败: {}",
+                err
+            ));
             return None;
         }
     };
@@ -899,17 +924,14 @@ pub fn load_state() -> Result<CodexWakeupState, String> {
     if !path.exists() {
         return Ok(CodexWakeupState::default());
     }
-    let content = fs::read_to_string(&path).map_err(|e| format!("读取 Codex 唤醒任务失败: {}", e))?;
+    let content =
+        fs::read_to_string(&path).map_err(|e| format!("读取 Codex 唤醒任务失败: {}", e))?;
     if content.trim().is_empty() {
         return Ok(CodexWakeupState::default());
     }
     let mut state: CodexWakeupState =
         serde_json::from_str(&content).map_err(|e| format!("解析 Codex 唤醒任务失败: {}", e))?;
-    state.tasks = state
-        .tasks
-        .iter()
-        .map(normalize_task)
-        .collect();
+    state.tasks = state.tasks.iter().map(normalize_task).collect();
     let changed = disable_tasks_when_cli_missing(&mut state);
     refresh_next_run_at(&mut state);
     if changed {
@@ -929,9 +951,7 @@ pub fn save_state(next_state: &CodexWakeupState) -> Result<CodexWakeupState, Str
             .iter()
             .map(normalize_task)
             .filter(|task| {
-                !task.id.is_empty()
-                    && !task.account_ids.is_empty()
-                    && seen.insert(task.id.clone())
+                !task.id.is_empty() && !task.account_ids.is_empty() && seen.insert(task.id.clone())
             })
             .collect(),
     };
@@ -948,7 +968,8 @@ pub fn load_history() -> Result<Vec<CodexWakeupHistoryItem>, String> {
     if !path.exists() {
         return Ok(Vec::new());
     }
-    let content = fs::read_to_string(&path).map_err(|e| format!("读取 Codex 唤醒历史失败: {}", e))?;
+    let content =
+        fs::read_to_string(&path).map_err(|e| format!("读取 Codex 唤醒历史失败: {}", e))?;
     if content.trim().is_empty() {
         return Ok(Vec::new());
     }
@@ -959,7 +980,9 @@ pub fn add_history_items(new_items: Vec<CodexWakeupHistoryItem>) -> Result<(), S
     if new_items.is_empty() {
         return Ok(());
     }
-    let _lock = HISTORY_LOCK.lock().map_err(|_| "获取 Codex 唤醒历史锁失败")?;
+    let _lock = HISTORY_LOCK
+        .lock()
+        .map_err(|_| "获取 Codex 唤醒历史锁失败")?;
     let mut existing = load_history().unwrap_or_default();
     let existing_ids: HashSet<String> = existing.iter().map(|item| item.id.clone()).collect();
     let mut merged: Vec<CodexWakeupHistoryItem> = new_items
@@ -973,7 +996,9 @@ pub fn add_history_items(new_items: Vec<CodexWakeupHistoryItem>) -> Result<(), S
 }
 
 pub fn clear_history() -> Result<(), String> {
-    let _lock = HISTORY_LOCK.lock().map_err(|_| "获取 Codex 唤醒历史锁失败")?;
+    let _lock = HISTORY_LOCK
+        .lock()
+        .map_err(|_| "获取 Codex 唤醒历史锁失败")?;
     save_json_atomic(&history_path()?, &Vec::<CodexWakeupHistoryItem>::new())
 }
 
@@ -996,7 +1021,11 @@ fn apply_hidden_window_flags(command: &mut Command) {
 #[cfg(not(target_os = "windows"))]
 fn apply_hidden_window_flags(_command: &mut Command) {}
 
-fn run_codex_exec_sync(binary_path: &Path, codex_home: &Path, prompt: &str) -> Result<CommandOutput, String> {
+fn run_codex_exec_sync(
+    binary_path: &Path,
+    codex_home: &Path,
+    prompt: &str,
+) -> Result<CommandOutput, String> {
     let workspace_dir = codex_home.join("workspace");
     fs::create_dir_all(&workspace_dir).map_err(|e| format!("创建唤醒工作目录失败: {}", e))?;
     let last_message_path = codex_home.join("last_message.txt");
@@ -1148,9 +1177,7 @@ fn create_cli_missing_record(
         .as_ref()
         .map(|account| account.email.clone())
         .unwrap_or_else(|| account_id.to_string());
-    let account_context_text = existing
-        .as_ref()
-        .and_then(resolve_account_context_text);
+    let account_context_text = existing.as_ref().and_then(resolve_account_context_text);
 
     create_failure_record(
         run_id,
@@ -1232,8 +1259,27 @@ async fn run_single_account(
         }
     };
 
-    let temp_home = std::env::temp_dir().join("ag-codex-wakeup").join(uuid::Uuid::new_v4().to_string());
-    if let Err(err) = fs::create_dir_all(&temp_home) {
+    let managed_home = match managed_home_path(&account.id) {
+        Ok(path) => path,
+        Err(err) => {
+            let account_context_text = resolve_account_context_text(&account);
+            let account_email = account.email;
+            return create_failure_record(
+                run_id,
+                &context.trigger_type,
+                context.task_id.as_deref(),
+                context.task_name.as_deref(),
+                account_id,
+                account_email,
+                account_context_text,
+                prompt_value,
+                err,
+                Some(binary.path.display().to_string()),
+            );
+        }
+    };
+
+    if let Err(err) = fs::create_dir_all(&managed_home) {
         let account_context_text = resolve_account_context_text(&account);
         let account_email = account.email;
         return create_failure_record(
@@ -1245,13 +1291,12 @@ async fn run_single_account(
             account_email,
             account_context_text,
             prompt_value,
-            format!("创建临时 CODEX_HOME 失败: {}", err),
+            format!("创建受管 CODEX_HOME 失败: {}", err),
             Some(binary.path.display().to_string()),
         );
     }
 
-    if let Err(err) = codex_account::write_auth_file_to_dir(&temp_home, &account) {
-        let _ = fs::remove_dir_all(&temp_home);
+    if let Err(err) = codex_account::write_auth_file_to_dir(&managed_home, &account) {
         let account_context_text = resolve_account_context_text(&account);
         let account_email = account.email;
         return create_failure_record(
@@ -1268,33 +1313,31 @@ async fn run_single_account(
         );
     }
 
-    let command_result = run_codex_exec_sync(&binary.path, &temp_home, prompt);
-
-    let _ = fs::remove_dir_all(&temp_home);
+    let command_result = run_codex_exec_sync(&binary.path, &managed_home, prompt);
 
     match command_result {
         Ok(output) => {
             let account_context_text = resolve_account_context_text(&account);
             let account_email = account.email;
             CodexWakeupHistoryItem {
-            id: uuid::Uuid::new_v4().to_string(),
-            run_id: run_id.to_string(),
-            timestamp: now_ms(),
-            trigger_type: context.trigger_type.clone(),
-            task_id: context.task_id.clone(),
-            task_name: context.task_name.clone(),
-            account_id: account_id.to_string(),
-            account_email,
-            account_context_text,
-            success: true,
-            prompt: prompt_value,
-            reply: Some(output.reply),
-            error: None,
-            quota_refresh_error: None,
-            duration_ms: Some(output.duration_ms),
-            cli_path: Some(binary.path.display().to_string()),
-            quota_before: None,
-            quota_after: None,
+                id: uuid::Uuid::new_v4().to_string(),
+                run_id: run_id.to_string(),
+                timestamp: now_ms(),
+                trigger_type: context.trigger_type.clone(),
+                task_id: context.task_id.clone(),
+                task_name: context.task_name.clone(),
+                account_id: account_id.to_string(),
+                account_email,
+                account_context_text,
+                success: true,
+                prompt: prompt_value,
+                reply: Some(output.reply),
+                error: None,
+                quota_refresh_error: None,
+                duration_ms: Some(output.duration_ms),
+                cli_path: Some(binary.path.display().to_string()),
+                quota_before: None,
+                quota_after: None,
             }
         }
         Err(err) => {
@@ -1373,7 +1416,8 @@ pub async fn run_batch(
                 None,
             );
 
-            let record = create_cli_missing_record(&run_id, &context, account_id, Some(prompt.clone()));
+            let record =
+                create_cli_missing_record(&run_id, &context, account_id, Some(prompt.clone()));
             if record.success {
                 success_count += 1;
             } else {
@@ -1438,7 +1482,8 @@ pub async fn run_batch(
             Some(&account_id),
             None,
         );
-        let record = run_single_account(binary.as_ref(), &run_id, &context, &account_id, &prompt).await;
+        let record =
+            run_single_account(binary.as_ref(), &run_id, &context, &account_id, &prompt).await;
         if record.success {
             success_count += 1;
         } else {
@@ -1484,9 +1529,14 @@ pub async fn run_batch(
     })
 }
 
-fn summarize_task_result(records: &[CodexWakeupHistoryItem]) -> (Option<String>, Option<u64>, Option<i64>) {
+fn summarize_task_result(
+    records: &[CodexWakeupHistoryItem],
+) -> (Option<String>, Option<u64>, Option<i64>) {
     let latest_ts = records.iter().map(|item| item.timestamp).max();
-    let total_duration = records.iter().filter_map(|item| item.duration_ms).sum::<u64>();
+    let total_duration = records
+        .iter()
+        .filter_map(|item| item.duration_ms)
+        .sum::<u64>();
 
     (
         None,
@@ -1499,7 +1549,10 @@ fn summarize_task_result(records: &[CodexWakeupHistoryItem]) -> (Option<String>,
     )
 }
 
-pub fn update_task_after_run(task_id: &str, records: &[CodexWakeupHistoryItem]) -> Result<(), String> {
+pub fn update_task_after_run(
+    task_id: &str,
+    records: &[CodexWakeupHistoryItem],
+) -> Result<(), String> {
     let mut state = load_state()?;
     let Some(task) = state.tasks.iter_mut().find(|item| item.id == task_id) else {
         return Ok(());
@@ -1512,8 +1565,16 @@ pub fn update_task_after_run(task_id: &str, records: &[CodexWakeupHistoryItem]) 
     task.last_run_at = Some(now_ts());
     task.last_status = Some(if all_success { "success" } else { "error" }.to_string());
     task.last_message = summary_message;
-    task.last_success_count = if records.is_empty() { None } else { Some(success_count) };
-    task.last_failure_count = if records.is_empty() { None } else { Some(failure_count) };
+    task.last_success_count = if records.is_empty() {
+        None
+    } else {
+        Some(success_count)
+    };
+    task.last_failure_count = if records.is_empty() {
+        None
+    } else {
+        Some(failure_count)
+    };
     task.last_duration_ms = total_duration;
     task.updated_at = now_ts();
     task.next_run_at = crate::modules::codex_wakeup_scheduler::calculate_next_run_at(task);
@@ -1522,5 +1583,8 @@ pub fn update_task_after_run(task_id: &str, records: &[CodexWakeupHistoryItem]) 
 }
 
 pub fn get_task(task_id: &str) -> Result<Option<CodexWakeupTask>, String> {
-    Ok(load_state()?.tasks.into_iter().find(|item| item.id == task_id))
+    Ok(load_state()?
+        .tasks
+        .into_iter()
+        .find(|item| item.id == task_id))
 }

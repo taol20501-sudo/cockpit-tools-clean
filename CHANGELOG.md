@@ -7,6 +7,16 @@ All notable changes to Cockpit Tools will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
+## [0.20.3] - 2026-03-24
+
+### Fixed
+- **Desktop update prompts now stay on a single app-controlled check flow instead of being re-checked inside the popup**: startup and manual checks now reuse the same updater result, detected updates are no longer lost because the dialog performs a second `check()`, silent downloads reopen the same dialog in the ready-to-restart state, and the app performs one startup check followed by hourly polling while it remains open.
+
+### Changed
+- **Codex wakeup now keeps a managed per-account `CODEX_HOME` instead of creating a temporary profile for every run**: each account now reuses a stable local wakeup home, `auth.json` is rewritten atomically before execution, and wakeup runs no longer create and delete a fresh temporary profile directory on every trigger.
+- **Windows process probing now uses a single inline PowerShell path without temporary script fallback**: Windows detection and launch helpers no longer write transient `.ps1` files or invoke `ExecutionPolicy Bypass` as a fallback when inline PowerShell execution fails.
+
+---
 ## [0.20.2] - 2026-03-23
 
 ### Fixed

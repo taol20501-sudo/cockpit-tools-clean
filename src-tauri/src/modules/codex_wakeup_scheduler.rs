@@ -68,7 +68,8 @@ fn current_due_at(task: &codex_wakeup::CodexWakeupTask, now: DateTime<Local>) ->
             }
         }
         "interval" => {
-            let interval_seconds = i64::from(task.schedule.interval_hours.unwrap_or(4).max(1)) * 3600;
+            let interval_seconds =
+                i64::from(task.schedule.interval_hours.unwrap_or(4).max(1)) * 3600;
             let due_at = task.last_run_at.unwrap_or(task.created_at) + interval_seconds;
             if due_at <= now.timestamp() {
                 Some(due_at)
@@ -110,7 +111,8 @@ pub fn calculate_next_run_at(task: &codex_wakeup::CodexWakeupTask) -> Option<i64
             None
         }
         "interval" => {
-            let interval_seconds = i64::from(task.schedule.interval_hours.unwrap_or(4).max(1)) * 3600;
+            let interval_seconds =
+                i64::from(task.schedule.interval_hours.unwrap_or(4).max(1)) * 3600;
             Some(task.last_run_at.unwrap_or(task.created_at) + interval_seconds)
         }
         _ => None,
@@ -118,12 +120,16 @@ pub fn calculate_next_run_at(task: &codex_wakeup::CodexWakeupTask) -> Option<i64
 }
 
 fn mark_running(task_id: &str) -> bool {
-    let mut guard = running_tasks().lock().expect("codex wakeup running tasks lock");
+    let mut guard = running_tasks()
+        .lock()
+        .expect("codex wakeup running tasks lock");
     guard.insert(task_id.to_string())
 }
 
 fn unmark_running(task_id: &str) {
-    let mut guard = running_tasks().lock().expect("codex wakeup running tasks lock");
+    let mut guard = running_tasks()
+        .lock()
+        .expect("codex wakeup running tasks lock");
     guard.remove(task_id);
 }
 
@@ -133,8 +139,8 @@ pub async fn run_task_now(
     trigger_type: &str,
     run_id: Option<String>,
 ) -> Result<codex_wakeup::CodexWakeupBatchResult, String> {
-    let task = codex_wakeup::get_task(task_id)?
-        .ok_or_else(|| format!("唤醒任务不存在: {}", task_id))?;
+    let task =
+        codex_wakeup::get_task(task_id)?.ok_or_else(|| format!("唤醒任务不存在: {}", task_id))?;
     if !mark_running(&task.id) {
         return Err("该任务正在执行中".to_string());
     }
@@ -144,7 +150,14 @@ pub async fn run_task_now(
         task_id: Some(task.id.clone()),
         task_name: Some(task.name.clone()),
     };
-    let result = codex_wakeup::run_batch(app, task.account_ids.clone(), task.prompt.clone(), context, run_id).await;
+    let result = codex_wakeup::run_batch(
+        app,
+        task.account_ids.clone(),
+        task.prompt.clone(),
+        context,
+        run_id,
+    )
+    .await;
 
     if let Ok(batch) = &result {
         if let Err(err) = codex_wakeup::update_task_after_run(&task.id, &batch.records) {
@@ -183,14 +196,19 @@ async fn run_scheduler_once(app: &AppHandle) {
         tauri::async_runtime::spawn(async move {
             let result = run_task_now(Some(&app_handle), &task_id, "scheduled", None).await;
             if let Err(err) = result {
-                logger::log_warn(&format!("[CodexWakeup] 调度任务执行失败: task_id={}, error={}", task_id, err));
+                logger::log_warn(&format!(
+                    "[CodexWakeup] 调度任务执行失败: task_id={}, error={}",
+                    task_id, err
+                ));
             }
         });
     }
 }
 
 pub fn ensure_started(app: AppHandle) {
-    let mut started = started_flag().lock().expect("codex wakeup scheduler started lock");
+    let mut started = started_flag()
+        .lock()
+        .expect("codex wakeup scheduler started lock");
     if *started {
         return;
     }
