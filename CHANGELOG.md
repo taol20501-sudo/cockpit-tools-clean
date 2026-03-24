@@ -7,6 +7,12 @@ All notable changes to Cockpit Tools will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
+## [0.20.5] - 2026-03-24
+
+### Fixed
+- **Windsurf quota-billed accounts now show the official used-percent values consistently across the account page, tray, macOS native menu, and diagnostic report**: daily and weekly quota usage is now read directly from the upstream usage fields instead of being inverted as if it were remaining percentage, preventing quota progress from being displayed backwards or incorrectly pinned to exhaustion.
+
+---
 ## [0.20.4] - 2026-03-24
 
 ### Added
