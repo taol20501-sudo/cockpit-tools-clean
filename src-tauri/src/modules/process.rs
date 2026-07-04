@@ -4016,6 +4016,44 @@ fn resolve_expected_codebuddy_cn_launch_path_for_match() -> Option<String> {
     Some(normalized)
 }
 
+fn resolve_expected_qoder_launch_path_for_match() -> Option<String> {
+    let launch_path = match resolve_qoder_launch_path() {
+        Ok(path) => path,
+        Err(err) => {
+            crate::modules::logger::log_warn(&format!(
+                "[Qoder Resolve] launch path missing or invalid, skip PID match: {}",
+                err
+            ));
+            return None;
+        }
+    };
+    let normalized = normalize_path_for_compare(launch_path.to_string_lossy().as_ref());
+    if normalized.is_empty() {
+        crate::modules::logger::log_warn("[Qoder Resolve] launch path is empty, skip PID match");
+        return None;
+    }
+    Some(normalized)
+}
+
+fn resolve_expected_trae_launch_path_for_match() -> Option<String> {
+    let launch_path = match resolve_trae_launch_path() {
+        Ok(path) => path,
+        Err(err) => {
+            crate::modules::logger::log_warn(&format!(
+                "[Trae Resolve] launch path missing or invalid, skip PID match: {}",
+                err
+            ));
+            return None;
+        }
+    };
+    let normalized = normalize_path_for_compare(launch_path.to_string_lossy().as_ref());
+    if normalized.is_empty() {
+        crate::modules::logger::log_warn("[Trae Resolve] launch path is empty, skip PID match");
+        return None;
+    }
+    Some(normalized)
+}
+
 fn resolve_expected_workbuddy_launch_path_for_match() -> Option<String> {
     let launch_path = match resolve_workbuddy_launch_path() {
         Ok(path) => path,
@@ -4655,6 +4693,22 @@ fn resolve_codebuddy_cn_target_and_fallback(user_data_dir: Option<&str>) -> Opti
     )
 }
 
+fn resolve_qoder_target_and_fallback(user_data_dir: Option<&str>) -> Option<(String, bool)> {
+    build_user_data_dir_match_target(
+        user_data_dir,
+        get_default_qoder_user_data_dir_for_os(),
+        !strict_process_detect_enabled(),
+    )
+}
+
+fn resolve_trae_target_and_fallback(user_data_dir: Option<&str>) -> Option<(String, bool)> {
+    build_user_data_dir_match_target(
+        user_data_dir,
+        get_default_trae_user_data_dir_for_os(),
+        !strict_process_detect_enabled(),
+    )
+}
+
 fn resolve_workbuddy_target_and_fallback(user_data_dir: Option<&str>) -> Option<(String, bool)> {
     build_user_data_dir_match_target(
         user_data_dir,
@@ -4886,32 +4940,32 @@ fn collect_trae_process_entries_macos() -> Vec<(u32, Option<String>)> {
     entries
 }
 
-#[cfg(target_os = "macos")]
-fn resolve_qoder_pid(last_pid: Option<u32>, user_data_dir: Option<&str>) -> Option<u32> {
-    let default_user_data_dir = crate::modules::qoder_instance::get_default_qoder_user_data_dir()
-        .ok()
-        .map(|value| value.to_string_lossy().to_string());
-    let (target, allow_none_for_target) = build_user_data_dir_match_target(
-        user_data_dir,
-        default_user_data_dir,
-        !strict_process_detect_enabled(),
-    )?;
-    let entries = collect_qoder_process_entries_macos();
-    resolve_pid_from_entries_by_user_data_dir(last_pid, &target, allow_none_for_target, &entries)
+pub fn resolve_qoder_pid_from_entries(
+    last_pid: Option<u32>,
+    user_data_dir: Option<&str>,
+    entries: &[(u32, Option<String>)],
+) -> Option<u32> {
+    let (target, allow_none_for_target) = resolve_qoder_target_and_fallback(user_data_dir)?;
+    resolve_pid_from_entries_by_user_data_dir(last_pid, &target, allow_none_for_target, entries)
 }
 
-#[cfg(target_os = "macos")]
-fn resolve_trae_pid(last_pid: Option<u32>, user_data_dir: Option<&str>) -> Option<u32> {
-    let default_user_data_dir = crate::modules::trae_instance::get_default_trae_user_data_dir()
-        .ok()
-        .map(|value| value.to_string_lossy().to_string());
-    let (target, allow_none_for_target) = build_user_data_dir_match_target(
-        user_data_dir,
-        default_user_data_dir,
-        !strict_process_detect_enabled(),
-    )?;
-    let entries = collect_trae_process_entries_macos();
-    resolve_pid_from_entries_by_user_data_dir(last_pid, &target, allow_none_for_target, &entries)
+pub fn resolve_qoder_pid(last_pid: Option<u32>, user_data_dir: Option<&str>) -> Option<u32> {
+    let entries = collect_qoder_process_entries();
+    resolve_qoder_pid_from_entries(last_pid, user_data_dir, &entries)
+}
+
+pub fn resolve_trae_pid_from_entries(
+    last_pid: Option<u32>,
+    user_data_dir: Option<&str>,
+    entries: &[(u32, Option<String>)],
+) -> Option<u32> {
+    let (target, allow_none_for_target) = resolve_trae_target_and_fallback(user_data_dir)?;
+    resolve_pid_from_entries_by_user_data_dir(last_pid, &target, allow_none_for_target, entries)
+}
+
+pub fn resolve_trae_pid(last_pid: Option<u32>, user_data_dir: Option<&str>) -> Option<u32> {
+    let entries = collect_trae_process_entries();
+    resolve_trae_pid_from_entries(last_pid, user_data_dir, &entries)
 }
 
 pub fn resolve_antigravity_pid_from_entries(
@@ -5869,6 +5923,224 @@ fn collect_workbuddy_process_entries_from_sysinfo_fallback(
     entries
 }
 
+#[cfg(target_os = "windows")]
+fn collect_named_electron_process_entries_from_powershell(
+    expected_exe_path: &str,
+    fallback_process_name: &str,
+    log_prefix: &str,
+) -> Vec<(u32, Option<String>)> {
+    let mut entries = Vec::new();
+    let process_name = Path::new(expected_exe_path)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(fallback_process_name);
+    let script = build_windows_path_filtered_process_probe_script(process_name, expected_exe_path);
+    let output = powershell_output_with_timeout(
+        &["-NoProfile", "-Command", &script],
+        WINDOWS_PROCESS_PROBE_TIMEOUT,
+    );
+    let output = match output {
+        Ok(value) => value,
+        Err(err) => {
+            crate::modules::logger::log_warn(&format!(
+                "[{} Probe] PowerShell process probe failed: {}",
+                log_prefix, err
+            ));
+            return entries;
+        }
+    };
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        crate::modules::logger::log_warn(&format!(
+            "[{} Probe] PowerShell process probe returned non-zero: {}, stderr={}",
+            log_prefix,
+            output.status,
+            stderr.trim()
+        ));
+        return entries;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for line in stdout.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let mut parts = line.splitn(2, '|');
+        let pid_str = parts.next().unwrap_or("").trim();
+        let cmdline = parts.next().unwrap_or("").trim();
+        let pid = match pid_str.parse::<u32>() {
+            Ok(value) => value,
+            Err(_) => continue,
+        };
+        let lower = cmdline.to_lowercase();
+        if is_helper_command_line(&lower) || lower.contains("crashpad_handler") {
+            continue;
+        }
+        let dir = extract_user_data_dir_from_command_line(cmdline).and_then(|value| {
+            let normalized = normalize_path_for_compare(&value);
+            if normalized.is_empty() {
+                None
+            } else {
+                Some(normalized)
+            }
+        });
+        entries.push((pid, dir));
+    }
+    entries.sort_by_key(|(pid, _)| *pid);
+    entries.dedup_by(|a, b| a.0 == b.0);
+    entries
+}
+
+#[cfg(target_os = "windows")]
+fn collect_named_electron_process_entries_from_sysinfo_fallback(
+    expected_exe_path: &str,
+    app_token: &str,
+    fallback_process_name: &str,
+    log_prefix: &str,
+) -> Vec<(u32, Option<String>)> {
+    let expected = normalize_path_for_compare(expected_exe_path);
+    if expected.is_empty() {
+        return Vec::new();
+    }
+
+    let expected_file_name = Path::new(expected_exe_path)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(fallback_process_name)
+        .to_ascii_lowercase();
+    let fallback_file_name = fallback_process_name.to_ascii_lowercase();
+    let app_token = app_token.to_ascii_lowercase();
+
+    let mut entries: Vec<(u32, Option<String>)> = Vec::new();
+    let mut candidates = 0usize;
+    let mut path_mismatch = 0usize;
+    let mut missing_exe = 0usize;
+    let mut cmdline_fallback_hit = 0usize;
+
+    let mut system = System::new();
+    system.refresh_processes_specifics(
+        sysinfo::ProcessesToUpdate::All,
+        true,
+        ProcessRefreshKind::nothing()
+            .with_exe(UpdateKind::OnlyIfNotSet)
+            .with_cmd(UpdateKind::OnlyIfNotSet),
+    );
+    let current_pid = std::process::id();
+
+    for (pid, process) in system.processes() {
+        let pid_u32 = pid.as_u32();
+        if pid_u32 == current_pid {
+            continue;
+        }
+
+        let name = process.name().to_string_lossy().to_lowercase();
+        let exe_path = process
+            .exe()
+            .and_then(|value| value.to_str())
+            .unwrap_or("")
+            .to_lowercase();
+        let args_line = process
+            .cmd()
+            .iter()
+            .map(|arg| arg.to_string_lossy().to_lowercase())
+            .collect::<Vec<String>>()
+            .join(" ");
+
+        let is_target_app = name == expected_file_name
+            || name == fallback_file_name
+            || exe_path.ends_with(&format!("\\{}", expected_file_name))
+            || exe_path.ends_with(&format!("\\{}", fallback_file_name))
+            || exe_path.contains(&format!("\\{}\\", app_token))
+            || exe_path.contains(&app_token);
+        if !is_target_app
+            || is_helper_command_line(&args_line)
+            || args_line.contains("crashpad_handler")
+        {
+            continue;
+        }
+        candidates += 1;
+
+        let (actual, used_cmdline_fallback) = resolve_windows_process_exe_for_match(process);
+        match actual {
+            Some(actual_path) if actual_path == expected => {
+                if used_cmdline_fallback {
+                    cmdline_fallback_hit += 1;
+                }
+                let dir = extract_user_data_dir(process.cmd()).and_then(|value| {
+                    let normalized = normalize_path_for_compare(&value);
+                    if normalized.is_empty() {
+                        None
+                    } else {
+                        Some(normalized)
+                    }
+                });
+                entries.push((pid_u32, dir));
+            }
+            Some(_) => path_mismatch += 1,
+            None => missing_exe += 1,
+        }
+    }
+
+    entries.sort_by_key(|(pid, _)| *pid);
+    entries.dedup_by(|a, b| a.0 == b.0);
+
+    if entries.is_empty() {
+        crate::modules::logger::log_warn(&format!(
+            "[{} Probe] sysinfo fallback no match: expected={}, candidates={}, path_mismatch={}, missing_exe={}, cmdline_fallback_hit={}",
+            log_prefix, expected, candidates, path_mismatch, missing_exe, cmdline_fallback_hit
+        ));
+    } else {
+        crate::modules::logger::log_info(&format!(
+            "[{} Probe] sysinfo fallback matched: expected={}, matched={}, candidates={}, path_mismatch={}, missing_exe={}, cmdline_fallback_hit={}",
+            log_prefix, expected, entries.len(), candidates, path_mismatch, missing_exe, cmdline_fallback_hit
+        ));
+    }
+
+    entries
+}
+
+#[cfg(target_os = "linux")]
+fn collect_named_electron_process_entries_from_proc(app_token: &str) -> Vec<(u32, Option<String>)> {
+    let app_token = app_token.to_ascii_lowercase();
+    let mut entries = Vec::new();
+    if let Ok(proc_entries) = std::fs::read_dir("/proc") {
+        for entry in proc_entries.flatten() {
+            let file_name = entry.file_name();
+            let pid_str = file_name.to_string_lossy();
+            if !pid_str.chars().all(|ch| ch.is_ascii_digit()) {
+                continue;
+            }
+            let pid = match pid_str.parse::<u32>() {
+                Ok(value) => value,
+                Err(_) => continue,
+            };
+            let cmdline_path = format!("/proc/{}/cmdline", pid);
+            let cmdline = match std::fs::read(&cmdline_path) {
+                Ok(value) => value,
+                Err(_) => continue,
+            };
+            if cmdline.is_empty() {
+                continue;
+            }
+            let cmdline_str = String::from_utf8_lossy(&cmdline).replace('\0', " ");
+            let cmd_lower = cmdline_str.to_lowercase();
+            let exe_path = std::fs::read_link(format!("/proc/{}/exe", pid))
+                .ok()
+                .and_then(|p| p.to_str().map(|s| s.to_lowercase()))
+                .unwrap_or_default();
+            if !cmd_lower.contains(&app_token) && !exe_path.contains(&app_token) {
+                continue;
+            }
+            if is_helper_command_line(&cmd_lower) {
+                continue;
+            }
+            let dir = extract_user_data_dir_from_command_line(&cmdline_str);
+            entries.push((pid, dir));
+        }
+    }
+    entries
+}
+
 pub fn collect_codebuddy_process_entries() -> Vec<(u32, Option<String>)> {
     let expected_launch = resolve_expected_codebuddy_launch_path_for_match();
     if expected_launch.is_none() {
@@ -6089,6 +6361,95 @@ pub fn resolve_codebuddy_cn_pid(last_pid: Option<u32>, user_data_dir: Option<&st
     resolve_codebuddy_cn_pid_from_entries(last_pid, user_data_dir, &entries)
 }
 
+pub fn collect_qoder_process_entries() -> Vec<(u32, Option<String>)> {
+    let expected_launch = resolve_expected_qoder_launch_path_for_match();
+    if expected_launch.is_none() {
+        return Vec::new();
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        let expected = expected_launch
+            .as_deref()
+            .expect("expected launch path must exist");
+        let entries =
+            collect_named_electron_process_entries_from_powershell(expected, "Qoder.exe", "Qoder");
+        if !entries.is_empty() {
+            return entries;
+        }
+        crate::modules::logger::log_warn(
+            "[Qoder Probe] PowerShell returned empty; fallback to sysinfo probe",
+        );
+        return collect_named_electron_process_entries_from_sysinfo_fallback(
+            expected,
+            "qoder",
+            "Qoder.exe",
+            "Qoder",
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let entries = collect_qoder_process_entries_macos();
+        if !entries.is_empty() {
+            return filter_entries_by_expected_launch_path("Qoder", entries, expected_launch);
+        }
+        return Vec::new();
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let entries = collect_named_electron_process_entries_from_proc("qoder");
+        if !entries.is_empty() {
+            return filter_entries_by_expected_launch_path("Qoder", entries, expected_launch);
+        }
+        return Vec::new();
+    }
+}
+
+pub fn collect_trae_process_entries() -> Vec<(u32, Option<String>)> {
+    let expected_launch = resolve_expected_trae_launch_path_for_match();
+    if expected_launch.is_none() {
+        return Vec::new();
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        let expected = expected_launch
+            .as_deref()
+            .expect("expected launch path must exist");
+        let entries =
+            collect_named_electron_process_entries_from_powershell(expected, "Trae.exe", "Trae");
+        if !entries.is_empty() {
+            return entries;
+        }
+        crate::modules::logger::log_warn(
+            "[Trae Probe] PowerShell returned empty; fallback to sysinfo probe",
+        );
+        return collect_named_electron_process_entries_from_sysinfo_fallback(
+            expected, "trae", "Trae.exe", "Trae",
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let entries = collect_trae_process_entries_macos();
+        if !entries.is_empty() {
+            return filter_entries_by_expected_launch_path("Trae", entries, expected_launch);
+        }
+        return Vec::new();
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let entries = collect_named_electron_process_entries_from_proc("trae");
+        if !entries.is_empty() {
+            return filter_entries_by_expected_launch_path("Trae", entries, expected_launch);
+        }
+        return Vec::new();
+    }
+}
+
 pub fn collect_workbuddy_process_entries() -> Vec<(u32, Option<String>)> {
     let expected_launch = resolve_expected_workbuddy_launch_path_for_match();
     if expected_launch.is_none() {
@@ -6277,43 +6638,22 @@ fn get_default_codebuddy_cn_user_data_dir_for_os() -> Option<String> {
     None
 }
 
+fn get_default_qoder_user_data_dir_for_os() -> Option<String> {
+    crate::modules::qoder_instance::get_default_qoder_user_data_dir()
+        .ok()
+        .map(|value| value.to_string_lossy().to_string())
+}
+
+fn get_default_trae_user_data_dir_for_os() -> Option<String> {
+    crate::modules::trae_instance::get_default_trae_user_data_dir()
+        .ok()
+        .map(|value| value.to_string_lossy().to_string())
+}
+
 fn get_default_workbuddy_user_data_dir_for_os() -> Option<String> {
-    #[cfg(target_os = "macos")]
-    {
-        let home = dirs::home_dir()?;
-        return Some(
-            home.join("Library")
-                .join("Application Support")
-                .join("WorkBuddy")
-                .to_string_lossy()
-                .to_string(),
-        );
-    }
-
-    #[cfg(target_os = "windows")]
-    {
-        let appdata = std::env::var("APPDATA").ok()?;
-        return Some(
-            Path::new(&appdata)
-                .join("WorkBuddy")
-                .to_string_lossy()
-                .to_string(),
-        );
-    }
-
-    #[cfg(target_os = "linux")]
-    {
-        let home = dirs::home_dir()?;
-        return Some(
-            home.join(".config")
-                .join("WorkBuddy")
-                .to_string_lossy()
-                .to_string(),
-        );
-    }
-
-    #[allow(unreachable_code)]
-    None
+    crate::modules::workbuddy_instance::get_default_workbuddy_user_data_dir()
+        .ok()
+        .map(|value| value.to_string_lossy().to_string())
 }
 
 pub fn focus_vscode_instance(
@@ -6701,6 +7041,129 @@ pub fn close_antigravity_legacy_instances(
         Some(log_antigravity_process_details_for_pids as fn(&[u32])),
         #[cfg(not(target_os = "windows"))]
         None,
+    )
+}
+
+fn close_user_data_dir_scoped_instances(
+    log_prefix: &str,
+    process_display_name: &str,
+    failure_message: &str,
+    user_data_dirs: &[String],
+    timeout_secs: u64,
+    default_dir: Option<String>,
+    collect_entries: fn() -> Vec<(u32, Option<String>)>,
+) -> Result<(), String> {
+    crate::modules::logger::log_info(&format!(
+        "[{}] default_dir={}",
+        log_prefix,
+        default_dir
+            .as_deref()
+            .map(|value| summarize_text_for_process_log(value, 96))
+            .unwrap_or_else(|| "-".to_string())
+    ));
+    close_managed_instances_common(
+        log_prefix,
+        &format!("Closing {} instances...", process_display_name),
+        &format!("No {} instance directories provided", process_display_name),
+        &format!("Managed {} instances are not running", process_display_name),
+        process_display_name,
+        failure_message,
+        user_data_dirs,
+        timeout_secs,
+        collect_entries,
+        |entries, target_dirs| {
+            select_main_pids_by_target_dirs(entries, target_dirs, default_dir.as_deref())
+        },
+        |target_dirs| {
+            filter_entries_by_target_dirs(collect_entries(), target_dirs, default_dir.as_deref())
+        },
+        None,
+        None,
+        None,
+    )
+}
+
+pub fn close_codebuddy_instances(
+    user_data_dirs: &[String],
+    timeout_secs: u64,
+) -> Result<(), String> {
+    let default_dir = get_default_codebuddy_user_data_dir_for_os()
+        .map(|value| normalize_path_for_compare(&value))
+        .filter(|value| !value.is_empty());
+    close_user_data_dir_scoped_instances(
+        "CodeBuddy Close",
+        "CodeBuddy",
+        "Unable to close managed CodeBuddy instances; please close them manually and retry",
+        user_data_dirs,
+        timeout_secs,
+        default_dir,
+        collect_codebuddy_process_entries,
+    )
+}
+
+pub fn close_codebuddy_cn_instances(
+    user_data_dirs: &[String],
+    timeout_secs: u64,
+) -> Result<(), String> {
+    let default_dir = get_default_codebuddy_cn_user_data_dir_for_os()
+        .map(|value| normalize_path_for_compare(&value))
+        .filter(|value| !value.is_empty());
+    close_user_data_dir_scoped_instances(
+        "CodeBuddy CN Close",
+        "CodeBuddy CN",
+        "Unable to close managed CodeBuddy CN instances; please close them manually and retry",
+        user_data_dirs,
+        timeout_secs,
+        default_dir,
+        collect_codebuddy_cn_process_entries,
+    )
+}
+
+pub fn close_qoder_instances(user_data_dirs: &[String], timeout_secs: u64) -> Result<(), String> {
+    let default_dir = get_default_qoder_user_data_dir_for_os()
+        .map(|value| normalize_path_for_compare(&value))
+        .filter(|value| !value.is_empty());
+    close_user_data_dir_scoped_instances(
+        "Qoder Close",
+        "Qoder",
+        "Unable to close managed Qoder instances; please close them manually and retry",
+        user_data_dirs,
+        timeout_secs,
+        default_dir,
+        collect_qoder_process_entries,
+    )
+}
+
+pub fn close_trae_instances(user_data_dirs: &[String], timeout_secs: u64) -> Result<(), String> {
+    let default_dir = get_default_trae_user_data_dir_for_os()
+        .map(|value| normalize_path_for_compare(&value))
+        .filter(|value| !value.is_empty());
+    close_user_data_dir_scoped_instances(
+        "Trae Close",
+        "Trae",
+        "Unable to close managed Trae instances; please close them manually and retry",
+        user_data_dirs,
+        timeout_secs,
+        default_dir,
+        collect_trae_process_entries,
+    )
+}
+
+pub fn close_workbuddy_instances(
+    user_data_dirs: &[String],
+    timeout_secs: u64,
+) -> Result<(), String> {
+    let default_dir = get_default_workbuddy_user_data_dir_for_os()
+        .map(|value| normalize_path_for_compare(&value))
+        .filter(|value| !value.is_empty());
+    close_user_data_dir_scoped_instances(
+        "WorkBuddy Close",
+        "WorkBuddy",
+        "Unable to close managed WorkBuddy instances; please close them manually and retry",
+        user_data_dirs,
+        timeout_secs,
+        default_dir,
+        collect_workbuddy_process_entries,
     )
 }
 

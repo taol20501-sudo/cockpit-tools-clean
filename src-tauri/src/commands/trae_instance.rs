@@ -16,13 +16,8 @@ fn is_profile_initialized(user_data_dir: &str) -> bool {
     }
 }
 
-fn resolve_running_pid(last_pid: Option<u32>) -> Option<u32> {
-    let pid = last_pid?;
-    if modules::process::is_pid_running(pid) {
-        Some(pid)
-    } else {
-        None
-    }
+fn resolve_running_pid(last_pid: Option<u32>, user_data_dir: Option<&str>) -> Option<u32> {
+    modules::process::resolve_trae_pid(last_pid, user_data_dir)
 }
 
 async fn inject_bound_account(
@@ -98,7 +93,7 @@ pub async fn trae_list_instances() -> Result<Vec<InstanceProfileView>, String> {
         .instances
         .into_iter()
         .map(|instance| {
-            let running_pid = resolve_running_pid(instance.last_pid);
+            let running_pid = resolve_running_pid(instance.last_pid, Some(&instance.user_data_dir));
             let running = running_pid.is_some();
             let initialized = is_profile_initialized(&instance.user_data_dir);
             let mut view = InstanceProfileView::from_profile(instance, running, initialized);
@@ -107,7 +102,7 @@ pub async fn trae_list_instances() -> Result<Vec<InstanceProfileView>, String> {
         })
         .collect();
 
-    let default_pid = resolve_running_pid(default_settings.last_pid);
+    let default_pid = resolve_running_pid(default_settings.last_pid, None);
     result.push(InstanceProfileView {
         id: DEFAULT_INSTANCE_ID.to_string(),
         name: String::new(),
@@ -171,7 +166,7 @@ pub async fn trae_update_instance(
             extra_args,
             follow_local_account,
         )?;
-        let running_pid = resolve_running_pid(updated.last_pid);
+        let running_pid = resolve_running_pid(updated.last_pid, None);
         return Ok(InstanceProfileView {
             id: DEFAULT_INSTANCE_ID.to_string(),
             name: String::new(),
@@ -198,7 +193,7 @@ pub async fn trae_update_instance(
             bind_account_id,
         })?;
 
-    let running_pid = resolve_running_pid(instance.last_pid);
+    let running_pid = resolve_running_pid(instance.last_pid, Some(&instance.user_data_dir));
     let running = running_pid.is_some();
     let initialized = is_profile_initialized(&instance.user_data_dir);
     let mut view = InstanceProfileView::from_profile(instance, running, initialized);
@@ -223,10 +218,12 @@ pub async fn trae_start_instance(instance_id: String) -> Result<InstanceProfileV
         let default_dir_str = default_dir.to_string_lossy().to_string();
         let default_settings = modules::trae_instance::load_default_settings()?;
 
-        if let Some(pid) = resolve_running_pid(default_settings.last_pid) {
+        if let Some(pid) = resolve_running_pid(default_settings.last_pid, None) {
             modules::process::close_pid(pid, 20)?;
             let _ = modules::trae_instance::update_default_pid(None)?;
         }
+        modules::process::close_trae_instances(&[default_dir_str.clone()], 20)?;
+        let _ = modules::trae_instance::update_default_pid(None)?;
 
         inject_bound_account(
             default_dir_str.as_str(),
@@ -243,7 +240,7 @@ pub async fn trae_start_instance(instance_id: String) -> Result<InstanceProfileV
             default_settings.bind_account_id.as_deref(),
         )
         .await;
-        let running_pid = resolve_running_pid(Some(pid));
+        let running_pid = resolve_running_pid(Some(pid), None);
 
         return Ok(InstanceProfileView {
             id: DEFAULT_INSTANCE_ID.to_string(),
@@ -269,10 +266,12 @@ pub async fn trae_start_instance(instance_id: String) -> Result<InstanceProfileV
         .find(|item| item.id == instance_id)
         .ok_or("实例不存在")?;
 
-    if let Some(pid) = resolve_running_pid(instance.last_pid) {
+    if let Some(pid) = resolve_running_pid(instance.last_pid, Some(&instance.user_data_dir)) {
         modules::process::close_pid(pid, 20)?;
         let _ = modules::trae_instance::update_instance_pid(&instance.id, None)?;
     }
+    modules::process::close_trae_instances(&[instance.user_data_dir.clone()], 20)?;
+    let _ = modules::trae_instance::update_instance_pid(&instance.id, None)?;
 
     inject_bound_account(&instance.user_data_dir, instance.bind_account_id.as_deref()).await?;
 
@@ -286,7 +285,7 @@ pub async fn trae_start_instance(instance_id: String) -> Result<InstanceProfileV
         .await;
 
     let updated = modules::trae_instance::update_instance_after_start(&instance.id, pid)?;
-    let running_pid = resolve_running_pid(Some(pid));
+    let running_pid = resolve_running_pid(Some(pid), Some(&updated.user_data_dir));
     let initialized = is_profile_initialized(&updated.user_data_dir);
     let mut view = InstanceProfileView::from_profile(updated, running_pid.is_some(), initialized);
     view.last_pid = running_pid;
@@ -299,9 +298,10 @@ pub async fn trae_stop_instance(instance_id: String) -> Result<InstanceProfileVi
         let default_dir = modules::trae_instance::get_default_trae_user_data_dir()?;
         let default_dir_str = default_dir.to_string_lossy().to_string();
         let default_settings = modules::trae_instance::load_default_settings()?;
-        if let Some(pid) = resolve_running_pid(default_settings.last_pid) {
+        if let Some(pid) = resolve_running_pid(default_settings.last_pid, None) {
             modules::process::close_pid(pid, 20)?;
         }
+        modules::process::close_trae_instances(&[default_dir_str.clone()], 20)?;
         let _ = modules::trae_instance::update_default_pid(None)?;
         return Ok(InstanceProfileView {
             id: DEFAULT_INSTANCE_ID.to_string(),
@@ -327,9 +327,10 @@ pub async fn trae_stop_instance(instance_id: String) -> Result<InstanceProfileVi
         .find(|item| item.id == instance_id)
         .ok_or("实例不存在")?;
 
-    if let Some(pid) = resolve_running_pid(instance.last_pid) {
+    if let Some(pid) = resolve_running_pid(instance.last_pid, Some(&instance.user_data_dir)) {
         modules::process::close_pid(pid, 20)?;
     }
+    modules::process::close_trae_instances(&[instance.user_data_dir.clone()], 20)?;
     let updated = modules::trae_instance::update_instance_pid(&instance.id, None)?;
     let initialized = is_profile_initialized(&updated.user_data_dir);
     Ok(InstanceProfileView::from_profile(
@@ -343,7 +344,7 @@ pub async fn trae_stop_instance(instance_id: String) -> Result<InstanceProfileVi
 pub async fn trae_open_instance_window(instance_id: String) -> Result<(), String> {
     if instance_id == DEFAULT_INSTANCE_ID {
         let default_settings = modules::trae_instance::load_default_settings()?;
-        let pid = resolve_running_pid(default_settings.last_pid).ok_or("默认实例未运行")?;
+        let pid = resolve_running_pid(default_settings.last_pid, None).ok_or("默认实例未运行")?;
         modules::process::focus_process_pid(pid)
             .map_err(|err| format!("定位 Trae 默认实例窗口失败: {}", err))?;
         return Ok(());
@@ -355,7 +356,8 @@ pub async fn trae_open_instance_window(instance_id: String) -> Result<(), String
         .into_iter()
         .find(|item| item.id == instance_id)
         .ok_or("实例不存在")?;
-    let pid = resolve_running_pid(instance.last_pid).ok_or("实例未运行")?;
+    let pid = resolve_running_pid(instance.last_pid, Some(&instance.user_data_dir))
+        .ok_or("实例未运行")?;
 
     modules::process::focus_process_pid(pid).map_err(|err| {
         format!(
@@ -369,18 +371,17 @@ pub async fn trae_open_instance_window(instance_id: String) -> Result<(), String
 #[tauri::command]
 pub async fn trae_close_all_instances() -> Result<(), String> {
     let store = modules::trae_instance::load_instance_store()?;
-    let default_settings = modules::trae_instance::load_default_settings()?;
-
-    if let Some(pid) = resolve_running_pid(default_settings.last_pid) {
-        let _ = modules::process::close_pid(pid, 20);
-    }
-
+    let default_dir = modules::trae_instance::get_default_trae_user_data_dir()?;
+    let mut target_dirs: Vec<String> = Vec::new();
+    target_dirs.push(default_dir.to_string_lossy().to_string());
     for instance in &store.instances {
-        if let Some(pid) = resolve_running_pid(instance.last_pid) {
-            let _ = modules::process::close_pid(pid, 20);
+        let dir = instance.user_data_dir.trim();
+        if !dir.is_empty() {
+            target_dirs.push(dir.to_string());
         }
     }
 
+    modules::process::close_trae_instances(&target_dirs, 20)?;
     let _ = modules::trae_instance::clear_all_pids();
     Ok(())
 }
