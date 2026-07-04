@@ -1400,7 +1400,7 @@ fn find_antigravity_process_exe() -> Option<std::path::PathBuf> {
                 || exe_path.contains("crashpad");
 
             #[cfg(target_os = "windows")]
-            let is_antigravity = is_windows_antigravity_main_executable(&name, &exe_path);
+            let is_antigravity = is_windows_antigravity_ide_main_executable(&name, &exe_path);
             #[cfg(target_os = "linux")]
             let is_antigravity = (name.contains("antigravity-ide")
                 || exe_path.contains("/antigravity-ide"))
@@ -1541,9 +1541,43 @@ fn find_codex_process_exe() -> Option<std::path::PathBuf> {
 fn is_windows_antigravity_main_executable(name: &str, exe_path: &str) -> bool {
     (name == "antigravity ide.exe"
         || name == "antigravity.exe"
+        || name == "antigravity-ide.exe"
         || exe_path.ends_with("\\antigravity ide.exe")
-        || exe_path.ends_with("\\antigravity.exe"))
+        || exe_path.ends_with("\\antigravity.exe")
+        || exe_path.ends_with("\\antigravity-ide.exe"))
         && !exe_path.contains("crashpad")
+}
+
+#[cfg(target_os = "windows")]
+fn is_windows_antigravity_ide_main_executable(name: &str, exe_path: &str) -> bool {
+    (name == "antigravity ide.exe"
+        || name == "antigravity-ide.exe"
+        || exe_path.ends_with("\\antigravity ide.exe")
+        || exe_path.ends_with("\\antigravity-ide.exe"))
+        && !exe_path.contains("crashpad")
+}
+
+#[cfg(target_os = "windows")]
+fn resolve_windows_antigravity_ide_custom_path(path_str: &str) -> Option<std::path::PathBuf> {
+    let path = std::path::PathBuf::from(path_str);
+    if path.is_file() {
+        let lower = path.to_string_lossy().to_ascii_lowercase();
+        if lower.ends_with("\\antigravity ide.exe") || lower.ends_with("\\antigravity-ide.exe") {
+            return Some(path);
+        }
+        return None;
+    }
+
+    if path.is_dir() {
+        for exe_name in ["Antigravity IDE.exe", "antigravity-ide.exe"] {
+            let candidate = path.join(exe_name);
+            if candidate.exists() {
+                return Some(candidate);
+            }
+        }
+    }
+
+    None
 }
 
 pub fn detect_antigravity_exec_path() -> Option<std::path::PathBuf> {
@@ -1563,58 +1597,21 @@ pub fn detect_antigravity_exec_path() -> Option<std::path::PathBuf> {
     {
         let mut candidates: Vec<std::path::PathBuf> = Vec::new();
         if let Ok(local_appdata) = std::env::var("LOCALAPPDATA") {
-            candidates.push(
-                std::path::PathBuf::from(&local_appdata)
-                    .join("Programs")
-                    .join("Antigravity")
-                    .join("Antigravity.exe"),
-            );
-            candidates.push(
-                std::path::PathBuf::from(&local_appdata)
-                    .join("Programs")
-                    .join("Antigravity")
-                    .join("Electron.exe"),
-            );
-            candidates.push(
-                std::path::PathBuf::from(local_appdata)
-                    .join("Programs")
-                    .join("Antigravity IDE")
-                    .join("Antigravity IDE.exe"),
-            );
+            let base = std::path::PathBuf::from(&local_appdata)
+                .join("Programs")
+                .join("Antigravity IDE");
+            candidates.push(base.join("Antigravity IDE.exe"));
+            candidates.push(base.join("antigravity-ide.exe"));
         }
         if let Ok(program_files) = std::env::var("PROGRAMFILES") {
-            candidates.push(
-                std::path::PathBuf::from(&program_files)
-                    .join("Antigravity")
-                    .join("Antigravity.exe"),
-            );
-            candidates.push(
-                std::path::PathBuf::from(&program_files)
-                    .join("Antigravity")
-                    .join("Electron.exe"),
-            );
-            candidates.push(
-                std::path::PathBuf::from(program_files)
-                    .join("Antigravity IDE")
-                    .join("Antigravity IDE.exe"),
-            );
+            let base = std::path::PathBuf::from(&program_files).join("Antigravity IDE");
+            candidates.push(base.join("Antigravity IDE.exe"));
+            candidates.push(base.join("antigravity-ide.exe"));
         }
         if let Ok(program_files_x86) = std::env::var("PROGRAMFILES(X86)") {
-            candidates.push(
-                std::path::PathBuf::from(&program_files_x86)
-                    .join("Antigravity")
-                    .join("Antigravity.exe"),
-            );
-            candidates.push(
-                std::path::PathBuf::from(&program_files_x86)
-                    .join("Antigravity")
-                    .join("Electron.exe"),
-            );
-            candidates.push(
-                std::path::PathBuf::from(program_files_x86)
-                    .join("Antigravity IDE")
-                    .join("Antigravity IDE.exe"),
-            );
+            let base = std::path::PathBuf::from(&program_files_x86).join("Antigravity IDE");
+            candidates.push(base.join("Antigravity IDE.exe"));
+            candidates.push(base.join("antigravity-ide.exe"));
         }
         for candidate in candidates {
             if candidate.exists() {
@@ -1623,16 +1620,10 @@ pub fn detect_antigravity_exec_path() -> Option<std::path::PathBuf> {
         }
         if let Some(path) = detect_windows_exec_path_by_signatures(
             "antigravity",
-            &[
-                "Antigravity.exe",
-                "antigravity.exe",
-                "Antigravity IDE.exe",
-                "antigravity-ide.exe",
-                "Electron.exe",
-            ],
-            &["antigravity", "antigravity ide"],
-            &["antigravity", "antigravity ide"],
-            &["antigravity ide", "antigravity"],
+            &["Antigravity IDE.exe", "antigravity-ide.exe"],
+            &["antigravity-ide"],
+            &["antigravity-ide", "antigravity ide"],
+            &["antigravity ide", "antigravity-ide"],
         ) {
             return Some(path);
         }
@@ -2923,9 +2914,20 @@ fn resolve_antigravity_launch_path() -> Result<std::path::PathBuf, String> {
             }
         }
 
-        if let Some(exec) = resolve_macos_exec_path(&custom, "Electron") {
-            return Ok(exec);
+        #[cfg(target_os = "windows")]
+        {
+            if let Some(exec) = resolve_windows_antigravity_ide_custom_path(&custom) {
+                return Ok(exec);
+            }
         }
+
+        #[cfg(not(target_os = "windows"))]
+        {
+            if let Some(exec) = resolve_macos_exec_path(&custom, "Electron") {
+                return Ok(exec);
+            }
+        }
+
         if let Some(detected) = detect_antigravity_exec_path() {
             update_app_path_in_config("antigravity", &detected);
             return Ok(detected);
@@ -7301,7 +7303,7 @@ pub fn start_antigravity_with_args(
         use std::os::windows::process::CommandExt;
 
         if user_data_dir.trim().is_empty() && extra_args.is_empty() {
-            if let Ok(Some(pid)) = try_launch_via_shortcut("antigravity") {
+            if let Ok(Some(pid)) = try_launch_via_shortcut("antigravity ide") {
                 return Ok(pid);
             }
         }
