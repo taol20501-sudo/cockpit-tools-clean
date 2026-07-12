@@ -722,7 +722,7 @@ export function GrokInstancesContent({
         )}
         renderAccountBadge={(account) => (
           <span className="instance-plan-badge">
-            {getGrokPlanBadge(account)}
+            {getGrokPlanBadge(account) || t('common.none', '暂无')}
           </span>
         )}
         getAccountDisplayText={getGrokAccountDisplayEmail}
@@ -733,7 +733,7 @@ export function GrokInstancesContent({
             account.last_name,
             account.principal_id,
             account.team_id,
-            getGrokPlanBadge(account),
+            getGrokPlanBadge(account) || t('common.none', '暂无'),
           ]
             .filter(Boolean)
             .join(' ')

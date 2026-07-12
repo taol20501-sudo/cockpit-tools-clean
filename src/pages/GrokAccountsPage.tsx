@@ -796,12 +796,16 @@ export function GrokAccountsPage() {
     importLocalClientKey: "grok.import.localClient",
     importLocalClientDefault: "从本机 Grok CLI 导入",
     getDisplayEmail: getGrokAccountDisplayEmail,
-    getPlanBadge: getGrokPlanBadge,
-    getPlanBadgeTitle: getGrokPlanRawValue,
-    getPlanBadgeClass: (planBadge) => {
+    getPlanBadge: (account) =>
+      getGrokPlanBadge(account) || t("common.none", "暂无"),
+    getPlanBadgeTitle: (account) =>
+      getGrokPlanRawValue(account) || t("common.none", "暂无"),
+    getPlanBadgeClass: (planBadge, account) => {
+      if (isGrokApiKeyAccount(account) || planBadge === "API_KEY") return "pro";
+      // Missing tier (暂无) uses Free styling — not the red "unknown" tone.
+      if (!getGrokPlanRawValue(account)) return "free";
       if (planBadge === "Free") return "free";
-      if (planBadge === "API_KEY") return "pro";
-      if (planBadge === "--") return "unknown";
+      if (planBadge === "--") return "free";
       return "pro";
     },
     getSearchText: (account) =>
@@ -812,7 +816,7 @@ export function GrokAccountsPage() {
         account.principal_id,
         account.team_id,
         account.quota?.subscriptionStatus,
-        getGrokPlanBadge(account),
+        getGrokPlanBadge(account) || t("common.none", "暂无"),
       ]
         .filter(Boolean)
         .join(" "),

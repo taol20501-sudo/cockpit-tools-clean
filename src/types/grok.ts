@@ -219,21 +219,34 @@ export function getGrokPlanRawValue(account: GrokAccount): string | null {
   );
 }
 
-/** Maps stable xAI tier identifiers to compact product names. */
+/**
+ * Display badge for a Grok account plan.
+ * Missing tier returns empty string — UI should show a localized "none" label
+ * (e.g. 暂无). Do not invent Free; a false Free happens when billing tier
+ * fields were not resolved.
+ */
 export function getGrokPlanBadge(account: GrokAccount): string {
   if (isGrokApiKeyAccount(account)) {
     // Plan/tier badges show raw values (project rule).
     return getGrokPlanRawValue(account) || "API_KEY";
   }
   const raw = getGrokPlanRawValue(account);
-  // The official Grok CLI treats a missing subscription tier as the free tier.
-  if (!raw) return "Free";
+  // Unknown / unresolved tier: leave empty for the UI "none" fallback.
+  if (!raw) return "";
   const normalized = raw
     .trim()
     .toUpperCase()
     .replace(/[\s-]+/g, "_");
   const compact = normalized.replace(/_/g, "");
-  if (["SUBSCRIPTION_TIER_INVALID", "INVALID", "FREE"].includes(normalized)) {
+  // Explicit free / invalid enums only — not missing data.
+  if (
+    [
+      "SUBSCRIPTION_TIER_INVALID",
+      "SUBSCRIPTION_TIER_FREE",
+      "INVALID",
+      "FREE",
+    ].includes(normalized)
+  ) {
     return "Free";
   }
   if (

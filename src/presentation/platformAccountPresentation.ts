@@ -1763,11 +1763,13 @@ export function buildGrokAccountPresentation(
     },
   );
 
+  const planBadge = getGrokPlanBadge(account);
   return {
     id: account.id,
     displayName: getGrokAccountDisplayEmail(account),
-    planLabel: getGrokPlanBadge(account),
-    planClass: "plan-badge-default",
+    planLabel: planBadge || t("common.none", "暂无"),
+    // Missing tier (暂无) uses Free styling, not red unknown.
+    planClass: planBadge ? "plan-badge-default" : "free",
     quotaItems,
   };
 }
