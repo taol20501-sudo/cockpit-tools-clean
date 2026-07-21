@@ -1,4 +1,7 @@
-# Cockpit Tools
+
+# Cockpit Tools Clean
+
+> 本仓库是基于原项目进行修改的非官方版本，并非原作者官方发布版本。
 
 ## 修改版说明
 
@@ -10,10 +13,14 @@
 - 关闭赞助商及合作中转站入口
 - 将远程公告地址切换至本仓库
 - 将软件名称和应用标识调整为 Cockpit Tools Clean
+- 安装程序由本仓库的 GitHub Actions 构建
 
-原项目版权归原作者所有。本修改版本继续遵循原项目许可证，仅用于许可证允许的范围，不代表原作者官方发布版本。
+原项目版权及相关权利归原作者所有。本修改版本继续遵循原仓库中的 LICENSE 文件，不代表原作者官方发布版本。
 
-请优先从本仓库的 Releases 页面下载安装程序。
+Windows 用户请前往本仓库的 Releases 页面下载 `.exe` 安装程序。
+
+---
+
 [English](README.en.md) · [Portuguese (BR)](README.pt-br.md) · 简体中文
 
 [![GitHub stars](https://img.shields.io/github/stars/jlcodes99/cockpit-tools?style=flat&color=gold)](https://github.com/jlcodes99/cockpit-tools)
