@@ -4,24 +4,9 @@
     "0.25.3"
   ],
   "topRightAd": null,
-  "apiRelayEnabled": true,
-  "topRightAdsEnabled": true,
-  "topRightAds": [
-    {
-      "id": "top-right-ad-2026-04-shop",
-      "enabled": true,
-      "relayRelated": false,
-      "priority": 100,
-      "text": "Codex Plus30天成品号，Gemini给自己账号订阅一年Pro 需要的了解一下",
-      "badge": "推广",
-      "ctaLabel": "选购",
-      "ctaUrl": "https://xiangzili.xyz/user/index/shop",
-      "displayMode": "dashboardAndPlatforms",
-      "displayPlatforms": [
-        "antigravity",
-        "antigravity_ide",
-        "codex"
-      ],
+  "apiRelayEnabled": false,
+  "topRightAdsEnabled": false,
+  "topRightAds": [],
       "targetVersions": "*",
       "targetLanguages": [
         "zh"
@@ -38,14 +23,15 @@
     }
   ],
   "sponsorModule": {
-    "enabled": true,
-    "entryVisible": true,
+    "enabled": false,
+    "entryVisible": false,
     "title": "专属中转站",
-    "subtitle": "为 Cockpit Tools 用户提供的合作 API 中转服务，可一键保存并启用到 Codex。",
-    "targetVersions": ">=0.25.2",
-    "targetLanguages": [
-      "*"
-    ],
+    "subtitle": "",
+    "targetVersions":  "*",
+    "targetLanguages": ["*"],
+    "locales": {},
+    "sponsors": []  }
+}
     "createdAt": "2026-06-05T00:00:00Z",
     "expiresAt": null,
     "locales": {
