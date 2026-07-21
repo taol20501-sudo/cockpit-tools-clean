@@ -89,8 +89,8 @@ import { CodexSshSyncSettingsControl } from '../components/codex/CodexSshSyncSet
 import { useEscClose } from '../hooks/useEscClose';
 import './settings/Settings.css';
 import { 
-  Github, User, Rocket, Save, FolderOpen,
-  AlertCircle, RefreshCw, Heart, MessageSquare, FileText, Download, X
+  Github, Save, FolderOpen,
+  AlertCircle, RefreshCw, MessageSquare, FileText, Download, X
 } from 'lucide-react';
 
 
