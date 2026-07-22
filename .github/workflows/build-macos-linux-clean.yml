@@ -1,0 +1,91 @@
+name: Build macOS and Linux Clean
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build ${{ matrix.label }}
+    runs-on: ${{ matrix.platform }}
+
+    permissions:
+      contents: read
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # 一个安装包同时兼容 Intel Mac 和 Apple Silicon Mac
+          - label: macos-universal
+            platform: macos-latest
+            args: "--target universal-apple-darwin"
+            release_dir: "target/universal-apple-darwin/release"
+
+          # 常见的 64 位 Linux
+          - label: linux-x64
+            platform: ubuntu-22.04
+            args: ""
+            release_dir: "target/release"
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Linux dependencies
+        if: startsWith(matrix.platform, 'ubuntu')
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            build-essential \
+            curl \
+            wget \
+            file \
+            libssl-dev \
+            libgtk-3-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            patchelf \
+            pkg-config \
+            libsoup-3.0-dev \
+            javascriptcoregtk-4.1 \
+            libjavascriptcoregtk-4.1-dev \
+            libnm-dev \
+            xdg-utils
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.platform == 'macos-latest' && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
+
+      - name: Install Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: sidecars/cockpit-cliproxy/go.mod
+          cache-dependency-path: sidecars/cockpit-cliproxy/go.sum
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install frontend dependencies
+        run: npm install
+
+      - name: Sync version
+        run: npm run sync-version
+
+      - name: Build application
+        env:
+          # macOS 无 Apple 开发者证书时使用临时签名
+          APPLE_SIGNING_IDENTITY: ${{ matrix.platform == 'macos-latest' && '-' || '' }}
+        run: npx tauri build --ci --config src-tauri/tauri.ci.conf.json ${{ matrix.args }}
+
+      - name: Upload bundles
+        uses: actions/upload-artifact@v4
+        with:
+          name: bundles-${{ matrix.label }}
+          path: ${{ matrix.release_dir }}/bundle/**
+          if-no-files-found: error
+          retention-days: 7
