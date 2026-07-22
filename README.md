@@ -15,7 +15,7 @@
 - 将软件名称和应用标识调整为 Cockpit Tools Clean
 - 安装程序由本仓库的 GitHub Actions 构建
 
-原项目版权及相关权利归原作者所有。本修改版本继续遵循原仓库中的 LICENSE 文件，不代表原作者官方发布版本。
+原项目版权及相关权利归原作者与贡献者所有。本修改版本继续遵循原仓库 README 声明的 CC BY-NC-SA 4.0 条款，不代表原作者官方发布或认可的版本。
 
 Windows 用户请前往本仓库的 Releases 页面下载 `.exe` 安装程序。
 
@@ -23,10 +23,10 @@ Windows 用户请前往本仓库的 Releases 页面下载 `.exe` 安装程序。
 
 [English](README.en.md) · [Portuguese (BR)](README.pt-br.md) · 简体中文
 
-[![GitHub stars](https://img.shields.io/github/stars/jlcodes99/cockpit-tools?style=flat&color=gold)](https://github.com/jlcodes99/cockpit-tools)
-[![GitHub downloads](https://img.shields.io/github/downloads/jlcodes99/cockpit-tools/total?style=flat&color=blue)](https://github.com/jlcodes99/cockpit-tools/releases)
-[![GitHub release](https://img.shields.io/github/v/release/jlcodes99/cockpit-tools?style=flat)](https://github.com/jlcodes99/cockpit-tools/releases)
-[![GitHub issues](https://img.shields.io/github/issues/jlcodes99/cockpit-tools)](https://github.com/jlcodes99/cockpit-tools/issues)
+[![GitHub stars](https://img.shields.io/github/stars/taol20501-sudo/cockpit-tools-clean?style=flat&color=gold)](https://github.com/taol20501-sudo/cockpit-tools-clean)
+[![GitHub downloads](https://img.shields.io/github/downloads/taol20501-sudo/cockpit-tools-clean/total?style=flat&color=blue)](https://github.com/taol20501-sudo/cockpit-tools-clean/releases)
+[![GitHub release](https://img.shields.io/github/v/release/taol20501-sudo/cockpit-tools-clean?style=flat)](https://github.com/taol20501-sudo/cockpit-tools-clean/releases)
+[![GitHub issues](https://img.shields.io/github/issues/taol20501-sudo/cockpit-tools-clean)](https://github.com/taol20501-sudo/cockpit-tools-clean/issues)
 
 一款**通用的 AI IDE 账号管理工具**，目前支持 **Antigravity IDE**、**Codex**、**GitHub Copilot**、**Windsurf**、**Kiro**、**Cursor**、**Grok CLI**、**CodeBuddy**、**CodeBuddy CN**、**Qoder**、**Trae**、**TRAE SOLO**、**Trae CN**、**TRAE SOLO CN**、**Zed** 和 **ZCode**，并支持多账号多实例并行运行。
 
@@ -338,39 +338,15 @@ Grok CLI 默认实例直接沿用官方 `~/.grok` 目录，启动时不设置 `G
 
 ### 选项 A: 手动下载 (推荐)
 
-前往 [GitHub Releases](https://github.com/jlcodes99/cockpit-tools/releases) 下载对应系统的安装包：
+前往 [Cockpit Tools Clean Releases](https://github.com/taol20501-sudo/cockpit-tools-clean/releases) 下载对应系统的安装包：
 
 *   **macOS**: `.dmg` (Apple Silicon & Intel)
 *   **Windows**: `.msi` (推荐) 或 `.exe`
 *   **Linux**: `.deb` (Debian/Ubuntu)、`.rpm` 或 `.AppImage` (通用)
 
-### 选项 B: Homebrew 安装 (macOS)
+### Homebrew 说明 (macOS)
 
-> 需要先安装 Homebrew。
-
-```bash
-brew tap jlcodes99/cockpit-tools https://github.com/jlcodes99/cockpit-tools
-brew install --cask cockpit-tools
-```
-
-如果遇到 macOS “应用已损坏”或无法打开，也可以使用 `--no-quarantine` 安装：
-
-```bash
-brew install --cask --no-quarantine cockpit-tools
-```
-
-如果提示已存在应用（例如：`already an App at '/Applications/Cockpit Tools.app'`），请先删除旧版本再安装：
-
-```bash
-rm -rf "/Applications/Cockpit Tools.app"
-brew install --cask cockpit-tools
-```
-
-或者直接强制覆盖安装：
-
-```bash
-brew install --cask --force cockpit-tools
-```
+Clean 版本目前请从本仓库 Releases 手动下载安装。需要安装 Clean 版本时不要使用上游 Homebrew tap，因为该 tap 安装的是上游版本并使用上游更新通道。
 
 ### 🛠️ 常见问题排查 (Troubleshooting)
 
@@ -380,7 +356,7 @@ brew install --cask --force cockpit-tools
 1.  **命令行修复** (推荐):
     打开终端，执行以下命令：
     ```bash
-    sudo xattr -rd com.apple.quarantine "/Applications/Cockpit Tools.app"
+    sudo xattr -rd com.apple.quarantine "/Applications/Cockpit Tools Clean.app"
     ```
     > **注意**: 如果您修改了应用名称，请在命令中相应调整路径。
 
@@ -446,7 +422,7 @@ npm run tauri build
 本项目是基于 [jlcodes99/cockpit-tools](https://github.com/jlcodes99/cockpit-tools)制作的非官方修改版本。
 本仓库是基于原项目进行修改的非官方版本，并非原作者官方发布版本。
 
-本项目默认采用 [CC BY-NC-SA 4.0](https://creativecommons.org/licenses/by-nc-sa/4.0/deed.zh-hans) 许可协议（署名-非商业性使用-相同方式共享）。
+本项目默认采用 [CC BY-NC-SA 4.0](https://creativecommons.org/licenses/by-nc-sa/4.0/deed.zh-hans) 许可协议（署名-非商业性使用-相同方式共享）。完整许可证引用、署名、修改与非官方声明见根目录 [LICENSE](LICENSE) 和 [NOTICE](NOTICE)。
 
 使用、修改和再分发时须：
 

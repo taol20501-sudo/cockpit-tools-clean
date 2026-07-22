@@ -1,11 +1,15 @@
-# Cockpit Tools
+# Cockpit Tools Clean
 
 English · [Portuguese (BR)](README.pt-br.md) · [简体中文](README.md)
 
-[![GitHub stars](https://img.shields.io/github/stars/jlcodes99/cockpit-tools?style=flat&color=gold)](https://github.com/jlcodes99/cockpit-tools)
-[![GitHub downloads](https://img.shields.io/github/downloads/jlcodes99/cockpit-tools/total?style=flat&color=blue)](https://github.com/jlcodes99/cockpit-tools/releases)
-[![GitHub release](https://img.shields.io/github/v/release/jlcodes99/cockpit-tools?style=flat)](https://github.com/jlcodes99/cockpit-tools/releases)
-[![GitHub issues](https://img.shields.io/github/issues/jlcodes99/cockpit-tools)](https://github.com/jlcodes99/cockpit-tools/issues)
+[![GitHub stars](https://img.shields.io/github/stars/taol20501-sudo/cockpit-tools-clean?style=flat&color=gold)](https://github.com/taol20501-sudo/cockpit-tools-clean)
+[![GitHub downloads](https://img.shields.io/github/downloads/taol20501-sudo/cockpit-tools-clean/total?style=flat&color=blue)](https://github.com/taol20501-sudo/cockpit-tools-clean/releases)
+[![GitHub release](https://img.shields.io/github/v/release/taol20501-sudo/cockpit-tools-clean?style=flat)](https://github.com/taol20501-sudo/cockpit-tools-clean/releases)
+[![GitHub issues](https://img.shields.io/github/issues/taol20501-sudo/cockpit-tools-clean)](https://github.com/taol20501-sudo/cockpit-tools-clean/issues)
+
+> This repository is an unofficial modified edition based on [jlcodes99/cockpit-tools](https://github.com/jlcodes99/cockpit-tools). It is not an official upstream release and is not endorsed by the upstream author.
+
+The Clean edition disables promotional advertisements, sponsor modules, and forced home-page announcement popups; uses a separate application name and identifier; and receives signed updates only from this repository.
 
 A **universal AI IDE account management tool**, currently supporting **Antigravity IDE**, **Codex**, **GitHub Copilot**, **Windsurf**, **Kiro**, **Cursor**, **Grok CLI**, **CodeBuddy**, **CodeBuddy CN**, **Qoder**, **Trae**, **TRAE SOLO**, **Trae CN**, **TRAE SOLO CN**, **Zed**, and **ZCode**, with multi-instance parallel workflows.
 
@@ -18,33 +22,6 @@ A **universal AI IDE account management tool**, currently supporting **Antigravi
 🇺🇸 English · 🇨🇳 简体中文 · 繁體中文 · 🇯🇵 日本語 · 🇩🇪 Deutsch · 🇪🇸 Español · 🇫🇷 Français · 🇮🇹 Italiano · 🇰🇷 한국어 · 🇧🇷 Português · 🇷🇺 Русский · 🇹🇷 Türkçe · 🇵🇱 Polski · 🇨🇿 Čeština · 🇸🇦 العربية · 🇻🇳 Tiếng Việt · 🇮🇩 Bahasa Indonesia
 
 **Officially supported platforms**: macOS, Windows, and Linux.
-
----
-
-## Sponsors
-
-<table>
-  <tr>
-    <td width="120" align="center">
-      <a href="https://apikey.fun/register?aff=COCKPIT">
-        <img src="src/assets/icons/apikey-fun.png" alt="APIKEY.FUN" width="72" />
-      </a>
-    </td>
-    <td>
-      <a href="https://apikey.fun/register?aff=COCKPIT"><strong>APIKEY.FUN</strong></a> is a professional enterprise-grade AI relay focused on stable, efficient, and low-cost AI model API access for companies and individual developers. It supports popular models such as Claude, OpenAI, and Gemini, with prices as low as 7% of official pricing. Register through this project <a href="https://apikey.fun/register?aff=COCKPIT"><strong>exclusive link</strong></a> to receive an exclusive <strong>permanent 5% top-up discount</strong>.
-    </td>
-  </tr>
-  <tr>
-    <td width="120" align="center">
-      <a href="https://roxybrowser.cn?code=0326VTDA">
-        <img src="src/assets/icons/roxybrowser.jpg" alt="RoxyBrowser" width="96" />
-      </a>
-    </td>
-    <td>
-      <a href="https://roxybrowser.cn?code=0326VTDA"><strong>RoxyBrowser</strong></a> is an anti-detect browser for multi-account operations and AI automation, supporting isolated browser fingerprint environments, Cookie / storage isolation, Roxy native residential IPs, team collaboration, and API / MCP automation. It helps users manage AI account matrices, reduce account association risk, and improve long-term stability. Register or purchase through the Cockpit <a href="https://roxybrowser.cn?code=0326VTDA"><strong>invite link</strong></a> to get a 10% fan discount.
-    </td>
-  </tr>
-</table>
 
 ---
 
@@ -347,39 +324,15 @@ Notes:
 
 ### Option A: Manual Download (Recommended)
 
-Go to [GitHub Releases](https://github.com/jlcodes99/cockpit-tools/releases) to download the package for your system:
+Go to the [Cockpit Tools Clean Releases page](https://github.com/taol20501-sudo/cockpit-tools-clean/releases) to download the package for your system:
 
 *   **macOS**: `.dmg` (Apple Silicon & Intel)
 *   **Windows**: `.msi` (Recommended) or `.exe`
 *   **Linux**: `.deb` (Debian/Ubuntu), `.rpm`, or `.AppImage` (Universal)
 
-### Option B: Install with Homebrew (macOS)
+### Homebrew note (macOS)
 
-> Homebrew is required.
-
-```bash
-brew tap jlcodes99/cockpit-tools https://github.com/jlcodes99/cockpit-tools
-brew install --cask cockpit-tools
-```
-
-If you hit the macOS "App is damaged" warning, you can also install with `--no-quarantine`:
-
-```bash
-brew install --cask --no-quarantine cockpit-tools
-```
-
-If Homebrew says the app already exists (e.g. `already an App at '/Applications/Cockpit Tools.app'`), remove the old app and install again:
-
-```bash
-rm -rf "/Applications/Cockpit Tools.app"
-brew install --cask cockpit-tools
-```
-
-Or force overwrite the existing app:
-
-```bash
-brew install --cask --force cockpit-tools
-```
+The Clean edition currently uses manual downloads from this repository. Do not use the upstream Homebrew tap when you intend to install Cockpit Tools Clean, because that tap installs the upstream edition and uses its update channel.
 
 ### 🛠️ Troubleshooting
 
@@ -389,7 +342,7 @@ Due to macOS security mechanisms, apps not downloaded from the App Store may tri
 1.  **Command Line Fix** (Recommended):
     Open Terminal and run the following command:
     ```bash
-    sudo xattr -rd com.apple.quarantine "/Applications/Cockpit Tools.app"
+    sudo xattr -rd com.apple.quarantine "/Applications/Cockpit Tools Clean.app"
     ```
     > **Note**: If you changed the app name, please adjust the path in the command accordingly.
 
@@ -437,14 +390,6 @@ Newly created Telegram chat group: [Join the group](https://t.me/+Y8gMv4SlZUU2MW
 
 ---
 
-## Sponsor
-
-If you find this project useful, consider supporting it here: [☕ Donate](docs/DONATE.en.md)
-
-Every bit of support helps sustain open-source development. Thank you!
-
----
-
 ## Acknowledgments
 
 - Antigravity account switching logic references: [Antigravity-Manager](https://github.com/lbjlaq/Antigravity-Manager)
@@ -465,7 +410,7 @@ Thanks to the project author for their open-source contributions! If these proje
 
 ## License
 
-This project is licensed under [CC BY-NC-SA 4.0](https://creativecommons.org/licenses/by-nc-sa/4.0/).
+This unofficial modified edition is distributed under [CC BY-NC-SA 4.0](https://creativecommons.org/licenses/by-nc-sa/4.0/). See the repository [LICENSE](LICENSE) and [NOTICE](NOTICE) files for the full license reference, attribution, modification, and non-endorsement notice.
 
 - Allowed: personal learning, research, and non-commercial use/modification (with attribution and share-alike obligations).
 - Not allowed: any commercial use without authorization (including internal commercial operations, external paid services, paid product integration, or resale/redistribution for profit).

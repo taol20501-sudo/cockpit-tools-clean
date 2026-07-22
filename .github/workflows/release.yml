@@ -110,6 +110,20 @@ jobs:
             echo "## Changelog (English)"
             echo
             printf '%s\n' "$en_section"
+            echo
+            echo "---"
+            echo
+            echo "## 项目来源与许可证 / Project Origin and License"
+            echo
+            echo "Cockpit Tools Clean 是基于 [jlcodes99/cockpit-tools](https://github.com/jlcodes99/cockpit-tools) 制作的非官方修改版，并非原作者官方发布或认可的版本。"
+            echo
+            echo "Cockpit Tools Clean is an unofficial modified edition based on [jlcodes99/cockpit-tools](https://github.com/jlcodes99/cockpit-tools). It is not an official upstream release and is not endorsed by the upstream author."
+            echo
+            echo "本版本关闭推广广告、赞助模块和强制主页公告弹窗，并使用独立的应用标识与签名更新通道。项目按照 [CC BY-NC-SA 4.0](https://creativecommons.org/licenses/by-nc-sa/4.0/) 的署名、非商业和相同方式共享条件分发；第三方组件继续遵循各自许可证。"
+            echo
+            echo "This edition disables promotional advertisements, sponsor modules, and forced home-page announcement popups, and uses an independent application identity and signed update channel. Distribution is subject to [CC BY-NC-SA 4.0](https://creativecommons.org/licenses/by-nc-sa/4.0/) attribution, non-commercial, and share-alike terms; third-party components retain their own licenses."
+            echo
+            echo "[完整署名与修改说明 / Full attribution and modification notice](https://github.com/${GITHUB_REPOSITORY}/blob/v${VERSION}/NOTICE)"
           } > release-notes.md
 
           date -u +"%Y-%m-%dT%H:%M:%SZ" > published-at.txt

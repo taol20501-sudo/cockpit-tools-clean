@@ -27,6 +27,14 @@ function expectExcludes(content, forbidden, file) {
 const packageJson = readJson('package.json');
 const tauriConfig = readJson('src-tauri/tauri.conf.json');
 const announcements = readJson('announcements.json');
+const license = read('LICENSE');
+const notice = read('NOTICE');
+const releaseWorkflow = read('.github/workflows/release.yml');
+const topLevelReadmes = [
+  ['README.md', read('README.md')],
+  ['README.en.md', read('README.en.md')],
+  ['README.pt-br.md', read('README.pt-br.md')],
+];
 
 expect(tauriConfig.productName === 'Cockpit Tools Clean', 'Clean product name changed');
 expect(
@@ -58,6 +66,22 @@ expect(announcements.topRightAd === null, 'Legacy top-right advertisement is not
 expect(Array.isArray(announcements.topRightAds) && announcements.topRightAds.length === 0, 'Advertisement list is not empty');
 expect(announcements.sponsorModule === null, 'Sponsor module was re-enabled');
 expect(Array.isArray(announcements.announcements) && announcements.announcements.length === 0, 'Bundled announcements are not empty');
+
+expectIncludes(license, 'CC BY-NC-SA 4.0', 'LICENSE');
+expectIncludes(license, 'https://github.com/jlcodes99/cockpit-tools', 'LICENSE');
+expectIncludes(notice, 'unofficial modified edition', 'NOTICE');
+expectIncludes(notice, 'https://github.com/taol20501-sudo/cockpit-tools-clean', 'NOTICE');
+expectIncludes(releaseWorkflow, '项目来源与许可证 / Project Origin and License', '.github/workflows/release.yml');
+expectIncludes(releaseWorkflow, '/blob/v${VERSION}/NOTICE', '.github/workflows/release.yml');
+
+for (const [file, content] of topLevelReadmes) {
+  expectIncludes(content, 'taol20501-sudo/cockpit-tools-clean/releases', file);
+  expectExcludes(content, 'jlcodes99/cockpit-tools/releases', file);
+  expectExcludes(content, 'brew tap jlcodes99/cockpit-tools', file);
+  expectExcludes(content, 'apikey.fun/register?aff=COCKPIT', file);
+  expectExcludes(content, 'roxybrowser.cn?code=', file);
+  expectExcludes(content, 'docs/DONATE', file);
+}
 
 const desktopAnnouncement = read('src-tauri/src/modules/announcement.rs');
 const coreAnnouncement = read('crates/cockpit-core/src/modules/announcement.rs');

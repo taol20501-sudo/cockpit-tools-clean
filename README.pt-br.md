@@ -1,11 +1,15 @@
-# Cockpit Tools
+# Cockpit Tools Clean
 
 [English](README.en.md)  · Portuguese (BR) · [简体中文](README.md)
 
-[![GitHub stars](https://img.shields.io/github/stars/jlcodes99/cockpit-tools?style=flat&color=gold)](https://github.com/jlcodes99/cockpit-tools)
-[![GitHub downloads](https://img.shields.io/github/downloads/jlcodes99/cockpit-tools/total?style=flat&color=blue)](https://github.com/jlcodes99/cockpit-tools/releases)
-[![GitHub release](https://img.shields.io/github/v/release/jlcodes99/cockpit-tools?style=flat)](https://github.com/jlcodes99/cockpit-tools/releases)
-[![GitHub issues](https://img.shields.io/github/issues/jlcodes99/cockpit-tools)](https://github.com/jlcodes99/cockpit-tools/issues)
+[![GitHub stars](https://img.shields.io/github/stars/taol20501-sudo/cockpit-tools-clean?style=flat&color=gold)](https://github.com/taol20501-sudo/cockpit-tools-clean)
+[![GitHub downloads](https://img.shields.io/github/downloads/taol20501-sudo/cockpit-tools-clean/total?style=flat&color=blue)](https://github.com/taol20501-sudo/cockpit-tools-clean/releases)
+[![GitHub release](https://img.shields.io/github/v/release/taol20501-sudo/cockpit-tools-clean?style=flat)](https://github.com/taol20501-sudo/cockpit-tools-clean/releases)
+[![GitHub issues](https://img.shields.io/github/issues/taol20501-sudo/cockpit-tools-clean)](https://github.com/taol20501-sudo/cockpit-tools-clean/issues)
+
+> Este repositório é uma edição modificada e não oficial baseada em [jlcodes99/cockpit-tools](https://github.com/jlcodes99/cockpit-tools). Não é uma versão oficial nem endossada pelo autor do projeto original.
+
+A edição Clean desativa anúncios promocionais, módulos de patrocinadores e avisos forçados na página inicial; usa nome e identificador próprios; e recebe atualizações assinadas somente deste repositório.
 
 Uma **ferramenta universal de gerenciamento de contas para IDEs de IA**, atualmente compatível com **Antigravity IDE**, **Codex**, **GitHub Copilot**, **Windsurf**, **Kiro**, **Cursor**, **CodeBuddy**, **CodeBuddy CN**, **Qoder**, **Trae** e **Zed**, com fluxos de trabalho paralelos em múltiplas instâncias.
 
@@ -285,40 +289,15 @@ Observações:
 
 ### Opção A: Download Manual (Recomendado)
 
-Acesse a [página de lançamentos do GitHub](https://github.com/jlcodes99/cockpit-tools/releases) para baixar o pacote para o seu sistema:
+Acesse a [página de lançamentos do Cockpit Tools Clean](https://github.com/taol20501-sudo/cockpit-tools-clean/releases) para baixar o pacote para o seu sistema:
 
 *   **macOS**: `.dmg` (Apple Silicon & Intel)
 *   **Windows**: `.msi` (Recommended) or `.exe`
 *   **Linux**: `.deb` (Debian/Ubuntu), `.rpm`, or `.AppImage` (Universal)
 
-### Opção B: Instalar com o Homebrew (macOS)
+### Observação sobre o Homebrew (macOS)
 
-> É necessário o Homebrew.
-
-
-```bash
-brew tap jlcodes99/cockpit-tools https://github.com/jlcodes99/cockpit-tools
-brew install --cask cockpit-tools
-```
-
-Se você se deparar com o aviso "O aplicativo está danificado" do macOS, também poderá instalar com a opção `--no-quarantine`:
-
-```bash
-brew install --cask --no-quarantine cockpit-tools
-```
-
-Se o Homebrew disser que o aplicativo já existe (por exemplo, `já existe um aplicativo em '/Applications/Cockpit Tools.app'`), remova o aplicativo antigo e instale-o novamente:
-
-```bash
-rm -rf "/Applications/Cockpit Tools.app"
-brew install --cask cockpit-tools
-```
-
-Ou force a sobrescrita do aplicativo existente:
-
-```bash
-brew install --cask --force cockpit-tools
-```
+A edição Clean atualmente deve ser instalada manualmente pela página Releases deste repositório. Não use o tap Homebrew do projeto original para instalar a edição Clean, pois ele instala a edição original e utiliza o canal de atualização original.
 
 ### 🛠️ Solução de problemas
 
@@ -328,7 +307,7 @@ Devido aos mecanismos de segurança do macOS, apps que não foram baixados da Ap
 1.  **Correção via linha de comando** (Recomendado):
     Abra o Terminal e execute o seguinte comando:
     ```bash
-    sudo xattr -rd com.apple.quarantine "/Applications/Cockpit Tools.app"
+    sudo xattr -rd com.apple.quarantine "/Applications/Cockpit Tools Clean.app"
     ```
     > **Observação**: Se você alterou o nome do aplicativo, ajuste o caminho no comando de acordo.
 
@@ -376,14 +355,6 @@ Grupo de bate-papo no Telegram recém-criado: [Junte-se ao grupo](https://t.me/+
 
 ---
 
-## Patrocínio
-
-Se você achar este projeto útil, considere apoiá-lo aqui: [☕ Doar](docs/DONATE.pt-br.md)
-
-Toda contribuição ajuda a manter o desenvolvimento de código aberto. Obrigado!
-
----
-
 ## Agradecimentos
 
 - Lógica de troca de contas do Antigravity IDE baseada em: [Antigravity-Manager](https://github.com/lbjlaq/Antigravity-Manager)
@@ -395,7 +366,7 @@ Agradecemos ao autor do projeto por suas contribuições de código aberto! Se e
 
 ## Licença
 
-Este projeto está licenciado sob a licença [CC BY-NC-SA 4.0](https://creativecommons.org/licenses/by-nc-sa/4.0/).
+Esta edição modificada e não oficial é distribuída sob a licença [CC BY-NC-SA 4.0](https://creativecommons.org/licenses/by-nc-sa/4.0/). Consulte os arquivos [LICENSE](LICENSE) e [NOTICE](NOTICE) para referência completa da licença, atribuição, modificações e aviso de não endosso.
 
 - Permitido: uso pessoal para fins de aprendizagem, pesquisa e uso/modificação não comercial (com atribuição e compartilhamento pela mesma licença).
 - Não permitido: qualquer uso comercial sem autorização (incluindo operações comerciais internas, serviços pagos externos, integração com produtos pagos ou revenda/redistribuição com fins lucrativos).

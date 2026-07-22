@@ -1,0 +1,30 @@
+Cockpit Tools Clean — Attribution and Modification Notice
+
+This repository and its release binaries are an unofficial modified edition of
+Cockpit Tools:
+
+  Upstream project: Cockpit Tools
+  Upstream repository: https://github.com/jlcodes99/cockpit-tools
+  Upstream author and contributors: jlcodes99 and project contributors
+
+Clean edition repository:
+
+  https://github.com/taol20501-sudo/cockpit-tools-clean
+
+The Clean edition changes include disabling promotional advertisements,
+sponsor modules, and forced home-page announcement popups; using a separate
+application name and identifier; and using an independent signed update
+channel hosted by the Clean edition repository.
+
+This edition is not an official upstream release and is not endorsed by the
+upstream author. Do not present it as an official Cockpit Tools release.
+
+License: CC BY-NC-SA 4.0
+https://creativecommons.org/licenses/by-nc-sa/4.0/
+
+Use, modification, and redistribution must retain appropriate attribution,
+identify that changes were made, remain non-commercial unless separately
+authorized in writing by the relevant rightsholder, and follow the applicable
+share-alike requirements. Third-party components retain their own notices and
+license terms.
+
