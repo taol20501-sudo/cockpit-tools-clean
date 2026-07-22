@@ -1,0 +1,24 @@
+name: Clean Edition Guard
+
+on:
+  push:
+    branches:
+      - main
+      - "sync/**"
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  verify-clean-edition:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Prevent advertisement and updater regressions
+        run: node scripts/verify-clean-edition.cjs

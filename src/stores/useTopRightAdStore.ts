@@ -1,6 +1,5 @@
 import { create } from 'zustand';
 import type { TopRightAdState } from '../types/topRightAd';
-import { forceRefreshTopRightAdState, getTopRightAdState } from '../services/topRightAdService';
 
 const EMPTY_STATE: TopRightAdState = {
   ad: null,
@@ -17,87 +16,32 @@ interface TopRightAdStoreState {
   forceRefreshState: () => Promise<TopRightAdState>;
 }
 
-function isTopRightAdState(value: unknown): value is TopRightAdState {
-  if (!value || typeof value !== 'object') {
-    return false;
-  }
-  const record = value as Partial<TopRightAdState>;
-  return Array.isArray(record.ads);
-}
-
-function normalizeTopRightAdState(state: TopRightAdState): TopRightAdState {
-  return {
-    ad: state.ad ?? state.ads?.[0] ?? null,
-    ads: Array.isArray(state.ads) ? state.ads : [],
-  };
-}
-
-function loadCachedTopRightAdState(): TopRightAdState {
-  if (typeof localStorage === 'undefined') {
-    return EMPTY_STATE;
-  }
-
-  try {
-    const raw = localStorage.getItem(TOP_RIGHT_AD_STATE_CACHE_KEY);
-    if (!raw) return EMPTY_STATE;
-    const parsed = JSON.parse(raw) as { state?: unknown };
-    return isTopRightAdState(parsed.state)
-      ? normalizeTopRightAdState(parsed.state)
-      : EMPTY_STATE;
-  } catch {
-    return EMPTY_STATE;
-  }
-}
-
-function persistTopRightAdState(state: TopRightAdState): void {
+function clearLegacyAdCache(): void {
   if (typeof localStorage === 'undefined') {
     return;
   }
 
   try {
-    localStorage.setItem(
-      TOP_RIGHT_AD_STATE_CACHE_KEY,
-      JSON.stringify({ savedAt: Date.now(), state: normalizeTopRightAdState(state) }),
-    );
+    localStorage.removeItem(TOP_RIGHT_AD_STATE_CACHE_KEY);
   } catch {
-    // 缓存写入失败不影响主流程。
+    // A storage failure must not make an advertisement visible.
   }
 }
 
-const initialTopRightAdState = loadCachedTopRightAdState();
+async function returnCleanState(
+  set: (state: Partial<TopRightAdStoreState>) => void,
+): Promise<TopRightAdState> {
+  clearLegacyAdCache();
+  set({ state: EMPTY_STATE, loading: false, initialized: true });
+  return EMPTY_STATE;
+}
 
-export const useTopRightAdStore = create<TopRightAdStoreState>((set, get) => ({
-  state: initialTopRightAdState,
+clearLegacyAdCache();
+
+export const useTopRightAdStore = create<TopRightAdStoreState>((set) => ({
+  state: EMPTY_STATE,
   loading: false,
-  initialized: initialTopRightAdState.ads.length > 0,
-
-  fetchState: async () => {
-    set({ loading: true });
-    try {
-      const nextState = normalizeTopRightAdState(await getTopRightAdState());
-      set({ state: nextState, loading: false, initialized: true });
-      persistTopRightAdState(nextState);
-      return nextState;
-    } catch (error) {
-      console.error('加载右上角广告位失败:', error);
-      const currentState = get().state;
-      set({ state: currentState, loading: false, initialized: true });
-      return currentState;
-    }
-  },
-
-  forceRefreshState: async () => {
-    set({ loading: true });
-    try {
-      const nextState = normalizeTopRightAdState(await forceRefreshTopRightAdState());
-      set({ state: nextState, loading: false, initialized: true });
-      persistTopRightAdState(nextState);
-      return nextState;
-    } catch (error) {
-      console.error('强制刷新右上角广告位失败:', error);
-      const currentState = get().state;
-      set({ state: currentState, loading: false, initialized: true });
-      return currentState;
-    }
-  },
+  initialized: true,
+  fetchState: async () => returnCleanState(set),
+  forceRefreshState: async () => returnCleanState(set),
 }));

@@ -1,0 +1,3 @@
+# Keep the deliberately empty Clean announcement feed when upstream edits its
+# promotional feed. The sync workflow configures this merge driver explicitly.
+announcements.json merge=keep-clean

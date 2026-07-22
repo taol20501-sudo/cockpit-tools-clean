@@ -1,0 +1,95 @@
+name: Sync Upstream
+
+on:
+  schedule:
+    - cron: "23 2 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: sync-upstream-main
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      SYNC_BRANCH: sync/upstream-main
+      UPSTREAM_REPOSITORY: jlcodes99/cockpit-tools
+    steps:
+      - name: Checkout Clean main branch
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Configure Git merge identity and Clean merge rules
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git config merge.keep-clean.driver true
+
+      - name: Fetch upstream
+        run: |
+          git remote add upstream "https://github.com/${UPSTREAM_REPOSITORY}.git"
+          git fetch --no-tags upstream main
+
+      - name: Merge upstream into a review branch
+        id: merge
+        run: |
+          if git merge-base --is-ancestor upstream/main origin/main; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "Clean main already contains the latest upstream commit." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          git switch -C "${SYNC_BRANCH}" origin/main
+          if ! git merge --no-ff --no-edit upstream/main; then
+            conflicts="$(git diff --name-only --diff-filter=U | paste -sd ', ' -)"
+            git merge --abort
+            echo "Upstream merge needs manual conflict resolution: ${conflicts}" >> "$GITHUB_STEP_SUMMARY"
+
+            existing_issue="$(gh issue list --state open --search 'Upstream sync needs manual resolution in:title' --json number --jq '.[0].number // empty')"
+            if [ -z "${existing_issue}" ]; then
+              gh issue create \
+                --title "Upstream sync needs manual resolution" \
+                --body "The scheduled merge from \`${UPSTREAM_REPOSITORY}:main\` conflicted with Clean changes. Conflicting files: ${conflicts}. No change was pushed to \`main\`."
+            else
+              gh issue comment "${existing_issue}" \
+                --body "The latest scheduled sync still conflicts. Conflicting files: ${conflicts}."
+            fi
+            exit 1
+          fi
+
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+          echo "upstream_sha=$(git rev-parse upstream/main)" >> "$GITHUB_OUTPUT"
+
+      - name: Run Clean edition regression gate
+        if: steps.merge.outputs.changed == 'true'
+        run: node scripts/verify-clean-edition.cjs
+
+      - name: Push review branch
+        if: steps.merge.outputs.changed == 'true'
+        run: |
+          git fetch origin "+refs/heads/${SYNC_BRANCH}:refs/remotes/origin/${SYNC_BRANCH}" || true
+          git push --force-with-lease origin "HEAD:refs/heads/${SYNC_BRANCH}"
+
+      - name: Create or update synchronization pull request
+        if: steps.merge.outputs.changed == 'true'
+        run: |
+          short_sha="$(printf '%s' '${{ steps.merge.outputs.upstream_sha }}' | cut -c1-8)"
+          pr_number="$(gh pr list --state open --head "${SYNC_BRANCH}" --json number --jq '.[0].number // empty')"
+          if [ -z "${pr_number}" ]; then
+            gh pr create \
+              --base main \
+              --head "${SYNC_BRANCH}" \
+              --title "chore: sync upstream ${short_sha}" \
+              --body "Automated merge from \`${UPSTREAM_REPOSITORY}:main\`. The Clean edition guard passed, so advertisements, sponsor content, forced home-page announcements, branding, and the private update channel remain disabled/preserved. Review the normal CI results before merging."
+          else
+            gh pr edit "${pr_number}" --title "chore: sync upstream ${short_sha}"
+          fi

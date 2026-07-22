@@ -9,7 +9,7 @@ on:
 jobs:
   prepare-release:
     name: Prepare staged release
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -39,10 +39,17 @@ jobs:
         run: |
           set -euo pipefail
           EXPECTED_TAG="v${{ steps.app_version.outputs.VERSION }}"
-          if [ "${GITHUB_REF_NAME}" != "${EXPECTED_TAG}" ]; then
+          if [ "${GITHUB_EVENT_NAME}" = "push" ] && [ "${GITHUB_REF_NAME}" != "${EXPECTED_TAG}" ]; then
             echo "Tag (${GITHUB_REF_NAME}) does not match package.json version (${EXPECTED_TAG})."
             exit 1
           fi
+          if [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ] && [ "${GITHUB_REF}" != "refs/heads/main" ]; then
+            echo "Manual releases must be run from the main branch."
+            exit 1
+          fi
+
+      - name: Verify Clean edition invariants
+        run: node scripts/verify-clean-edition.cjs
 
       - name: Build bilingual release notes from changelog
         shell: bash
@@ -107,31 +114,40 @@ jobs:
 
           date -u +"%Y-%m-%dT%H:%M:%SZ" > published-at.txt
 
-      - name: Preserve previous legacy latest.json
+      - name: Preserve previous legacy latest.json or bootstrap the Clean channel
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         shell: bash
         run: |
           set -euo pipefail
+          CURRENT_TAG="v${{ steps.app_version.outputs.VERSION }}"
           PREVIOUS_TAG="$(
             gh release list \
               --limit 100 \
               --json tagName,isDraft,isPrerelease \
-              --jq "[.[] | select(.isDraft == false and .isPrerelease == false and .tagName != \"${GITHUB_REF_NAME}\")][0].tagName // \"\""
+              --jq "[.[] | select(.isDraft == false and .isPrerelease == false and .tagName != \"${CURRENT_TAG}\")][0].tagName // \"\""
           )"
-          if [ -z "${PREVIOUS_TAG}" ]; then
-            echo "No previous published release was found; refusing to stage without a legacy updater manifest."
-            exit 1
-          fi
-
           mkdir -p previous-release
-          gh release download "${PREVIOUS_TAG}" \
-            --pattern "latest.json" \
-            --dir previous-release \
-            --clobber
-          test -s previous-release/latest.json
-          cp previous-release/latest.json legacy-latest.json
-          echo "Preserved legacy latest.json from ${PREVIOUS_TAG}"
+          if [ -n "${PREVIOUS_TAG}" ] && \
+             gh release download "${PREVIOUS_TAG}" --pattern "latest.json" --dir previous-release --clobber && \
+             test -s previous-release/latest.json; then
+            cp previous-release/latest.json legacy-latest.json
+            echo "Preserved legacy latest.json from ${PREVIOUS_TAG}"
+          else
+            VERSION="${{ steps.app_version.outputs.VERSION }}"
+            node -e '
+              const fs = require("node:fs");
+              const version = process.argv[1];
+              const manifest = {
+                version,
+                notes: "Cockpit Tools Clean updater channel bootstrap",
+                pub_date: new Date().toISOString(),
+                platforms: {},
+              };
+              fs.writeFileSync("legacy-latest.json", `${JSON.stringify(manifest, null, 2)}\n`);
+            ' "${VERSION}"
+            echo "No signed Clean updater manifest exists yet; created a temporary bootstrap manifest."
+          fi
 
       # Publish the release early (with previous complete latest.json) so parallel
       # platform jobs can verify assets via public tag download URLs without
@@ -144,7 +160,7 @@ jobs:
         run: |
           set -euo pipefail
           TAG="v${{ steps.app_version.outputs.VERSION }}"
-          TITLE="Cockpit Tools v${{ steps.app_version.outputs.VERSION }}"
+          TITLE="Cockpit Tools Clean v${{ steps.app_version.outputs.VERSION }}"
           if gh release view "${TAG}" > /dev/null 2>&1; then
             gh release edit "${TAG}" \
               --title "${TITLE}" \
@@ -152,6 +168,7 @@ jobs:
           else
             gh release create "${TAG}" \
               --draft \
+              --target "${GITHUB_SHA}" \
               --title "${TITLE}" \
               --notes-file release-notes.md
           fi
@@ -845,6 +862,7 @@ jobs:
 
   update-homebrew-cask:
     name: Update Homebrew Cask
+    if: github.repository == 'jlcodes99/cockpit-tools'
     needs:
       - prepare-release
       - finalize-legacy-latest

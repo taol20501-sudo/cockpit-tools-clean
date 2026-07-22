@@ -31,6 +31,9 @@ jobs:
       - name: Install dependencies
         run: npm install
 
+      - name: Verify Clean edition invariants
+        run: npm run check:clean
+
       - name: Sync version
         run: npm run sync-version
 
