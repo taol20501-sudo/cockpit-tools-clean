@@ -1,3 +1,7 @@
 # Keep the deliberately empty Clean announcement feed when upstream edits its
 # promotional feed. The sync workflow configures this merge driver explicitly.
 announcements.json merge=keep-clean
+
+# Merge ordinary upstream Tauri configuration changes while preserving the
+# Clean product identity and signed updater channel.
+src-tauri/tauri.conf.json merge=clean-tauri-config
