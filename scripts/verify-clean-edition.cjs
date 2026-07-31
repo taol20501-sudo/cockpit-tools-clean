@@ -30,6 +30,8 @@ const announcements = readJson('announcements.json');
 const license = read('LICENSE');
 const notice = read('NOTICE');
 const releaseWorkflow = read('.github/workflows/release.yml');
+const syncWorkflow = read('.github/workflows/sync-upstream.yml');
+const gitAttributes = read('.gitattributes');
 const topLevelReadmes = [
   ['README.md', read('README.md')],
   ['README.en.md', read('README.en.md')],
@@ -73,6 +75,11 @@ expectIncludes(notice, 'unofficial modified edition', 'NOTICE');
 expectIncludes(notice, 'https://github.com/taol20501-sudo/cockpit-tools-clean', 'NOTICE');
 expectIncludes(releaseWorkflow, '项目来源与许可证 / Project Origin and License', '.github/workflows/release.yml');
 expectIncludes(releaseWorkflow, '/blob/v${VERSION}/NOTICE', '.github/workflows/release.yml');
+expectIncludes(gitAttributes, 'announcements.json merge=keep-clean', '.gitattributes');
+expectIncludes(gitAttributes, '.github/workflows/release.yml merge=keep-clean', '.gitattributes');
+expectIncludes(syncWorkflow, 'node scripts/verify-clean-edition.cjs', '.github/workflows/sync-upstream.yml');
+expectIncludes(syncWorkflow, 'git push origin "HEAD:refs/heads/main"', '.github/workflows/sync-upstream.yml');
+expectIncludes(syncWorkflow, 'gh workflow run release.yml --ref main', '.github/workflows/sync-upstream.yml');
 
 for (const [file, content] of topLevelReadmes) {
   expectIncludes(content, 'taol20501-sudo/cockpit-tools-clean/releases', file);

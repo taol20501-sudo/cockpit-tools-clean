@@ -5,3 +5,8 @@ announcements.json merge=keep-clean
 # Merge ordinary upstream Tauri configuration changes while preserving the
 # Clean product identity and signed updater channel.
 src-tauri/tauri.conf.json merge=clean-tauri-config
+
+# The Clean fork owns its release channel and legal notices. Upstream release
+# workflow refactors are reviewed and ported separately instead of replacing
+# the Clean signing/release pipeline during scheduled synchronization.
+.github/workflows/release.yml merge=keep-clean

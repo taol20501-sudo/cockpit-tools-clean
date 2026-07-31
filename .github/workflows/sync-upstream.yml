@@ -10,8 +10,8 @@ concurrency:
   cancel-in-progress: false
 
 permissions:
+  actions: write
   contents: write
-  pull-requests: write
   issues: write
 
 jobs:
@@ -27,6 +27,11 @@ jobs:
         with:
           ref: main
           fetch-depth: 0
+
+      - name: Set up Node.js for Clean merge drivers and checks
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
 
       - name: Configure Git merge identity and Clean merge rules
         run: |
@@ -79,23 +84,27 @@ jobs:
         if: steps.merge.outputs.changed == 'true'
         run: node scripts/verify-clean-edition.cjs
 
-      - name: Push review branch
+      - name: Push validated merge to main
         if: steps.merge.outputs.changed == 'true'
         run: |
-          git fetch origin "+refs/heads/${SYNC_BRANCH}:refs/remotes/origin/${SYNC_BRANCH}" || true
-          git push --force-with-lease origin "HEAD:refs/heads/${SYNC_BRANCH}"
+          git push origin "HEAD:refs/heads/main"
 
-      - name: Create or update synchronization pull request
-        if: steps.merge.outputs.changed == 'true'
+      - name: Ensure the current Clean version is fully released
         run: |
-          short_sha="$(printf '%s' '${{ steps.merge.outputs.upstream_sha }}' | cut -c1-8)"
-          pr_number="$(gh pr list --state open --head "${SYNC_BRANCH}" --json number --jq '.[0].number // empty')"
-          if [ -z "${pr_number}" ]; then
-            gh pr create \
-              --base main \
-              --head "${SYNC_BRANCH}" \
-              --title "chore: sync upstream ${short_sha}" \
-              --body "Automated merge from \`${UPSTREAM_REPOSITORY}:main\`. The Clean edition guard passed, so advertisements, sponsor content, forced home-page announcements, branding, and the private update channel remain disabled/preserved. Review the normal CI results before merging."
+          set -euo pipefail
+          version="$(node -p "require('./package.json').version")"
+          tag="v${version}"
+          check_dir="$(mktemp -d)"
+          manifest_version=""
+
+          if gh release view "${tag}" > /dev/null 2>&1 && \
+             gh release download "${tag}" --pattern latest.json --dir "${check_dir}" --clobber > /dev/null 2>&1; then
+            manifest_version="$(jq -r '.version // empty' "${check_dir}/latest.json")"
+          fi
+
+          if [ "${manifest_version}" = "${version}" ]; then
+            echo "Clean release ${tag} already has a complete updater manifest." >> "$GITHUB_STEP_SUMMARY"
           else
-            gh pr edit "${pr_number}" --title "chore: sync upstream ${short_sha}"
+            gh workflow run release.yml --ref main
+            echo "Dispatched Clean release ${tag}; existing updater manifest version was '${manifest_version:-missing}'." >> "$GITHUB_STEP_SUMMARY"
           fi
