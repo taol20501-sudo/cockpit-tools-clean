@@ -2,7 +2,10 @@ name: Sync Upstream
 
 on:
   schedule:
-    - cron: "23 2 * * *"
+    # GitHub may delay scheduled workflows during busy periods. Poll every
+    # three hours so an upstream release is not missed for an entire day when
+    # it lands shortly after one delayed run.
+    - cron: "17 */3 * * *"
   workflow_dispatch:
 
 concurrency:
@@ -96,6 +99,14 @@ jobs:
           tag="v${version}"
           check_dir="$(mktemp -d)"
           manifest_version=""
+          release_run_count="$(
+            gh run list \
+              --workflow release.yml \
+              --commit "$(git rev-parse HEAD)" \
+              --limit 20 \
+              --json status \
+              --jq '[.[] | select(.status != "completed")] | length'
+          )"
 
           if gh release view "${tag}" > /dev/null 2>&1 && \
              gh release download "${tag}" --pattern latest.json --dir "${check_dir}" --clobber > /dev/null 2>&1; then
@@ -104,6 +115,8 @@ jobs:
 
           if [ "${manifest_version}" = "${version}" ]; then
             echo "Clean release ${tag} already has a complete updater manifest." >> "$GITHUB_STEP_SUMMARY"
+          elif [ "${release_run_count}" -gt 0 ]; then
+            echo "Clean release ${tag} is already queued or building; no duplicate release was dispatched." >> "$GITHUB_STEP_SUMMARY"
           else
             gh workflow run release.yml --ref main
             echo "Dispatched Clean release ${tag}; existing updater manifest version was '${manifest_version:-missing}'." >> "$GITHUB_STEP_SUMMARY"
