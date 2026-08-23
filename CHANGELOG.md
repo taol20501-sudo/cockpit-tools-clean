@@ -7,6 +7,18 @@ All notable changes to Cockpit Tools will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
+## [1.3.27] - 2026-08-23
+
+### Fixed
+
+- **Fixed Windows Codex account switching being blocked by system permissions**: restored the stable official-client close and launch path without directly invoking the internal WindowsApps `codex.exe app-server daemon stop`, preventing “Access denied (os error 5)” or an unavailable PowerShell executable from aborting the switch.
+
+## [1.3.26] - 2026-08-23
+
+### Fixed
+
+- **Fixed Windows account switching failing in the new Codex version**: fixed the official `Codex app-server daemon stop` step failing with “Access denied (os error 5)” for `codex.exe` under WindowsApps, which prevented the account switch from continuing.
+
 ## [1.3.25] - 2026-08-23
 
 ### Changed
