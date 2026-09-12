@@ -56,10 +56,17 @@ func enrichAuthSelectionError(err error, providers []string, model string) error
 		baseMessage = "no auth available"
 	}
 	detail := fmt.Sprintf("%s (providers=%s, model=%s)", baseMessage, providerText, modelText)
+	if strings.ContainsAny(baseMessage, "\u4e00-\u9fff") {
+		detail = fmt.Sprintf("%s（提供商=%s，模型=%s）", baseMessage, providerText, modelText)
+	}
 
 	// Clarify the most common alias confusion between Anthropic route names and internal provider keys.
 	if strings.Contains(","+providerText+",", ",claude,") {
-		detail += "; check Claude auth/key session and cooldown state via /v0/management/auth-files"
+		if strings.ContainsAny(baseMessage, "\u4e00-\u9fff") {
+			detail += "；请通过 /v0/management/auth-files 检查 Claude 授权、Key 会话和冷却状态"
+		} else {
+			detail += "; check Claude auth/key session and cooldown state via /v0/management/auth-files"
+		}
 	}
 
 	status := authErr.HTTPStatus
@@ -67,12 +74,20 @@ func enrichAuthSelectionError(err error, providers []string, model string) error
 		status = http.StatusServiceUnavailable
 	}
 
-	return &coreauth.Error{
+	enriched := &coreauth.Error{
 		Code:       authErr.Code,
 		Message:    detail,
 		Retryable:  authErr.Retryable,
 		HTTPStatus: status,
 	}
+	cause := errors.Unwrap(err)
+	if coreauth.IsTerminalAuthError(err) {
+		return coreauth.NewTerminalAuthError(enriched, cause)
+	}
+	if cause != nil {
+		return coreauth.WithCause(enriched, cause)
+	}
+	return enriched
 }
 
 // WriteErrorResponse writes an error message to the response writer using the HTTP status embedded in the message.
@@ -109,7 +124,11 @@ func (h *BaseAPIHandler) WriteErrorResponse(c *gin.Context, msg *interfaces.Erro
 		}
 	}
 
-	body := BuildErrorResponseBody(status, errText)
+	var errCause error
+	if msg != nil {
+		errCause = msg.Error
+	}
+	body := BuildErrorResponseBodyWithError(status, errText, errCause)
 	// Append first to preserve upstream response logs, then drop duplicate payloads if already recorded.
 	var previous []byte
 	if existing, exists := c.Get("API_RESPONSE"); exists {

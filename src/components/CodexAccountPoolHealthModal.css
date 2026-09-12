@@ -49,6 +49,24 @@
   overflow-y: auto;
 }
 
+.codex-account-pool-health-success {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 12px;
+  padding: 8px 12px;
+  border: 1px solid color-mix(in srgb, var(--success, #16a34a) 28%, transparent);
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--success, #16a34a) 12%, transparent);
+  color: var(--success, #16a34a);
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.codex-account-pool-health-success svg {
+  flex-shrink: 0;
+}
+
 .codex-account-pool-health-list {
   display: grid;
   gap: 10px;
@@ -154,6 +172,24 @@
 
 .codex-account-pool-health-item.is-missing .codex-account-pool-health-item-status {
   color: var(--text-secondary);
+}
+
+.codex-account-pool-health-item.is-available .codex-account-pool-health-item-status {
+  color: var(--success, #16a34a);
+}
+
+.codex-account-pool-health-model-pill {
+  display: inline-flex;
+  align-items: center;
+  flex-shrink: 0;
+  padding: 2px 7px;
+  border: 1px solid var(--border-light);
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--bg-secondary) 88%, transparent);
+  color: var(--text-secondary);
+  font-size: 10px;
+  line-height: 1.3;
+  white-space: nowrap;
 }
 
 .codex-account-pool-health-item-primary > .btn {

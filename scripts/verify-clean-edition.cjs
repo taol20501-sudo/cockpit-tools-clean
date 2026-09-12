@@ -80,6 +80,9 @@ expectIncludes(gitAttributes, '.github/workflows/release.yml merge=keep-clean', 
 expectIncludes(syncWorkflow, 'node scripts/verify-clean-edition.cjs', '.github/workflows/sync-upstream.yml');
 expectIncludes(syncWorkflow, 'git push origin "HEAD:refs/heads/main"', '.github/workflows/sync-upstream.yml');
 expectIncludes(syncWorkflow, 'gh workflow run release.yml --ref main', '.github/workflows/sync-upstream.yml');
+expectIncludes(syncWorkflow, 'GH_REPO: ${{ github.repository }}', '.github/workflows/sync-upstream.yml');
+expectIncludes(syncWorkflow, 'gh workflow run release.yml --ref main --repo "${GH_REPO}"', '.github/workflows/sync-upstream.yml');
+expectIncludes(syncWorkflow, 'node scripts/release/check_clean_release.cjs', '.github/workflows/sync-upstream.yml');
 expectIncludes(syncWorkflow, 'cron: "17 */3 * * *"', '.github/workflows/sync-upstream.yml');
 expectIncludes(syncWorkflow, '--commit "$(git rev-parse HEAD)"', '.github/workflows/sync-upstream.yml');
 
@@ -96,6 +99,7 @@ const desktopAnnouncement = read('src-tauri/src/modules/announcement.rs');
 const coreAnnouncement = read('crates/cockpit-core/src/modules/announcement.rs');
 const remoteConfig = read('src-tauri/src/modules/remote_config.rs');
 const settingsPage = read('src/pages/SettingsPage.tsx');
+const settingsView = read('src/pages/SettingsPageView.tsx');
 const updaterNotes = read('src/utils/updaterReleaseNotes.ts');
 const topRightStore = read('src/stores/useTopRightAdStore.ts');
 const sponsorStore = read('src/stores/useSponsorStore.ts');
@@ -121,10 +125,12 @@ expectIncludes(
   'src-tauri/src/modules/remote_config.rs',
 );
 expectIncludes(
-  settingsPage,
+  settingsView,
   'https://github.com/taol20501-sudo/cockpit-tools-clean/issues',
-  'src/pages/SettingsPage.tsx',
+  'src/pages/SettingsPageView.tsx',
 );
+expectExcludes(settingsView, 'docs/DONATE', 'src/pages/SettingsPageView.tsx');
+expectExcludes(settingsView, "t('settings.about.sponsor", 'src/pages/SettingsPageView.tsx');
 expectExcludes(settingsPage, 'jlcodes99/cockpit-tools/blob/main/docs/DONATE', 'src/pages/SettingsPage.tsx');
 expectExcludes(updaterNotes, 'jlcodes99/cockpit-tools/releases', 'src/utils/updaterReleaseNotes.ts');
 expectIncludes(updaterNotes, 'taol20501-sudo/cockpit-tools-clean/releases', 'src/utils/updaterReleaseNotes.ts');

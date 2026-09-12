@@ -1,22 +1,21 @@
 cask "cockpit-tools" do
-  version "1.3.32"
-  sha256 "2542600cb59f709ffe4079af9f631b67dfe3062fc2ce63d22ce36df1b84ccce6"
+  version "1.3.49"
+  sha256 "3d7adbd4d824d95e2658e1dc044dc6bc0e9d6efa4791ff7f833f10c86289a514"
 
-  url "https://github.com/jlcodes99/cockpit-tools/releases/download/v#{version}/Cockpit.Tools_#{version}_universal.dmg",
-      verified: "github.com/jlcodes99/cockpit-tools/"
+  url "https://github.com/jlcodes99/cockpit-tools/releases/download/v#{version}/Cockpit.Tools_#{version}_universal.dmg"
   name "Cockpit Tools"
   desc "Account manager for AI IDEs (Antigravity and Codex)"
   homepage "https://github.com/jlcodes99/cockpit-tools"
 
   auto_updates true
 
-  postflight do
-    system_command "/usr/bin/xattr",
-                   args: ["-cr", "#{appdir}/Cockpit Tools.app"],
-                   sudo: true
-  end
-
   app "Cockpit Tools.app"
+
+  postflight_steps do
+    run "/usr/bin/xattr",
+        args: ["-cr", "{{appdir}}/Cockpit Tools.app"],
+        sudo: true
+  end
 
   zap trash: [
     "~/Library/Application Support/com.jlcodes.cockpit-tools",

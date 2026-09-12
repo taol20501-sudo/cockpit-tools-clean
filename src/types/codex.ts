@@ -11,10 +11,6 @@ export interface CodexExperimentalModelDefinition {
   display_name: string;
   /** undefined follows the official model reasoning levels; otherwise custom multi-select. */
   reasoning_efforts?: CodexReasoningEffort[];
-  /** undefined follows the model catalog metadata. */
-  context_window?: number;
-  /** undefined follows the model catalog metadata. */
-  auto_compact_token_limit?: number;
 }
 
 export type CodexReasoningEffort = 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra';
@@ -30,6 +26,10 @@ export interface CodexQuickConfig {
   experimental_model_catalog_conflict?: string;
   experimental_model_catalog_models: CodexExperimentalModelDefinition[];
   experimental_model_catalog_default_model_id?: string | null;
+  experimental_model_catalog_reset_models: CodexExperimentalModelDefinition[];
+  experimental_model_catalog_reset_default_model_id?: string | null;
+  /** Official Codex experimental context management; absent/false follows the official default. */
+  context_management_experimental_mode: boolean;
 }
 
 export type CodexAppSpeed = "standard" | "fast";
@@ -76,8 +76,11 @@ export interface CodexAccount {
   account_name?: string;
   account_structure?: string;
   account_note?: string;
+  /** Legacy import/export metadata; no longer changes outgoing requests. */
   codex_fingerprint_mode?: CodexFingerprintMode;
+  /** Legacy backup metadata; no longer restricts clients or reaches the sidecar. */
   codex_cli_only?: boolean;
+  /** Legacy backup metadata; no longer grants client-policy exceptions. */
   codex_cli_only_allow_app_server?: boolean;
   two_factor_secret?: string;
   account_password?: string;
@@ -91,7 +94,21 @@ export interface CodexAccount {
   authorization_status?: string | null;
   requires_reauth?: boolean;
   reauth_reason?: string;
+  client_auth_status?: "available" | "login_required" | "unknown" | string | null;
+  last_client_auth_observed_at?: number | null;
+  last_client_login_redirect_at?: number | null;
+  last_client_launch_at?: number | null;
+  last_client_auth_instance_id?: string | null;
   quota?: CodexQuota;
+  team_quota_history?: {
+    user_id: string;
+    account_id: string;
+    observed_at: number;
+    hourly_reset_time?: number | null;
+    weekly_reset_time?: number | null;
+    hourly_percentage?: number | null;
+    weekly_percentage?: number | null;
+  };
   quota_error?: CodexQuotaErrorInfo;
   tags?: string[];
   created_at: number;
@@ -1018,10 +1035,35 @@ function normalizeCodexPlanKey(planType?: string): string {
   return normalized;
 }
 
+function getCodexEffectivePlanKey(account: CodexAccount): string {
+  const planKey = normalizeCodexPlanKey(account.plan_type);
+  if (
+    planKey === "free" ||
+    isCodexApiKeyAccount(account) ||
+    isCodexPendingOAuthAccount(account) ||
+    isCodexAgentIdentityAccount(account) ||
+    isCodexWebSessionAccount(account)
+  ) {
+    return planKey;
+  }
+
+  const subscriptionExpiry = parseCodexSubscriptionDate(
+    account.subscription_active_until,
+  );
+  if (subscriptionExpiry && subscriptionExpiry.getTime() <= Date.now()) {
+    return "free";
+  }
+  return planKey;
+}
+
 export function isCodexExplicitFreePlanType(planType?: string): boolean {
   const normalized = (planType || "").trim();
   if (!normalized) return false;
   return normalizeCodexPlanKey(planType) === "free";
+}
+
+export function isCodexEffectiveFreePlan(account: CodexAccount): boolean {
+  return getCodexEffectivePlanKey(account) === "free";
 }
 
 function normalizeCodexAuthFilePlanType(
@@ -1057,8 +1099,9 @@ function getCodexPlanBadgeLabel(account: CodexAccount): string {
   if (isCodexApiKeyAccount(account)) {
     return "API";
   }
-  const baseLabel = getCodexPlanDisplayName(account.plan_type);
-  if (normalizeCodexPlanKey(account.plan_type) !== "pro") {
+  const effectivePlanKey = getCodexEffectivePlanKey(account);
+  const baseLabel = getCodexPlanDisplayName(effectivePlanKey);
+  if (effectivePlanKey !== "pro") {
     return baseLabel;
   }
 
@@ -1077,7 +1120,7 @@ function getCodexPlanBadgeClass(account: CodexAccount): string {
   if (isCodexNewApiAccount(account)) {
     return "api-key new-api-exclusive";
   }
-  const baseClass = normalizeCodexPlanKey(account.plan_type);
+  const baseClass = getCodexEffectivePlanKey(account);
   if (baseClass === "plus") {
     return "plus codex-plus";
   }
@@ -1126,7 +1169,7 @@ export function getCodexPlanBadgePresentationWithStyle(
 
 export function getCodexPlanFilterKey(account: CodexAccount): string {
   if (isCodexPendingOAuthAccount(account)) return "PENDING";
-  return normalizeCodexPlanKey(account.plan_type).toUpperCase();
+  return getCodexEffectivePlanKey(account).toUpperCase();
 }
 
 export function isCodexTeamLikePlan(planType?: string): boolean {

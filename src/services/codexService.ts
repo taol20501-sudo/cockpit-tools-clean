@@ -6,7 +6,6 @@ import {
   CodexApiProviderMode,
   CodexAppSpeed,
   CodexAppSpeedConfig,
-  CodexFingerprintMode,
   CodexBatchDeleteJobStatus,
   CodexProviderWireApi,
   CodexQuickConfig,
@@ -53,6 +52,13 @@ export async function getCodexQuickConfig(): Promise<CodexQuickConfig> {
   return await invoke('get_codex_quick_config');
 }
 
+/** 保存官方 Codex 实验性上下文管理开关。 */
+export async function saveCodexContextManagement(
+  experimentalMode: boolean,
+): Promise<CodexQuickConfig> {
+  return await invoke('save_codex_context_management', { experimentalMode });
+}
+
 /** 保存 Codex config.toml 快捷配置 */
 export async function saveCodexQuickConfig(
   modelContextWindow?: number,
@@ -66,6 +72,19 @@ export async function saveCodexQuickConfig(
     autoCompactTokenLimit: autoCompactTokenLimit ?? null,
     experimentalModelCatalogEnabled: experimentalModelCatalogEnabled ?? null,
     experimentalModelCatalogModels: experimentalModelCatalogModels ?? null,
+    experimentalModelCatalogDefaultModelId: experimentalModelCatalogDefaultModelId ?? null,
+  });
+}
+
+/** 保存 Codex 可见模型，不修改当前上下文窗口配置。 */
+export async function saveCodexModelCatalog(
+  experimentalModelCatalogEnabled: boolean,
+  experimentalModelCatalogModels: CodexExperimentalModelDefinition[],
+  experimentalModelCatalogDefaultModelId?: string | null,
+): Promise<CodexQuickConfig> {
+  return await invoke('save_codex_model_catalog', {
+    experimentalModelCatalogEnabled,
+    experimentalModelCatalogModels,
     experimentalModelCatalogDefaultModelId: experimentalModelCatalogDefaultModelId ?? null,
   });
 }
@@ -102,13 +121,22 @@ export async function refreshCodexAccountProfile(accountId: string): Promise<Cod
   return await invoke('refresh_codex_account_profile', { accountId });
 }
 
+/** 使用 OAuth refresh_token 手动强制获取新的 access_token/id_token。 */
+export async function forceRefreshCodexTokens(accountId: string): Promise<CodexAccount> {
+  return await invoke<CodexAccount>('force_refresh_codex_tokens', { accountId });
+}
+
+/** 清除官方客户端登录页观测标识，不修改 Token 或远端授权状态。 */
+export async function clearClientAuthObservation(accountId: string): Promise<boolean> {
+  return await invoke<boolean>('codex_clear_client_auth_observation', { accountId });
+}
+
 /** 切换 Codex 账号 */
 export async function switchCodexAccount(
   accountId: string,
   options?: {
     reauthTokenGeneration?: number;
     launchAfterSwitch?: boolean;
-    skipOfficialAccountCheck?: boolean;
   },
 ): Promise<CodexAccount> {
   const startedAt = performance.now();
@@ -124,10 +152,25 @@ export async function switchCodexAccount(
           stage: 'preparing',
           progress: 4,
           launchAfterSwitch: options?.launchAfterSwitch,
-          skipOfficialAccountCheck: options?.skipOfficialAccountCheck,
         },
       }),
     );
+    if (options?.launchAfterSwitch === true) {
+      window.dispatchEvent(
+        new CustomEvent('codex:instance-launch-progress', {
+          detail: {
+            type: 'start',
+            instanceId: '__default__',
+            instanceName: '',
+            isDefault: true,
+            accountId,
+            operation: 'switch-and-start',
+            source: 'switch-service',
+            progress: 4,
+          },
+        }),
+      );
+    }
     const account = await invoke<CodexAccount>('switch_codex_account', {
       accountId,
       autoRepairMode: null,
@@ -135,7 +178,6 @@ export async function switchCodexAccount(
         typeof options?.reauthTokenGeneration === 'number' ? options.reauthTokenGeneration : null,
       launchAfterSwitch:
         typeof options?.launchAfterSwitch === 'boolean' ? options.launchAfterSwitch : null,
-      skipOfficialAccountCheck: options?.skipOfficialAccountCheck === true ? true : null,
     });
     window.dispatchEvent(
       new CustomEvent('codex-switch-progress', {
@@ -147,8 +189,46 @@ export async function switchCodexAccount(
         },
       }),
     );
+    if (options?.launchAfterSwitch === true) {
+      window.dispatchEvent(
+        new CustomEvent('codex:instance-launch-progress', {
+          detail: {
+            type: 'complete',
+            instanceId: '__default__',
+            instanceName: '',
+            isDefault: true,
+            accountId,
+            operation: 'switch-and-start',
+            progress: 100,
+          },
+        }),
+      );
+    }
     return account;
   } catch (error) {
+    if (String(error).includes('CODEX_START_CANCELLED')) {
+      const cancelledPayload = {
+        type: 'cancelled' as const,
+        accountId,
+        error: 'CODEX_START_CANCELLED',
+        cancelled: true,
+      };
+      window.dispatchEvent(new CustomEvent('codex-switch-progress', { detail: cancelledPayload }));
+      if (options?.launchAfterSwitch === true) {
+        window.dispatchEvent(
+          new CustomEvent('codex:instance-launch-progress', {
+            detail: {
+              ...cancelledPayload,
+              instanceId: '__default__',
+              instanceName: '',
+              isDefault: true,
+              operation: 'switch-and-start',
+            },
+          }),
+        );
+      }
+      throw error;
+    }
     const normalizedError = normalizeCodexSwitchError(error);
     window.dispatchEvent(
       new CustomEvent('codex-switch-progress', {
@@ -160,6 +240,23 @@ export async function switchCodexAccount(
         },
       }),
     );
+    if (options?.launchAfterSwitch === true) {
+      window.dispatchEvent(
+        new CustomEvent('codex:instance-launch-progress', {
+          detail: {
+            type: 'error',
+            instanceId: '__default__',
+            instanceName: '',
+            isDefault: true,
+            accountId,
+            operation: 'switch-and-start',
+            error: normalizedError.message,
+            authFailure: normalizedError.authFailure,
+            canRetry: true,
+          },
+        }),
+      );
+    }
     throw normalizedError;
   } finally {
     console.info('[Codex Switch][Service] invoke switch_codex_account finished', {
@@ -352,12 +449,13 @@ export async function refreshAllCodexQuotas(): Promise<number> {
 /** 按 ID 列表限流并发刷新配额（分组/本地访问批量）；后端统一限流并只做一次 tray 更新 */
 export async function refreshCodexQuotasBatch(
   accountIds: string[],
-  options?: { respectGroupQuotaRefresh?: boolean },
+  options?: { respectGroupQuotaRefresh?: boolean; background?: boolean },
 ): Promise<number> {
   return await invoke('refresh_codex_quotas_batch', {
     accountIds,
     // 缺省 true：遵守分组「额度刷新」开关；显式刷新分组时传 false
     respectGroupQuotaRefresh: options?.respectGroupQuotaRefresh ?? true,
+    background: options?.background ?? false,
   });
 }
 
@@ -551,27 +649,6 @@ export async function updateCodexAccountTags(
   return await invoke('update_codex_account_tags', { accountId, tags });
 }
 
-export async function updateCodexAccountsFingerprintMode(
-  accountIds: string[],
-  mode: CodexFingerprintMode,
-): Promise<CodexAccount[]> {
-  return await invoke('update_codex_accounts_fingerprint_mode', {
-    accountIds,
-    mode,
-  });
-}
-
-export async function updateCodexAccountClientPolicy(
-  accountId: string,
-  codexCliOnly: boolean,
-  allowAppServer: boolean,
-): Promise<CodexAccount> {
-  return await invoke('update_codex_account_client_policy', {
-    accountId,
-    codexCliOnly,
-    allowAppServer,
-  });
-}
 
 export async function updateCodexAccountInstanceAccess(
   accountId: string,
@@ -626,4 +703,13 @@ export async function fetchCodexAccountNoteMailUrl(
   mailUrl: string,
 ): Promise<CodexMailPreviewFetchResult> {
   return await invoke('fetch_codex_account_note_mail_url', { mailUrl });
+}
+
+export async function restoreCodexActiveTakeoverIfEnabled(): Promise<boolean> {
+  try {
+    return await invoke<boolean>('restore_codex_active_takeover_if_enabled');
+  } catch (e) {
+    console.warn('[Codex Auto-Restore] 恢复代理接管失败:', e);
+    return false;
+  }
 }

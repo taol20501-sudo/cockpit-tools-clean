@@ -22,6 +22,8 @@ jobs:
     runs-on: ubuntu-latest
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      # gh otherwise resolves fork operations to the parent repository.
+      GH_REPO: ${{ github.repository }}
       SYNC_BRANCH: sync/upstream-main
       UPSTREAM_REPOSITORY: jlcodes99/cockpit-tools
     steps:
@@ -84,7 +86,6 @@ jobs:
           echo "upstream_sha=$(git rev-parse upstream/main)" >> "$GITHUB_OUTPUT"
 
       - name: Run Clean edition regression gate
-        if: steps.merge.outputs.changed == 'true'
         run: node scripts/verify-clean-edition.cjs
 
       - name: Push validated merge to main
@@ -98,7 +99,7 @@ jobs:
           version="$(node -p "require('./package.json').version")"
           tag="v${version}"
           check_dir="$(mktemp -d)"
-          manifest_version=""
+          release_complete=false
           release_run_count="$(
             gh run list \
               --workflow release.yml \
@@ -108,16 +109,19 @@ jobs:
               --jq '[.[] | select(.status != "completed")] | length'
           )"
 
-          if gh release view "${tag}" > /dev/null 2>&1 && \
+          if gh release view "${tag}" --json tagName,isDraft,isPrerelease,assets > "${check_dir}/release.json" 2>/dev/null && \
              gh release download "${tag}" --pattern latest.json --dir "${check_dir}" --clobber > /dev/null 2>&1; then
-            manifest_version="$(jq -r '.version // empty' "${check_dir}/latest.json")"
+            if node scripts/release/check_clean_release.cjs "${version}" "${GH_REPO}" \
+                 "${check_dir}/release.json" "${check_dir}/latest.json"; then
+              release_complete=true
+            fi
           fi
 
-          if [ "${manifest_version}" = "${version}" ]; then
+          if [ "${release_complete}" = "true" ]; then
             echo "Clean release ${tag} already has a complete updater manifest." >> "$GITHUB_STEP_SUMMARY"
           elif [ "${release_run_count}" -gt 0 ]; then
             echo "Clean release ${tag} is already queued or building; no duplicate release was dispatched." >> "$GITHUB_STEP_SUMMARY"
           else
-            gh workflow run release.yml --ref main
-            echo "Dispatched Clean release ${tag}; existing updater manifest version was '${manifest_version:-missing}'." >> "$GITHUB_STEP_SUMMARY"
+            gh workflow run release.yml --ref main --repo "${GH_REPO}"
+            echo "Dispatched Clean release ${tag}; its signed updater assets were incomplete or missing." >> "$GITHUB_STEP_SUMMARY"
           fi

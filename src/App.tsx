@@ -22,6 +22,7 @@ import { GlobalModal } from './components/GlobalModal';
 import { WindowsOperationDialog } from './components/WindowsOperationDialog';
 import { CodexSwitchProgressModal } from './components/CodexSwitchProgressModal';
 import { CodexInstanceLaunchProgressModal } from './components/CodexInstanceLaunchProgressModal';
+import { CodexPelicanHost } from './components/codex/pelican/CodexPelicanHost';
 import { AnnouncementHost } from './components/AnnouncementCenter';
 import { TopCenterPromoBanner } from './components/TopCenterPromoBanner';
 import type { QuickSettingsType } from './components/QuickSettingsPopover';
@@ -824,6 +825,11 @@ function MainApp() {
     return () => {
       disposed = true;
     };
+  }, []);
+
+  // 冷启动：根据用户配置自动恢复 Codex 代理接管状态
+  useEffect(() => {
+    void useCodexAccountStore.getState().restoreActiveTakeoverIfNeeded();
   }, []);
 
   // 主窗口切到某平台页（如 Grok）时，同步悬浮窗/菜单栏当前平台，避免一直停在默认 antigravity
@@ -3716,6 +3722,7 @@ function MainApp() {
       <GlobalModal />
       <CodexSwitchProgressModal />
       <CodexInstanceLaunchProgressModal />
+      <CodexPelicanHost />
       <WindowsOperationDialog />
 
       {/* 关闭确认对话框 */}

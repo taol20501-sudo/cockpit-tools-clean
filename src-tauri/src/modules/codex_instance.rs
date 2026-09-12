@@ -6,13 +6,17 @@ use chrono::Utc;
 use uuid::Uuid;
 
 use crate::models::codex::CodexAppSpeed;
-use crate::models::{DefaultInstanceSettings, InstanceLaunchMode, InstanceProfile, InstanceStore};
+use crate::models::{
+    CodexInstanceModelRouting, DefaultInstanceSettings, InstanceLaunchMode, InstanceProfile,
+    InstanceStore,
+};
 use crate::modules;
 use crate::modules::instance::InstanceDefaults;
 use crate::modules::instance_store;
 
 static CODEX_INSTANCE_STORE_LOCK: std::sync::LazyLock<Mutex<()>> =
     std::sync::LazyLock::new(|| Mutex::new(()));
+static CODEX_INSTANCE_SAVE_NOTIFY_LOCK: Mutex<()> = Mutex::new(());
 
 const CODEX_INSTANCES_FILE: &str = "codex_instances.json";
 pub const CODEX_API_SERVICE_BIND_ACCOUNT_ID: &str = "__api_service__";
@@ -63,6 +67,7 @@ pub struct CreateInstanceParams {
     pub working_dir: Option<String>,
     pub extra_args: String,
     pub bind_account_id: Option<String>,
+    pub model_routing: Option<CodexInstanceModelRouting>,
     pub copy_source_instance_id: Option<String>,
     pub init_mode: Option<String>,
     pub launch_mode: Option<InstanceLaunchMode>,
@@ -76,6 +81,7 @@ pub struct UpdateInstanceParams {
     pub working_dir: Option<String>,
     pub extra_args: Option<String>,
     pub bind_account_id: Option<Option<String>>,
+    pub model_routing: Option<Option<CodexInstanceModelRouting>>,
     pub launch_mode: Option<InstanceLaunchMode>,
     pub app_speed: Option<CodexAppSpeed>,
 }
@@ -89,12 +95,21 @@ pub fn load_instance_store() -> Result<InstanceStore, String> {
     let path = instances_path()?;
     let mut store = instance_store::load_instance_store(&path, CODEX_INSTANCES_FILE)?;
     if normalize_managed_instance_dirs(&mut store)? {
-        save_instance_store(&store)?;
+        save_instance_store_raw(&store)?;
     }
     Ok(store)
 }
 
 pub fn save_instance_store(store: &InstanceStore) -> Result<(), String> {
+    let _guard = CODEX_INSTANCE_SAVE_NOTIFY_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    save_instance_store_raw(store)?;
+    crate::commands::codex_instance_gateway_watchdog::instance_store_saved(store);
+    Ok(())
+}
+
+fn save_instance_store_raw(store: &InstanceStore) -> Result<(), String> {
     let path = instances_path()?;
     instance_store::save_instance_store(&path, CODEX_INSTANCES_FILE, store)
 }
@@ -106,6 +121,7 @@ pub fn load_default_settings() -> Result<DefaultInstanceSettings, String> {
 
 pub fn update_default_settings(
     bind_account_id: Option<Option<String>>,
+    model_routing: Option<Option<CodexInstanceModelRouting>>,
     extra_args: Option<String>,
     follow_local_account: Option<bool>,
     launch_mode: Option<InstanceLaunchMode>,
@@ -125,6 +141,10 @@ pub fn update_default_settings(
     if let Some(bind) = bind_account_id {
         settings.bind_account_id = bind;
         settings.follow_local_account = false;
+    }
+
+    if let Some(routing) = model_routing {
+        settings.model_routing = routing;
     }
 
     if follow_local_account == Some(false) && settings.bind_account_id.is_none() {
@@ -948,6 +968,11 @@ pub fn create_instance(params: CreateInstanceParams) -> Result<InstanceProfile, 
         } else {
             params.bind_account_id
         },
+        model_routing: if create_empty {
+            None
+        } else {
+            params.model_routing
+        },
         launch_mode: params.launch_mode.unwrap_or_default(),
         app_speed: params.app_speed.unwrap_or_default(),
         created_at: Utc::now().timestamp_millis(),
@@ -999,6 +1024,9 @@ pub fn update_instance(params: UpdateInstanceParams) -> Result<InstanceProfile, 
     }
     if let Some(bind) = params.bind_account_id.clone() {
         instance.bind_account_id = bind;
+    }
+    if let Some(routing) = params.model_routing.clone() {
+        instance.model_routing = routing;
     }
     if let Some(mode) = params.launch_mode {
         instance.launch_mode = mode;
@@ -1189,7 +1217,12 @@ pub fn replace_bind_account_references(
 }
 
 pub async fn inject_account_to_profile(profile_dir: &Path, account_id: &str) -> Result<(), String> {
-    inject_account_to_profile_with_login_guard_fallback(profile_dir, account_id, false).await
+    modules::codex_account::prepare_account_for_injection_from_auth_dir(
+        account_id,
+        Some(profile_dir),
+    )
+    .await
+    .map(|_| ())
 }
 
 /// 用户主动启动实例时使用：每次都重新验证当前凭据，不复用上一次刷新失败结论。
@@ -1214,20 +1247,6 @@ pub async fn project_preflighted_account_to_profile_for_launch(
     modules::codex_account::project_preflighted_account_for_instance_launch(account_id, profile_dir)
         .await
         .map(|_| ())
-}
-
-pub async fn inject_account_to_profile_with_login_guard_fallback(
-    profile_dir: &Path,
-    account_id: &str,
-    allow_login_guard_fallback: bool,
-) -> Result<(), String> {
-    modules::codex_account::prepare_account_for_injection_from_auth_dir_with_login_guard_fallback(
-        account_id,
-        Some(profile_dir),
-        allow_login_guard_fallback,
-    )
-    .await
-    .map(|_| ())
 }
 
 #[cfg(all(test, windows))]

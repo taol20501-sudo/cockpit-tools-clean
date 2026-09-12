@@ -22,3 +22,6 @@ jobs:
 
       - name: Prevent advertisement and updater regressions
         run: node scripts/verify-clean-edition.cjs
+
+      - name: Test Clean merge and release regression protections
+        run: node --test scripts/merge-clean-tauri-config.test.cjs scripts/release/check_clean_release.test.cjs
