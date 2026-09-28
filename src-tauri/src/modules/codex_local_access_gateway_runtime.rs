@@ -28,7 +28,7 @@ async fn ensure_gateway_matches_runtime_once_locked() -> Result<(), String> {
         return Ok(());
     };
 
-    if !collection.enabled {
+    if !local_access_gateway_should_run(&collection) {
         stop_gateway_locked().await;
         return Ok(());
     }
@@ -922,12 +922,17 @@ fn build_account_pool_health_snapshot(
 
 #[derive(Debug, Clone, Copy, Default)]
 struct RequestStatsMeta<'a> {
+    proxy_route: Option<&'a CodexLocalAccessProxyRoute>,
     request_id: Option<&'a str>,
     client_instance_id: Option<&'a str>,
     http_status: Option<u16>,
     error_message: Option<&'a str>,
     service_tier: Option<&'a str>,
     reasoning_effort: Option<&'a str>,
+    /// 客户端请求模型（含路由命名空间）；未提供时按上游模型展示。
+    requested_model: Option<&'a str>,
+    /// 实际发送给上游的模型。
+    upstream_model: Option<&'a str>,
 }
 
 async fn record_request_stats_with_meta(
@@ -1021,7 +1026,7 @@ async fn record_request_stats_with_meta(
                 })
             });
         runtime.collection_dirty |= token_usage_changed;
-        let event = append_usage_event(
+        let event = append_usage_event_with_meta(
             &mut runtime.stats.events,
             now,
             meta.request_id,
@@ -1035,6 +1040,8 @@ async fn record_request_stats_with_meta(
             request_kind,
             meta.service_tier,
             meta.reasoning_effort,
+            meta.requested_model,
+            meta.upstream_model,
             success,
             meta.http_status,
             error_category,
@@ -1044,6 +1051,7 @@ async fn record_request_stats_with_meta(
             pricing.as_ref(),
             model_pricing_version,
             estimated_cost_usd,
+            meta.proxy_route,
         );
 
         apply_usage_event_to_current_windows(&mut runtime.stats, &event, now);
@@ -1134,6 +1142,15 @@ fn build_state_snapshot_inner(
         .collect();
     let account_health = build_account_health_snapshot(runtime);
     let account_pool_health = build_account_pool_health_snapshot(runtime);
+    let recovery_suppressed_account_ids = {
+        let now = now_ms();
+        runtime
+            .recovery_suppressed_accounts
+            .iter()
+            .filter(|(_, suppressed_until_ms)| **suppressed_until_ms > now)
+            .map(|(account_id, _)| account_id.clone())
+            .collect::<Vec<_>>()
+    };
     let quota_reserve_status = collection.as_ref().and_then(build_quota_reserve_status);
     let service_enabled = collection
         .as_ref()
@@ -1160,6 +1177,7 @@ fn build_state_snapshot_inner(
         stats,
         account_health,
         account_pool_health,
+        recovery_suppressed_account_ids,
         quota_reserve_status,
     }
 }
@@ -1247,7 +1265,7 @@ pub async fn activate_local_access_for_dir(
         .collection
         .clone()
         .ok_or_else(|| "API 服务集合尚未创建".to_string())?;
-    write_local_access_profile_takeover(profile_dir, &collection, None).await?;
+    write_local_access_profile_takeover(profile_dir, &collection, None, true).await?;
     Ok(state)
 }
 
@@ -1269,7 +1287,10 @@ pub async fn prepare_local_access_for_bound_profile_dir(
     }
 
     ensure_gateway_matches_runtime().await?;
-    ensure_profile_takeover(profile_dir, &collection).await?;
+    // This path is an explicit launch of an API Service-bound instance, not
+    // background reconciliation. It may reacquire the selected profile.
+    save_profile_takeover_backup(profile_dir, &collection.api_key)?;
+    write_local_access_profile_takeover(profile_dir, &collection, None, true).await?;
     Ok(true)
 }
 
@@ -1284,12 +1305,14 @@ fn new_empty_local_access_collection() -> Result<CodexLocalAccessCollection, Str
         image_generation_mode: CodexLocalAccessImageGenerationMode::default(),
         image_generation_model: DEFAULT_CODEX_IMAGE_GENERATION_MODEL.to_string(),
         image_generation_account_policies: HashMap::new(),
+        image_generation_account_ids: Vec::new(),
         gateway_mode: CodexLocalAccessGatewayMode::default(),
         upstream_proxy_url: None,
         routing_strategy: CodexLocalAccessRoutingStrategy::default(),
         custom_routing_rules: Vec::new(),
         account_model_rules: Vec::new(),
         model_aliases: Vec::new(),
+        suppress_oauth_model_alias: false,
         model_pricing_version: DEFAULT_MODEL_PRICING_VERSION,
         model_pricings: Vec::new(),
         excluded_models: Vec::new(),
@@ -1307,6 +1330,8 @@ fn new_empty_local_access_collection() -> Result<CodexLocalAccessCollection, Str
         debug_logs: true,
         immediate_sse_response: false,
         max_concurrent_image_requests: 1,
+        max_account_concurrency: 0,
+        account_concurrency_wait_ms: DEFAULT_ACCOUNT_CONCURRENCY_WAIT_MS,
         bound_oauth_account_id: None,
         bound_oauth_quota_reserve: None,
         account_ids: Vec::new(),

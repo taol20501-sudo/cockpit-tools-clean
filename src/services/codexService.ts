@@ -1,4 +1,5 @@
 import { invoke } from '@tauri-apps/api/core';
+import { presentProxyEnginePrerequisite, withProxyEnginePrerequisite } from '../utils/codexProxyEnginePrerequisite';
 import {
   CodexAccount,
   CodexAccountNoteUpdate,
@@ -14,10 +15,13 @@ import {
   CodexResetCreditsSnapshot,
 } from '../types/codex';
 import { normalizeCodexSwitchError } from '../utils/codexSwitchAuthFailure';
+import type { CodexOAuthProxyUse } from '../utils/codexOAuthReauthProxy';
 
 export interface CodexOAuthLoginStartResponse {
   loginId: string;
   authUrl: string;
+  /** 本次登录实际使用的出口；缺席表示走默认出口。 */
+  proxy?: CodexOAuthProxyUse;
 }
 
 export interface CodexDeviceAuthStartResponse {
@@ -206,6 +210,7 @@ export async function switchCodexAccount(
     }
     return account;
   } catch (error) {
+    presentProxyEnginePrerequisite(error);
     if (String(error).includes('CODEX_START_CANCELLED')) {
       const cancelledPayload = {
         type: 'cancelled' as const,
@@ -316,8 +321,16 @@ export async function importCodexAccessTokenAccount(
   });
 }
 
-export async function importCodexFromLocal(): Promise<CodexAccount> {
-  return await invoke('import_codex_from_local');
+/**
+ * 从官方 Codex 本机凭据存储导入账号。
+ *
+ * `instanceId` 省略或为 `null` 时读取默认实例；传入多开实例 ID 时读取该实例的
+ * profile 目录（官方客户端按 `CODEX_HOME` 分别落盘凭据）。
+ */
+export async function importCodexFromLocal(
+  instanceId?: string | null,
+): Promise<CodexAccount> {
+  return await invoke('import_codex_from_local', { instanceId: instanceId ?? null });
 }
 
 /** 从 JSON 字符串导入账号 */
@@ -460,8 +473,15 @@ export async function refreshCodexQuotasBatch(
 }
 
 /** 新 OAuth 流程：开始登录 */
-export async function startCodexOAuthLogin(): Promise<CodexOAuthLoginStartResponse> {
-  return await invoke('codex_oauth_login_start');
+/** `reauthAccountId` 仅在未显式提供 `proxyUrl` 时用于解析该账号的生效出口。 */
+export async function startCodexOAuthLogin(
+  proxyUrl?: string,
+  reauthAccountId?: string,
+): Promise<CodexOAuthLoginStartResponse> {
+  return await invoke('codex_oauth_login_start', {
+    proxyUrl: proxyUrl ?? null,
+    reauthAccountId: reauthAccountId ?? null,
+  });
 }
 
 /** 官方 Codex device-auth 流程：返回设备码并在后端轮询授权结果 */
@@ -554,6 +574,26 @@ export async function updateCodexAccountName(
   name: string,
 ): Promise<CodexAccount> {
   return await invoke('update_codex_account_name', { accountId, name });
+}
+
+/**
+ * 通过 Grok 平台账号添加 Codex 供应商账号。
+ *
+ * 账号本身不保存上游 API Key：运行态使用绑定的 Grok 账号 OAuth 令牌，
+ * 并由 Grok 账号的模型目录决定客户端可见模型。
+ */
+export async function addCodexAccountFromGrok(
+  grokAccountId: string,
+  options?: {
+    apiModelCatalog?: string[] | null;
+    accountName?: string | null;
+  },
+): Promise<CodexAccount> {
+  return await invoke('add_codex_account_from_grok', {
+    grokAccountId,
+    apiModelCatalog: options?.apiModelCatalog ?? null,
+    accountName: options?.accountName ?? null,
+  });
 }
 
 export async function updateCodexApiKeyCredentials(
@@ -649,16 +689,31 @@ export async function updateCodexAccountTags(
   return await invoke('update_codex_account_tags', { accountId, tags });
 }
 
+export async function updateCodexAccountEgressProxy(
+  accountId: string,
+  egressProxyUrl: string | null,
+  disabled = false,
+): Promise<CodexAccount> {
+  const request = invoke<CodexAccount>('update_codex_account_egress_proxy', {
+    accountId,
+    egressProxyUrl,
+    disabled,
+  });
+  return egressProxyUrl ? withProxyEnginePrerequisite(request) : request;
+}
+
 
 export async function updateCodexAccountInstanceAccess(
   accountId: string,
   accessMode?: string | null,
   startupModel?: string | null,
+  imageGenerationAccountIds?: string[] | null,
 ): Promise<CodexAccount> {
   return await invoke('update_codex_account_instance_access', {
     accountId,
     accessMode: accessMode ?? null,
     startupModel: startupModel ?? null,
+    imageGenerationAccountIds: imageGenerationAccountIds ?? null,
   });
 }
 

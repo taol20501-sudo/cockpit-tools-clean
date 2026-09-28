@@ -20,6 +20,7 @@ import (
 	"time"
 
 	codexlive "github.com/router-for-me/CLIProxyAPI/v7/internal/client/codex/live"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor/helps"
 
 	sdkhandlers "github.com/router-for-me/CLIProxyAPI/v7/sdk/api/handlers"
 	sdkopenai "github.com/router-for-me/CLIProxyAPI/v7/sdk/api/handlers/openai"
@@ -88,6 +89,25 @@ func normalizeCockpitLocale(locale string) string {
 	return locale
 }
 
+// defaultUsageServiceTier 返回 Cockpit 通过 payload.default 注入的服务等级。
+// 客户端未显式发送 service_tier 时，该档位就是实际上游使用的档位，
+// 用于统计与日志里区分快速/标准模式。
+func defaultUsageServiceTier(cfg *config.Config) string {
+	if cfg == nil {
+		return ""
+	}
+	for _, rule := range cfg.Payload.Default {
+		tier, ok := rule.Params["service_tier"].(string)
+		if !ok {
+			continue
+		}
+		if normalized := normalizedUsageServiceTier(tier); normalized != "" {
+			return normalized
+		}
+	}
+	return ""
+}
+
 func main() {
 	ignoreBrokenPipeSignal()
 	configPath := flag.String("config", "", "CLIProxyAPI config file")
@@ -122,6 +142,7 @@ func main() {
 		os.Exit(2)
 	}
 	emitter.emitStartupStage("init_runtime")
+	helps.SetRequestProxyRouteObserver(newRequestProxyRouteObserver(m.ProxyRouteObservers))
 	m.quotaCooldowns = newQuotaCooldownStateStore(*quotaPoolStatePath, m)
 	if err := m.quotaCooldowns.load(); err != nil {
 		emitter.emit(map[string]any{"type": "quota_cooldown_state_error", "message": err.Error()})
@@ -138,6 +159,7 @@ func main() {
 	tokenLimiter := newAPIKeyTokenLimiter(m)
 	policy := &requestPolicy{
 		manifest:     m,
+		cfg:          cfg,
 		emitter:      emitter,
 		tracker:      usageTracker,
 		tokenLimiter: tokenLimiter,
@@ -163,7 +185,11 @@ func main() {
 	m.quotaCooldowns.start(ctx, emitter)
 	monitorParentProcess(ctx, *parentPID, cancel, emitter)
 
-	coreusage.RegisterPlugin(&usagePlugin{manifest: m, tracker: usageTracker})
+	coreusage.RegisterPlugin(&usagePlugin{
+		manifest:           m,
+		tracker:            usageTracker,
+		defaultServiceTier: defaultUsageServiceTier(cfg),
+	})
 
 	runtime, err := newSidecarRuntime(ctx, absConfigPath, cfg, m, coreManager)
 	if err != nil {
@@ -184,6 +210,7 @@ func main() {
 	liveHandler := codexlive.NewHandler(coreManager, cfg)
 	defer liveHandler.Close()
 	relay := &relayServer{
+		automaticSelector:  buildCoreAuthSelectorWithConcurrency(nil, selector, m, quotaState, usageTracker),
 		runtime:            runtime,
 		cfg:                cfg,
 		manifest:           m,

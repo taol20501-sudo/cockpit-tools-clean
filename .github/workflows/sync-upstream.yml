@@ -43,6 +43,7 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git config merge.keep-clean.driver true
+          git config merge.clean-text.driver "node scripts/merge-clean-text.cjs %O %A %B %L %P"
           git config merge.clean-tauri-config.name "merge upstream Tauri config while preserving Clean identity and updater"
           git config merge.clean-tauri-config.driver "node scripts/merge-clean-tauri-config.cjs %O %A %B %L %P"
 
@@ -86,7 +87,9 @@ jobs:
           echo "upstream_sha=$(git rev-parse upstream/main)" >> "$GITHUB_OUTPUT"
 
       - name: Run Clean edition regression gate
-        run: node scripts/verify-clean-edition.cjs
+        run: |
+          node scripts/verify-clean-edition.cjs
+          node --test scripts/merge-clean-tauri-config.test.cjs scripts/merge-clean-text.test.cjs scripts/release/check_clean_release.test.cjs
 
       - name: Push validated merge to main
         if: steps.merge.outputs.changed == 'true'

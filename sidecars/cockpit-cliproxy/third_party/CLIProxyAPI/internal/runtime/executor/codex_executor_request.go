@@ -288,6 +288,26 @@ func applyCodexHeaders(r *http.Request, auth *cliproxyauth.Auth, token string, s
 	applyCodexHeadersFromSources(r, auth, token, stream, cfg, ginHeaders)
 }
 
+// applyCodexRoutingHint mirrors the native Codex client hint used by the
+// ChatGPT backend. It is derived after request translation so the tier cannot
+// become stale. API-key passthrough requests intentionally do not receive it.
+func applyCodexRoutingHint(headers http.Header, auth *cliproxyauth.Auth, model string, upstreamBody []byte) {
+	if headers == nil || codexAuthUsesAPIKey(auth) {
+		return
+	}
+	model = strings.TrimSpace(model)
+	if model == "" {
+		return
+	}
+	hint := "model=" + model
+	if tier := gjson.GetBytes(upstreamBody, "service_tier"); tier.Type == gjson.String {
+		if value := strings.TrimSpace(tier.String()); value != "" {
+			hint += ";tier=" + value
+		}
+	}
+	headers.Set("X-Codex-Routing-Hint", hint)
+}
+
 // applyModelHeaderOverrides forces models.json config.override_header onto upstream headers.
 func applyModelHeaderOverrides(headers http.Header, modelName string) {
 	if headers == nil {
@@ -396,6 +416,7 @@ func applyCodexCloakingHeaders(headers http.Header, cfg *config.Config, isAPIKey
 }
 
 func normalizeCodexInstructions(body []byte, model ...string) []byte {
+	body = normalizeCodexCallIDs(body)
 	instructions := gjson.GetBytes(body, "instructions")
 	if !instructions.Exists() || instructions.Type == gjson.Null || strings.TrimSpace(instructions.String()) == "" {
 		value := ""
@@ -405,6 +426,128 @@ func normalizeCodexInstructions(body []byte, model ...string) []byte {
 		body, _ = sjson.SetBytes(body, "instructions", value)
 	}
 	return body
+}
+
+func codexCallItemRequiresID(itemType string) bool {
+	switch itemType {
+	case "function_call", "custom_tool_call", "tool_call", "mcp_tool_call":
+		return true
+	default:
+		return false
+	}
+}
+
+func codexCallOutputRequiresID(itemType string) bool {
+	switch itemType {
+	case "function_call_output", "custom_tool_call_output", "tool_call_output", "mcp_tool_call_output":
+		return true
+	default:
+		return false
+	}
+}
+
+func nextGeneratedCodexCallID(prefix string, index int, used map[string]struct{}) string {
+	base := fmt.Sprintf("%s_%d", prefix, index)
+	if _, exists := used[base]; !exists {
+		used[base] = struct{}{}
+		return base
+	}
+	for suffix := 1; ; suffix++ {
+		candidate := fmt.Sprintf("%s_%d", base, suffix)
+		if _, exists := used[candidate]; !exists {
+			used[candidate] = struct{}{}
+			return candidate
+		}
+	}
+}
+
+// NormalizeCodexCallIDs repairs historical tool replay items whose provider-specific
+// conversion omitted call_id. Strict Responses upstreams reject the whole request with
+// "missing field `call_id`" otherwise.
+func NormalizeCodexCallIDs(body []byte) []byte {
+	return normalizeCodexCallIDs(body)
+}
+
+func normalizeCodexCallIDs(body []byte) []byte {
+	input := gjson.GetBytes(body, "input")
+	if !input.IsArray() {
+		return body
+	}
+	used := make(map[string]struct{})
+	for _, item := range input.Array() {
+		if callID := strings.TrimSpace(item.Get("call_id").String()); callID != "" {
+			used[callID] = struct{}{}
+		}
+	}
+	type pendingCall struct {
+		id   string
+		name string
+	}
+	pending := make([]pendingCall, 0)
+	dropInputIndices := make([]int, 0)
+	index := -1
+	input.ForEach(func(_, item gjson.Result) bool {
+		index++
+		itemType := strings.ToLower(strings.TrimSpace(item.Get("type").String()))
+		isCall := codexCallItemRequiresID(itemType)
+		isOutput := codexCallOutputRequiresID(itemType)
+		if !isCall && !isOutput {
+			return true
+		}
+		name := strings.TrimSpace(item.Get("name").String())
+		callID := strings.TrimSpace(item.Get("call_id").String())
+		if callID == "" {
+			if isCall {
+				callID = nextGeneratedCodexCallID("call_missing", index, used)
+			} else {
+				matched := -1
+				if name != "" {
+					for i, pendingCall := range pending {
+						if pendingCall.name == name {
+							matched = i
+							break
+						}
+					}
+				}
+				if matched < 0 && len(pending) > 0 {
+					matched = 0
+				}
+				if matched >= 0 {
+					callID = pending[matched].id
+					pending = append(pending[:matched], pending[matched+1:]...)
+				} else if codexCallOutputCanStandAlone(itemType, item) {
+					return true
+				} else {
+					dropInputIndices = append(dropInputIndices, index)
+					return true
+				}
+			}
+			body, _ = sjson.SetBytes(body, fmt.Sprintf("input.%d.call_id", index), callID)
+		}
+		if isCall {
+			pending = append(pending, pendingCall{id: callID, name: name})
+			return true
+		}
+		for i, pendingCall := range pending {
+			if pendingCall.id == callID {
+				pending = append(pending[:i], pending[i+1:]...)
+				break
+			}
+		}
+		return true
+	})
+	for index := len(dropInputIndices) - 1; index >= 0; index-- {
+		body, _ = sjson.DeleteBytes(body, fmt.Sprintf("input.%d", dropInputIndices[index]))
+	}
+	return body
+}
+
+func codexCallOutputCanStandAlone(itemType string, item gjson.Result) bool {
+	if itemType != "function_call_output" {
+		return false
+	}
+	name := item.Get("name")
+	return name.Type == gjson.String && strings.TrimSpace(name.String()) != ""
 }
 
 var imageGenToolJSON = []byte(`{"type":"image_generation","output_format":"png"}`)

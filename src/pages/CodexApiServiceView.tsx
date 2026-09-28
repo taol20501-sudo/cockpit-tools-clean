@@ -13,7 +13,10 @@ import { CodexLocalAccessModal } from "../components/CodexLocalAccessModal";
 import { CodexAccountPoolHealthModal } from "../components/CodexAccountPoolHealthModal";
 import { CodexStatsRangePicker } from "../components/CodexStatsRangePicker";
 import { CodexUsageTrend } from "../components/codex/CodexUsageTrend";
+import { CodexRequestProxyLabel } from "../components/codex/CodexRequestProxyLabel";
 import { PaginationControls } from "../components/PaginationControls";
+import { resolveCodexApiServiceLogModelPair } from "../utils/codexApiServiceLogModel";
+import { requestCodexOpenAddAccount } from "../utils/codexAddAccountRequest";
 import type {
   CodexLocalAccessCustomRoutingRule,
   CodexLocalAccessScope,
@@ -28,11 +31,15 @@ import type {
 
 export type CodexApiServiceViewProps = ReturnType<typeof useCodexApiServicePageController>;
 
+/** 宿主内部调度（唤醒、鹈鹕测试）固定使用的 API 服务 Key ID，只在请求日志中展示本地化名称。 */
+const INTERNAL_API_KEY_ID = "__cockpit_internal__";
+
 /** 渲染 CodexApiServicePage 的界面；业务状态与动作统一由 Controller 提供。 */
 export function CodexApiServiceView(props: CodexApiServiceViewProps) {
   const {
     accessScope,
     accessScopeOptions,
+    accountConcurrencyWaitDraft,
     accountDisplayNames,
     accountModelMappingDrafts,
     accountModelMappingError,
@@ -116,6 +123,7 @@ export function CodexApiServiceView(props: CodexApiServiceViewProps) {
     handleSaveApiKeyLabel,
     handleSaveApiKeyPolicy,
     handleSaveMembersFromModal,
+    handleAddGrokMemberToApiService,
     handleSaveModelPricings,
     handleSaveModelRules,
     handleSavePort,
@@ -141,6 +149,7 @@ export function CodexApiServiceView(props: CodexApiServiceViewProps) {
     mappingDraftsFromAccount,
     mappingMemberAccounts,
     maskAccountText,
+    maxAccountConcurrencyDraft,
     maxConcurrentImageRequestsDraft,
     maxRetryCredentialsDraft,
     maxRetryIntervalDraft,
@@ -194,6 +203,7 @@ export function CodexApiServiceView(props: CodexApiServiceViewProps) {
     resolveClientInstanceLabel,
     responsesWebsocketsEnabledDraft,
     routingOptions,
+    routingSaving,
     routingStrategy,
     selectedModelId,
     selectedStatsRangeTitle,
@@ -210,12 +220,14 @@ export function CodexApiServiceView(props: CodexApiServiceViewProps) {
     setAddressKind,
     setApiKeyDrafts,
     setApiKeyPolicyDrafts,
+    setAccountConcurrencyWaitDraft,
     setDisableCoolingDraft,
     setError,
     setExcludedModelsText,
     setHealthModalOpen,
     setImmediateSseResponseDraft,
     setKeyVisible,
+    setMaxAccountConcurrencyDraft,
     setMaxConcurrentImageRequestsDraft,
     setMaxRetryCredentialsDraft,
     setMaxRetryIntervalDraft,
@@ -281,11 +293,10 @@ export function CodexApiServiceView(props: CodexApiServiceViewProps) {
       <div className="page-top-strip">
         <div className="page-top-strip-left">
           <span className="page-top-strip-label">
-            {t("settings.general.account", "Accounts")}
+            {t("settings.general.accountManagement", "Account")}
           </span>
           <ManualHelpIconButton className="platform-header-help" />
         </div>
-        <div className="page-top-strip-right-placeholder" aria-hidden="true" />
       </div>
 
       <div className="page-tabs-row page-tabs-center page-tabs-row-with-leading">
@@ -1747,7 +1758,7 @@ export function CodexApiServiceView(props: CodexApiServiceViewProps) {
                   type="button"
                   className="btn btn-secondary btn-sm"
                   onClick={() => void handleSaveRoutingOptions()}
-                  disabled={busy || !collection}
+                  disabled={busy || routingSaving || !collection}
                 >
                   <Check size={14} />
                   {t("codex.apiService.routing.saveOptions", "保存选项")}
@@ -1777,7 +1788,7 @@ export function CodexApiServiceView(props: CodexApiServiceViewProps) {
                     onChange={(event) =>
                       setSessionAffinityDraft(event.target.checked)
                     }
-                    disabled={busy || !collection}
+                    disabled={routingSaving || !collection}
                   />
                 </label>
                 <label>
@@ -1795,7 +1806,7 @@ export function CodexApiServiceView(props: CodexApiServiceViewProps) {
                     onChange={(event) =>
                       setSessionAffinityTtlDraft(event.target.value)
                     }
-                    disabled={busy || !collection}
+                    disabled={routingSaving || !collection}
                   />
                 </label>
                 <label>
@@ -1890,6 +1901,42 @@ export function CodexApiServiceView(props: CodexApiServiceViewProps) {
                     value={maxConcurrentImageRequestsDraft}
                     onChange={(event) =>
                       setMaxConcurrentImageRequestsDraft(event.target.value)
+                    }
+                    disabled={busy || !collection}
+                  />
+                </label>
+                <label>
+                  <span>
+                    {t(
+                      "codex.apiService.routing.maxAccountConcurrency",
+                      "Account concurrency",
+                    )}
+                  </span>
+                  <input
+                    type="number"
+                    min={0}
+                    max={64}
+                    value={maxAccountConcurrencyDraft}
+                    onChange={(event) =>
+                      setMaxAccountConcurrencyDraft(event.target.value)
+                    }
+                    disabled={busy || !collection}
+                  />
+                </label>
+                <label>
+                  <span>
+                    {t(
+                      "codex.apiService.routing.accountConcurrencyWait",
+                      "Concurrency wait (s)",
+                    )}
+                  </span>
+                  <input
+                    type="number"
+                    min={0}
+                    max={1800}
+                    value={accountConcurrencyWaitDraft}
+                    onChange={(event) =>
+                      setAccountConcurrencyWaitDraft(event.target.value)
                     }
                     disabled={busy || !collection}
                   />
@@ -2374,13 +2421,46 @@ export function CodexApiServiceView(props: CodexApiServiceViewProps) {
                       event.email ||
                       event.accountId ||
                       "-";
+                    const serviceTier = (event.serviceTier || "")
+                      .trim()
+                      .toLowerCase();
+                    const serviceTierIsFast = serviceTier === "priority";
+                    const serviceTierLabel =
+                      serviceTier === "priority"
+                        ? t("codex.speed.fast", "快速")
+                        : serviceTier === "standard"
+                          ? t("codex.speed.standard", "标准")
+                          : event.serviceTier
+                            ? t("codex.apiService.logs.serviceTierValue", {
+                                tier: event.serviceTier,
+                                defaultValue: "Tier {{tier}}",
+                              })
+                            : "";
+                    // 始终标出实际上游模型（与请求模型一致时也展示）；仅当日志未记录上游模型时回退为单行。
+                    const { requestedModel, upstreamModel } =
+                      resolveCodexApiServiceLogModelPair(event);
                     return (
                       <div
                         key={`${event.timestamp}-${event.requestId || event.apiKeyId}-${index}`}
                         className="codex-api-service-log-row"
                       >
                         <div>
-                          <strong>{event.modelId || "--"}</strong>
+                          <div className="codex-api-service-log-model">
+                            <strong title={requestedModel}>
+                              {requestedModel}
+                            </strong>
+                            {upstreamModel ? (
+                              <span
+                                className="codex-api-service-log-model-upstream"
+                                title={t(
+                                  "codex.apiService.logs.upstreamModel",
+                                  "实际模型",
+                                )}
+                              >
+                                ↳ {upstreamModel}
+                              </span>
+                            ) : null}
+                          </div>
                           <span
                             className={`codex-api-service-pill ${event.success ? "success" : "error"}`}
                           >
@@ -2402,18 +2482,15 @@ export function CodexApiServiceView(props: CodexApiServiceViewProps) {
                               })}
                             </span>
                           ) : null}
-                          {event.serviceTier ? (
+                          {serviceTierLabel ? (
                             <span
-                              className="codex-api-service-pill muted"
+                              className={`codex-api-service-pill ${serviceTierIsFast ? "fast" : "muted"}`}
                               title={t(
                                 "codex.apiService.logs.serviceTier",
                                 "服务等级",
                               )}
                             >
-                              {t("codex.apiService.logs.serviceTierValue", {
-                                tier: event.serviceTier,
-                                defaultValue: "Tier {{tier}}",
-                              })}
+                              {serviceTierLabel}
                             </span>
                           ) : null}
                         </div>
@@ -2421,7 +2498,12 @@ export function CodexApiServiceView(props: CodexApiServiceViewProps) {
                           <span>{formatDateTime(event.timestamp)}</span>
                           <span>{requestKindLabel(event.requestKind, t)}</span>
                           <span>
-                            {event.apiKeyLabel || event.apiKeyId || "-"}
+                            {event.apiKeyId === INTERNAL_API_KEY_ID
+                              ? t(
+                                  "codex.localAccess.internalSchedulerLabel",
+                                  "Internal scheduler",
+                                )
+                              : event.apiKeyLabel || event.apiKeyId || "-"}
                           </span>
                           <span
                             title={
@@ -2443,6 +2525,7 @@ export function CodexApiServiceView(props: CodexApiServiceViewProps) {
                           <span>
                             {maskAccountText(accountDisplayName)}
                           </span>
+                          <CodexRequestProxyLabel route={event.proxyRoute} t={t} />
                           <span>{formatLatencyMs(event.latencyMs)}</span>
                           <span>
                             {formatCompactNumber(event.totalTokens)} Tokens
@@ -3972,11 +4055,21 @@ export function CodexApiServiceView(props: CodexApiServiceViewProps) {
         accounts={accounts}
         accountHealth={state?.accountHealth ?? []}
         accountPoolHealth={state?.accountPoolHealth ?? []}
+        recoverySuppressedAccountIds={
+          state?.recoverySuppressedAccountIds ?? []
+        }
         actionBusy={busy}
         maskAccountText={maskAccountText}
         onClose={() => setHealthModalOpen(false)}
         onRecover={(accountId) => handleRecoverAccounts([accountId])}
         onRecoverAll={handleRecoverAccounts}
+        onReauthorize={(accountId) => {
+          setHealthModalOpen(false);
+          requestCodexOpenAddAccount({
+            targetAccountId: accountId,
+            tab: "tempLogin",
+          });
+        }}
       />
 
       <CodexLocalAccessModal
@@ -4005,6 +4098,7 @@ export function CodexApiServiceView(props: CodexApiServiceViewProps) {
         accountsLoaded={accountsLoaded}
         accountGroups={groups}
         memberView={memberView}
+        onAddGrokMember={handleAddGrokMemberToApiService}
         initialSelectedIds={memberIds}
         maskAccountText={maskAccountText}
         onClose={() => setMemberModalOpen(false)}
@@ -4034,6 +4128,8 @@ export function CodexApiServiceView(props: CodexApiServiceViewProps) {
               disableCooling: collection.disableCooling,
               immediateSseResponse: collection.immediateSseResponse,
               maxConcurrentImageRequests: collection.maxConcurrentImageRequests,
+              maxAccountConcurrency: collection.maxAccountConcurrency,
+              accountConcurrencyWaitMs: collection.accountConcurrencyWaitMs,
             });
             setState(next);
           }
@@ -4070,6 +4166,11 @@ export function CodexApiServiceView(props: CodexApiServiceViewProps) {
         onUpdateImageGenerationModel={(model) =>
           codexLocalAccessService
             .updateCodexLocalAccessImageGenerationModel(model)
+            .then(setState)
+        }
+        onUpdateImageGenerationAccounts={(accountIds) =>
+          codexLocalAccessService
+            .updateCodexLocalAccessImageGenerationAccounts(accountIds)
             .then(setState)
         }
         onUpdateUpstreamProxyConfig={(url) =>

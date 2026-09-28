@@ -14,7 +14,7 @@ func TestReserveFallbackUsesLunaCapabilitiesForEachClientVersion(t *testing.T) {
 				t.Fatalf("models = %d, want 2", len(models))
 			}
 			luna, reserve := models[0], models[1]
-			if reserve["slug"] != "gpt-reserve" || reserve["visibility"] != "list" || reserve["display_name"] != "Luna Reserve" {
+			if reserve["slug"] != "gpt-reserve" || reserve["visibility"] != "list" || reserve["display_name"] != "GPT-5.6 Reserve" {
 				t.Fatalf("Reserve identity/visibility = %v/%v", reserve["slug"], reserve["visibility"])
 			}
 			for field, value := range luna {
@@ -22,8 +22,10 @@ func TestReserveFallbackUsesLunaCapabilitiesForEachClientVersion(t *testing.T) {
 					t.Errorf("Reserve field %s differs from Luna", field)
 				}
 			}
-			if reserve["auto_compact_token_limit"] != nil {
-				t.Fatal("Reserve must keep the default compaction policy")
+			// Reserve 继承 Luna 模板的上下文，就必须同时继承它的 90% 压缩阈值，
+			// 目录里不允许出现「有窗口但没压缩阈值」的声明。
+			if got, want := intModelValue(reserve, "auto_compact_token_limit"), intModelValue(luna, "auto_compact_token_limit"); got != 272000*90/100 || got != want {
+				t.Fatalf("Reserve auto_compact_token_limit = %d, want Luna value %d", got, want)
 			}
 		})
 	}

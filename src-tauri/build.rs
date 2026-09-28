@@ -49,6 +49,9 @@ fn emit_sidecar_rerun_inputs(path: &Path) {
     };
 
     if metadata.is_dir() {
+        // 目录本身也纳入追踪：只追踪已有文件时，新增 .go 文件不会触发重建，
+        // dev 启动会继续使用旧的 sidecar 二进制。
+        println!("cargo:rerun-if-changed={}", path.display());
         let Ok(entries) = std::fs::read_dir(path) else {
             return;
         };
@@ -175,8 +178,10 @@ fn main() {
     }
     build_cockpit_cliproxy_sidecar();
 
+    // The cfg gate selects the build host. Only link Swift for a macOS target,
+    // otherwise macOS-to-Windows builds inherit Darwin-only linker arguments.
     #[cfg(target_os = "macos")]
-    {
+    if target.ends_with("-apple-darwin") {
         SwiftLinker::new("12.0")
             .with_package("MacosNativeMenuSwift", "native/macos-native-menu")
             .link();

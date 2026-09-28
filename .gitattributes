@@ -10,3 +10,13 @@ src-tauri/tauri.conf.json merge=clean-tauri-config
 # workflow refactors are reviewed and ported separately instead of replacing
 # the Clean signing/release pipeline during scheduled synchronization.
 .github/workflows/release.yml merge=keep-clean
+
+# This store is deliberately a no-op; upstream sponsorship features are disabled.
+src/stores/useSponsorStore.ts merge=keep-clean
+src/stores/useTopRightAdStore.ts merge=keep-clean
+
+# Ignore known promotional-only differences, but merge all ordinary content.
+README.md merge=clean-text
+README.en.md merge=clean-text
+README.pt-br.md merge=clean-text
+src/utils/apikeyFunLinks.ts merge=clean-text

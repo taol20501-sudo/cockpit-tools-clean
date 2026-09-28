@@ -1,20 +1,91 @@
 use serde_json::{json, Map, Value};
-use std::collections::HashSet;
+use sha2::{Digest, Sha256};
+use std::collections::{HashMap, HashSet};
 use std::sync::OnceLock;
 
 const REASONING_ENCRYPTED_CONTENT_INCLUDE: &str = "reasoning.encrypted_content";
 const CODEX_AUTO_REVIEW_MODEL_ID: &str = "codex-auto-review";
 const CODEX_RESERVE_MODEL_ID: &str = "gpt-reserve";
 const CODEX_RESERVE_TEMPLATE_MODEL_ID: &str = "gpt-5.6-luna";
+/// 额度兜底模型对客户端展示的名称（跟随官方 5.6 命名）。
+pub(crate) const CODEX_RESERVE_DISPLAY_NAME: &str = "GPT-5.6 Reserve";
 const CODEX_MODEL_CATALOG_TEMPLATE_SLUG: &str = "gpt-5.5";
+const CODEX_INPUT_ITEM_ID_LIMIT: usize = 64;
+/// Codex 客户端模型目录统一的压缩格式哈希（comp_hash）。
+///
+/// 各模型带不同 comp_hash 时，客户端在切换模型后会触发 PreTurn 自动压缩
+/// （`run_auto_compact{reason=CompHashChanged}`），与当前 token 用量无关；
+/// 统一为最新官方值即可避免混合模型目录内切换模型被强制重建上下文。
+pub(crate) const CODEX_CLIENT_COMP_HASH: &str = "3000";
 const CODEX_CLIENT_MODEL_TEMPLATES_JSON: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../sidecars/cockpit-cliproxy/third_party/CLIProxyAPI/internal/registry/models/codex_client_models.json"
 ));
 const DEFAULT_CONTEXT_WINDOW: i64 = 272_000;
-const DEFAULT_MAX_CONTEXT_WINDOW: i64 = 1_000_000;
+/// 未知 / 自定义 Codex 模型的兜底上限。
+///
+/// 兜底不再声明 1M 上限：1M 级上下文属于具体模型的真实能力值，只能来自模型目录或
+/// 用户显式覆盖；兜底一律与 `DEFAULT_CONTEXT_WINDOW` 保持一致，避免客户端按 1M
+/// 上报所有第三方模型。
+const DEFAULT_MAX_CONTEXT_WINDOW: i64 = DEFAULT_CONTEXT_WINDOW;
 const LOCAL_PROXY_BYPASS_HOSTS: [&str; 5] =
     ["127.0.0.1", "127.0.0.0/8", "localhost", "::1", "::1/128"];
+
+/// Codex 客户端「上下文 / 压缩」统一口径：压缩阈值固定取上下文窗口的 90%。
+pub(crate) const AUTO_COMPACT_RATIO_PERCENT: i64 = 90;
+
+/// 按统一口径派生自动压缩阈值：`context_window * 90 / 100`（整数除法，向下取整）。
+///
+/// 例：`516000 -> 464400`、`1000000 -> 900000`、`272000 -> 244800`、`128000 -> 115200`。
+/// 非正输入返回 0，调用方据此判断「无法派生」。
+pub(crate) fn derived_auto_compact_token_limit(context_window: i64) -> i64 {
+    if context_window <= 0 {
+        return 0;
+    }
+    context_window.saturating_mul(AUTO_COMPACT_RATIO_PERCENT) / 100
+}
+
+/// 为单个模型条目补齐压缩阈值：声明了 `context_window` 但缺少、非正或大于等于窗口的
+/// 压缩阈值时，按统一口径派生写入；合法的显式阈值保持原样。
+fn ensure_model_auto_compact_limit(object: &mut Map<String, Value>) -> bool {
+    let Some(context_window) = object
+        .get("context_window")
+        .and_then(Value::as_i64)
+        .filter(|value| *value > 0)
+    else {
+        return false;
+    };
+    let existing = object
+        .get("auto_compact_token_limit")
+        .and_then(Value::as_i64)
+        .filter(|value| *value > 0);
+    // 已声明的压缩阈值必须小于上下文窗口，否则视为无效并重新派生。
+    if existing.is_some_and(|value| value < context_window) {
+        return false;
+    }
+    object.insert(
+        "auto_compact_token_limit".to_string(),
+        json!(derived_auto_compact_token_limit(context_window)),
+    );
+    true
+}
+
+/// 为整个 Codex 客户端模型目录补齐压缩阈值（统一口径的收口点）。
+///
+/// 只要条目声明了 `context_window > 0`，就必定带 `auto_compact_token_limit`；
+/// 内置模板、`gpt-reserve`、模板回落条目与外部覆盖都不再留空。
+pub(crate) fn ensure_client_model_auto_compact_limits(catalog: &mut Value) -> bool {
+    let Some(models) = catalog.get_mut("models").and_then(Value::as_array_mut) else {
+        return false;
+    };
+    let mut changed = false;
+    for model in models {
+        if let Some(object) = model.as_object_mut() {
+            changed |= ensure_model_auto_compact_limit(object);
+        }
+    }
+    changed
+}
 
 pub fn merge_local_no_proxy(raw: &str) -> String {
     let mut seen = HashSet::new();
@@ -124,17 +195,20 @@ pub fn apply_model_context_overrides(
         let Some(object) = model.as_object_mut() else {
             continue;
         };
-        if let Some(context_window) = context_window.filter(|value| *value > 0) {
-            object.insert("context_window".to_string(), json!(context_window));
-            object.insert("max_context_window".to_string(), json!(context_window));
-        }
-        if let Some(auto_compact_token_limit) = auto_compact_token_limit.filter(|value| *value > 0)
-        {
-            object.insert(
-                "auto_compact_token_limit".to_string(),
-                json!(auto_compact_token_limit),
-            );
-        }
+        // 上下文窗口与压缩阈值必须成对出现：只给了压缩阈值属于半边配置，直接忽略，
+        // 保持「跟随官方」语义（客户端继续使用官方目录值）。
+        let Some(context_window) = context_window.filter(|value| *value > 0) else {
+            continue;
+        };
+        object.insert("context_window".to_string(), json!(context_window));
+        object.insert("max_context_window".to_string(), json!(context_window));
+        let auto_compact_token_limit = auto_compact_token_limit
+            .filter(|value| *value > 0 && *value < context_window)
+            .unwrap_or_else(|| derived_auto_compact_token_limit(context_window));
+        object.insert(
+            "auto_compact_token_limit".to_string(),
+            json!(auto_compact_token_limit),
+        );
     }
 }
 
@@ -232,12 +306,21 @@ pub(crate) fn managed_codex_model_ids() -> Vec<String> {
         .map(str::to_string)
         .collect::<Vec<_>>();
 
-    if let Some(index) = model_ids
+    // 官方推荐集把 GPT-6 家族排在最前，顺序固定为 Astra → Sol → Luna；
+    // 只移动已存在的条目，不插入目录里没有的模型。
+    for (offset, model_id) in ["gpt-6-astra", "gpt-6-sol", "gpt-6-luna"]
         .iter()
-        .position(|model| model.eq_ignore_ascii_case("gpt-6-astra"))
+        .enumerate()
     {
-        let astra = model_ids.remove(index);
-        model_ids.insert(0, astra);
+        if let Some(index) = model_ids
+            .iter()
+            .position(|model| model.eq_ignore_ascii_case(model_id))
+        {
+            if index > offset {
+                let model = model_ids.remove(index);
+                model_ids.insert(offset, model);
+            }
+        }
     }
 
     model_ids
@@ -445,7 +528,10 @@ fn build_codex_client_model(model_id: &str, index: usize) -> Value {
         .expect("Codex client model template should be a JSON object");
     object.insert("slug".to_string(), Value::String(model_id.to_string()));
     if model_id.trim().eq_ignore_ascii_case(CODEX_RESERVE_MODEL_ID) {
-        object.insert("display_name".to_string(), json!("Luna Reserve"));
+        object.insert(
+            "display_name".to_string(),
+            json!(CODEX_RESERVE_DISPLAY_NAME),
+        );
         object.insert("visibility".to_string(), json!("list"));
     }
     if !is_catalog_model {
@@ -460,6 +546,10 @@ fn build_codex_client_model(model_id: &str, index: usize) -> Value {
             "max_context_window".to_string(),
             json!(DEFAULT_MAX_CONTEXT_WINDOW),
         );
+        object.insert(
+            "auto_compact_token_limit".to_string(),
+            json!(derived_auto_compact_token_limit(DEFAULT_CONTEXT_WINDOW)),
+        );
         object.insert("priority".to_string(), json!(1000 + index));
         object.insert(
             "additional_speed_tiers".to_string(),
@@ -467,6 +557,19 @@ fn build_codex_client_model(model_id: &str, index: usize) -> Value {
         );
         object.insert("service_tiers".to_string(), Value::Array(Vec::new()));
         inherit_routed_gpt_capabilities(object, model_id);
+        // Grok 平台模型由第三方 executor 承接，官方模型目录没有对应条目。
+        // 缺少 multi_agent_version 时 Codex 客户端不会为这些模型注入子智能体
+        // 协作工具（spawn/send/wait 等），会话里就表现为「找不到协作工具」。
+        if is_grok_codex_model(model_id) {
+            object.insert(
+                "multi_agent_version".to_string(),
+                json!(GROK_MULTI_AGENT_VERSION),
+            );
+            object.insert(
+                "minimal_client_version".to_string(),
+                json!(GROK_MINIMAL_CLIENT_VERSION),
+            );
+        }
     }
     if visibility == "hide" || !object.contains_key("visibility") {
         object.insert(
@@ -477,7 +580,27 @@ fn build_codex_client_model(model_id: &str, index: usize) -> Value {
     object.insert("supported_in_api".to_string(), Value::Bool(true));
     object.insert("availability_nux".to_string(), Value::Null);
     object.insert("upgrade".to_string(), Value::Null);
+    object.insert(
+        "comp_hash".to_string(),
+        Value::String(CODEX_CLIENT_COMP_HASH.to_string()),
+    );
+    apply_deepseek_multi_agent_capability(&mut model);
+    // 统一口径收口：任何声明了上下文窗口的条目（内置模板、模板回落、外部覆盖）都必须
+    // 带自动压缩阈值，避免目录里出现「有窗口无阈值」的空档。
+    if let Some(object) = model.as_object_mut() {
+        ensure_model_auto_compact_limit(object);
+    }
     model
+}
+
+/// 只为已适配的 DeepSeek 模型补协作声明；必须在模板覆盖之后调用。
+pub(crate) fn apply_deepseek_multi_agent_capability(model: &mut Value) {
+    let slug = model.get("slug").and_then(Value::as_str).unwrap_or_default();
+    let id = slug.trim().rsplit('/').next().unwrap_or_default().to_ascii_lowercase();
+    if !matches!(id.as_str(), "deepseek-flash" | "deepseek-v4-flash" | "deepseek-v4-pro") {
+        return;
+    }
+    model["multi_agent_version"] = json!("v2");
 }
 
 fn codex_client_model_catalog() -> &'static Value {
@@ -506,11 +629,24 @@ fn inherit_routed_gpt_capabilities(object: &mut Map<String, Value>, model_id: &s
         "additional_speed_tiers",
         "context_window",
         "max_context_window",
+        "auto_compact_token_limit",
     ] {
         if let Some(value) = template.get(field) {
             object.insert(field.to_string(), value.clone());
         }
     }
+}
+
+/// Grok 平台模型沿用的官方多智能体协议版本；与官方 DeepSeek 条目保持一致。
+const GROK_MULTI_AGENT_VERSION: &str = "v2";
+/// 声明 v2 协作能力所需的最低客户端版本，取官方同代模型的值。
+const GROK_MINIMAL_CLIENT_VERSION: &str = "0.144.0";
+
+fn is_grok_codex_model(model_id: &str) -> bool {
+    let model_id = model_id.trim();
+    crate::modules::codex_account::GROK_CODEX_MODELS
+        .iter()
+        .any(|id| id.eq_ignore_ascii_case(model_id))
 }
 
 fn codex_client_model_template(model_id: &str) -> (Value, bool) {
@@ -580,7 +716,9 @@ fn display_name_for_model(model_id: &str) -> String {
         "gpt-5.4-mini" => "GPT-5.4 Mini".to_string(),
         "gpt-5.3-codex" => "GPT-5.3 Codex".to_string(),
         "gpt-5.3-codex-spark" => "GPT-5.3 Codex Spark".to_string(),
-        "gpt-6-astra" => "6 Astra".to_string(),
+        "gpt-6-astra" => "GPT-6 Astra".to_string(),
+        "gpt-6-sol" => "GPT-6 Sol".to_string(),
+        "gpt-6-luna" => "GPT-6 Luna".to_string(),
         "gpt-5.2" => "GPT-5.2".to_string(),
         "gpt-5.2-codex" => "GPT-5.2 Codex".to_string(),
         "gpt-5.1-codex-max" => "GPT-5.1 Codex Max".to_string(),
@@ -651,19 +789,118 @@ fn normalize_responses_input(obj: &mut Map<String, Value>) -> bool {
         }
         Value::Array(items) => {
             let mut changed = false;
-            for item in items {
+            changed |= normalize_responses_item_ids(items);
+            for item in items.iter_mut() {
                 changed |= normalize_responses_input_item(item);
             }
+            changed |= ensure_responses_call_ids(items);
             changed
         }
         Value::Object(_) => {
-            let mut item = input.clone();
-            normalize_responses_input_item(&mut item);
-            *input = Value::Array(vec![item]);
+            let item = input.clone();
+            let mut items = vec![item];
+            normalize_responses_item_ids(&mut items);
+            normalize_responses_input_item(&mut items[0]);
+            *input = Value::Array(items);
             true
         }
         _ => false,
     }
+}
+
+/// Repair item IDs written by providers that used the `function_call` prefix
+/// for a `custom_tool_call`. Official Responses validates the prefix against
+/// the item type when replaying a conversation, so this must happen before
+/// both direct official requests and gateway requests.
+fn normalize_responses_item_ids(items: &mut [Value]) -> bool {
+    let mut replacements = HashMap::new();
+    let mut used = HashSet::new();
+    for item in items.iter() {
+        let Some(obj) = item.as_object() else {
+            continue;
+        };
+        let Some(id) = obj.get("id").and_then(Value::as_str) else {
+            continue;
+        };
+        if id.is_empty() {
+            continue;
+        }
+        let Some(item_type) = obj.get("type").and_then(Value::as_str) else {
+            continue;
+        };
+        let prefix = match item_type {
+            "function_call" => "fc",
+            "custom_tool_call" => "ctc",
+            "custom_tool_call_output" => "ctco",
+            "message" => "msg",
+            "reasoning" => "rs",
+            _ => continue,
+        };
+        let mut candidate = if id.starts_with(&format!("{prefix}_")) {
+            id.to_string()
+        } else {
+            format!("{prefix}_{id}")
+        };
+        if candidate.chars().count() > CODEX_INPUT_ITEM_ID_LIMIT {
+            candidate = shorten_codex_item_id(&candidate, 0);
+        }
+        if used.contains(&candidate) {
+            for attempt in 1.. {
+                let shortened = shorten_codex_item_id(&candidate, attempt);
+                if used.insert(shortened.clone()) {
+                    candidate = shortened;
+                    break;
+                }
+            }
+        } else {
+            used.insert(candidate.clone());
+        }
+        if candidate != id {
+            replacements.insert(id.to_string(), candidate);
+        }
+    }
+
+    if replacements.is_empty() {
+        return false;
+    }
+    let mut changed = false;
+    for item in items.iter_mut() {
+        let Some(obj) = item.as_object_mut() else {
+            continue;
+        };
+        for key in ["id", "item_id"] {
+            let Some(value) = obj
+                .get(key)
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+            else {
+                continue;
+            };
+            if let Some(replacement) = replacements.get(&value) {
+                obj.insert(key.to_string(), Value::String(replacement.clone()));
+                changed = true;
+            }
+        }
+    }
+    changed
+}
+
+fn shorten_codex_item_id(id: &str, attempt: usize) -> String {
+    let mut input = id.to_string();
+    if attempt > 0 {
+        input.push('\0');
+        input.push_str(&attempt.to_string());
+    }
+    let digest = Sha256::digest(input.as_bytes());
+    let suffix = format!(
+        "_{}",
+        digest[..8]
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+    );
+    let prefix_len = CODEX_INPUT_ITEM_ID_LIMIT.saturating_sub(suffix.len());
+    id.chars().take(prefix_len).collect::<String>() + &suffix
 }
 
 fn normalize_responses_input_item(item: &mut Value) -> bool {
@@ -699,6 +936,122 @@ fn normalize_responses_input_item(item: &mut Value) -> bool {
         changed |= normalize_message_content(content, &normalized_role);
     }
 
+    changed
+}
+
+fn responses_call_item_requires_id(item_type: &str) -> bool {
+    matches!(
+        item_type,
+        "function_call" | "custom_tool_call" | "tool_call" | "mcp_tool_call"
+    )
+}
+
+fn responses_call_output_requires_id(item_type: &str) -> bool {
+    matches!(
+        item_type,
+        "function_call_output"
+            | "custom_tool_call_output"
+            | "tool_call_output"
+            | "mcp_tool_call_output"
+    )
+}
+
+fn next_generated_call_id(prefix: &str, index: usize, used: &mut HashSet<String>) -> String {
+    let base = format!("{}_{}", prefix, index);
+    if used.insert(base.clone()) {
+        return base;
+    }
+    for suffix in 1.. {
+        let candidate = format!("{}_{}", base, suffix);
+        if used.insert(candidate.clone()) {
+            return candidate;
+        }
+    }
+    unreachable!("call id suffix space is unbounded")
+}
+
+fn response_item_non_empty_string<'a>(obj: &'a Map<String, Value>, key: &str) -> Option<&'a str> {
+    obj.get(key)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
+fn responses_call_output_can_stand_alone(item_type: &str, obj: &Map<String, Value>) -> bool {
+    item_type == "function_call_output" && response_item_non_empty_string(obj, "name").is_some()
+}
+
+fn ensure_responses_call_ids(items: &mut Vec<Value>) -> bool {
+    let mut used = HashSet::new();
+    for item in items.iter() {
+        if let Some(call_id) = item
+            .as_object()
+            .and_then(|obj| response_item_non_empty_string(obj, "call_id"))
+        {
+            used.insert(call_id.to_string());
+        }
+    }
+
+    let mut pending: Vec<(String, Option<String>)> = Vec::new();
+    let mut drop_indices = Vec::new();
+    let mut changed = false;
+    for (index, item) in items.iter_mut().enumerate() {
+        let Some(obj) = item.as_object_mut() else {
+            continue;
+        };
+        let item_type = obj
+            .get("type")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        let is_call = responses_call_item_requires_id(&item_type);
+        let is_output = responses_call_output_requires_id(&item_type);
+        if !is_call && !is_output {
+            continue;
+        }
+        let name = response_item_non_empty_string(obj, "name").map(ToOwned::to_owned);
+        let call_id = match response_item_non_empty_string(obj, "call_id") {
+            Some(call_id) => call_id.to_string(),
+            None => {
+                let generated = if is_call {
+                    next_generated_call_id("call_missing", index, &mut used)
+                } else {
+                    let matched = name
+                        .as_deref()
+                        .and_then(|name| {
+                            pending
+                                .iter()
+                                .position(|(_, pending_name)| pending_name.as_deref() == Some(name))
+                        })
+                        .or_else(|| (!pending.is_empty()).then_some(0));
+                    match matched {
+                        Some(position) => pending.remove(position).0,
+                        None if responses_call_output_can_stand_alone(&item_type, obj) => {
+                            continue;
+                        }
+                        None => {
+                            drop_indices.push(index);
+                            continue;
+                        }
+                    }
+                };
+                obj.insert("call_id".to_string(), Value::String(generated.clone()));
+                changed = true;
+                generated
+            }
+        };
+
+        if is_call {
+            pending.push((call_id, name));
+        } else if let Some(position) = pending.iter().position(|(id, _)| id == &call_id) {
+            pending.remove(position);
+        }
+    }
+    for index in drop_indices.into_iter().rev() {
+        items.remove(index);
+        changed = true;
+    }
     changed
 }
 
@@ -851,6 +1204,47 @@ mod tests {
     use super::*;
 
     #[test]
+    fn deepseek_multi_agent_catalog_is_scoped_and_preserves_identity() {
+        for slug in ["deepseek-flash", "deepseek-v4-flash", "deepseek-v4-pro", "relay/deepseek-v4-pro"] {
+            let model = build_codex_client_model(slug, 0);
+            assert_eq!(model["slug"], json!(slug));
+            assert_eq!(model["multi_agent_version"], json!("v2"));
+        }
+        for slug in ["gpt-5.5", "gpt-5.6-luna", "gpt-reserve", "grok-4.6", "glm-4.6", "deepseek-custom"] {
+            let mut model = build_codex_client_model(slug, 0);
+            let before = model.clone();
+            apply_deepseek_multi_agent_capability(&mut model);
+            assert_eq!(model, before, "{slug}");
+        }
+    }
+
+    #[test]
+    fn grok_models_declare_multi_agent_capability() {
+        let catalog = build_codex_client_models_response(&[
+            "grok-4.6".into(),
+            "grok-4.5".into(),
+            "grok-4.3".into(),
+            "unknown-third-party".into(),
+        ]);
+        let models = catalog["models"].as_array().expect("models");
+        for slug in ["grok-4.6", "grok-4.5", "grok-4.3"] {
+            let model = models
+                .iter()
+                .find(|model| model["slug"] == json!(slug))
+                .unwrap_or_else(|| panic!("missing {slug}"));
+            assert_eq!(model["multi_agent_version"], json!("v2"), "{slug}");
+            assert_eq!(model["minimal_client_version"], json!("0.144.0"), "{slug}");
+        }
+        // 其它第三方模型仍保持模板默认值，避免误开协作能力。
+        let unknown = models
+            .iter()
+            .find(|model| model["slug"] == json!("unknown-third-party"))
+            .expect("unknown model");
+        assert_eq!(unknown["multi_agent_version"], Value::Null);
+        assert_eq!(unknown["minimal_client_version"], json!("0.124.0"));
+    }
+
+    #[test]
     fn routed_gpt_models_preserve_capabilities_and_dispatch_identity() {
         for upstream in ["gpt-6-astra", "gpt-5.6-sol", "gpt-5.6-luna"] {
             let routed = format!("cpa/{upstream}");
@@ -911,9 +1305,14 @@ mod tests {
         let mut expected = before[1].clone();
         expected["slug"] = json!(CODEX_RESERVE_MODEL_ID);
         expected["visibility"] = json!("list");
-        expected["display_name"] = json!("Luna Reserve");
+        expected["display_name"] = json!(CODEX_RESERVE_DISPLAY_NAME);
         assert_eq!(models.last(), Some(&expected));
-        assert!(expected["auto_compact_token_limit"].is_null());
+        // 统一口径：Reserve 沿用 Luna 模板的上下文窗口，压缩阈值必须同时存在且为 90%。
+        let reserve_context = expected["context_window"].as_i64().expect("context window");
+        assert_eq!(
+            expected["auto_compact_token_limit"].as_i64(),
+            Some(derived_auto_compact_token_limit(reserve_context))
+        );
 
         let explicit = build_codex_client_models_response(&[CODEX_RESERVE_MODEL_ID.to_string()]);
         assert_eq!(explicit["models"][0], expected);
@@ -1215,6 +1614,175 @@ mod tests {
     }
 
     #[test]
+    fn repairs_mismatched_custom_tool_call_item_ids() {
+        let mut body = json!({
+            "model": "gpt-6-astra",
+            "input": [
+                {
+                    "type": "custom_tool_call",
+                    "id": "fc_legacy_0",
+                    "call_id": "call-legacy",
+                    "name": "apply_patch",
+                    "input": "patch"
+                },
+                {
+                    "type": "custom_tool_call_output",
+                    "id": "fc_legacy_output_0",
+                    "item_id": "fc_legacy_0",
+                    "call_id": "call-legacy",
+                    "output": "ok"
+                }
+            ]
+        });
+
+        assert!(normalize_responses_body_for_codex(&mut body));
+        assert_eq!(body["input"][0]["id"], "ctc_fc_legacy_0");
+        assert_eq!(body["input"][1]["id"], "ctco_fc_legacy_output_0");
+        assert_eq!(body["input"][1]["item_id"], "ctc_fc_legacy_0");
+    }
+
+    #[test]
+    fn shortens_long_and_colliding_response_item_ids() {
+        let long_id = format!("fc_{}", "x".repeat(80));
+        let mut body = json!({
+            "model": "gpt-6-astra",
+            "input": [
+                {"type": "function_call", "id": long_id, "call_id": "call-1"},
+                {"type": "function_call", "id": "fc_same", "call_id": "call-2"},
+                {"type": "function_call", "id": "same", "call_id": "call-3"}
+            ]
+        });
+
+        assert!(normalize_responses_body_for_codex(&mut body));
+        let items = body["input"].as_array().expect("input array");
+        let ids = items
+            .iter()
+            .map(|item| item["id"].as_str().expect("item id"))
+            .collect::<Vec<_>>();
+        assert!(ids.iter().all(|id| id.starts_with("fc_") && id.len() <= 64));
+        assert_eq!(ids.len(), ids.iter().collect::<HashSet<_>>().len());
+    }
+
+    #[test]
+    fn synthesizes_missing_call_ids_for_replayed_tool_items() {
+        let mut body = json!({
+            "model": "deepseek-v4-flash",
+            "input": [
+                {
+                    "type": "function_call",
+                    "name": "exec_command",
+                    "arguments": "{\"cmd\":\"pwd\"}"
+                },
+                {
+                    "type": "function_call_output",
+                    "output": "/workspace"
+                },
+                {
+                    "type": "custom_tool_call",
+                    "name": "apply_patch",
+                    "input": "*** Begin Patch"
+                },
+                {
+                    "type": "custom_tool_call_output",
+                    "output": "Done!"
+                },
+                {
+                    "type": "function_call",
+                    "call_id": "call_existing",
+                    "name": "lookup",
+                    "arguments": "{}"
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_existing",
+                    "output": "ok"
+                }
+            ]
+        });
+
+        assert!(normalize_responses_body_for_codex(&mut body));
+        let input = body.get("input").and_then(Value::as_array).unwrap();
+        let first_call_id = input[0]
+            .get("call_id")
+            .and_then(Value::as_str)
+            .expect("function call id");
+        assert!(first_call_id.starts_with("call_missing"));
+        assert_eq!(
+            input[1].get("call_id").and_then(Value::as_str),
+            Some(first_call_id)
+        );
+        let custom_call_id = input[2]
+            .get("call_id")
+            .and_then(Value::as_str)
+            .expect("custom tool call id");
+        assert!(custom_call_id.starts_with("call_missing"));
+        assert_eq!(
+            input[3].get("call_id").and_then(Value::as_str),
+            Some(custom_call_id)
+        );
+        assert_eq!(
+            input[4].get("call_id").and_then(Value::as_str),
+            Some("call_existing")
+        );
+        assert_eq!(
+            input[5].get("call_id").and_then(Value::as_str),
+            Some("call_existing")
+        );
+    }
+
+    #[test]
+    fn drops_anonymous_orphan_outputs_while_preserving_paired_history() {
+        let mut body = json!({
+            "model": "deepseek-v4-flash",
+            "input": [
+                {"type": "message", "role": "user", "content": "continue"},
+                {"type": "function_call_output", "output": "orphan result"},
+                {"type": "function_call", "name": "exec_command", "arguments": "{}"},
+                {"type": "function_call_output", "output": "paired result"},
+                {"type": "function_call_output", "name": "heartbeat", "output": "keep standalone"}
+            ]
+        });
+
+        assert!(normalize_responses_body_for_codex(&mut body));
+        let input = body.get("input").and_then(Value::as_array).unwrap();
+        assert_eq!(input.len(), 4);
+        assert_eq!(
+            input[1].get("type").and_then(Value::as_str),
+            Some("function_call")
+        );
+        let call_id = input[1]
+            .get("call_id")
+            .and_then(Value::as_str)
+            .expect("synthesized call id");
+        assert_eq!(
+            input[2].get("call_id").and_then(Value::as_str),
+            Some(call_id)
+        );
+        assert_eq!(
+            input[3].get("name").and_then(Value::as_str),
+            Some("heartbeat")
+        );
+        assert!(input[3].get("call_id").is_none());
+    }
+
+    #[test]
+    fn preserves_existing_replay_input_items() {
+        let mut body = json!({
+            "model": "gpt-5.6-sol",
+            "input": [
+                {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "continue"}]},
+                {"type": "function_call", "call_id": "old_unanswered", "name": "exec_command", "arguments": "{}"},
+                {"type": "function_call", "call_id": "old_answered", "name": "lookup", "arguments": "{}"},
+                {"type": "function_call_output", "call_id": "old_answered", "output": "ok"}
+            ]
+        });
+        let expected_input = body["input"].clone();
+
+        normalize_responses_body_for_codex(&mut body);
+        assert_eq!(body["input"], expected_input);
+    }
+
+    #[test]
     fn preserving_supported_call_namespaces_does_not_report_change() {
         for item_type in [
             "function_call",
@@ -1263,6 +1831,7 @@ mod tests {
         assert!(response.get("models").and_then(Value::as_array).is_some());
         assert!(response.get("object").is_none());
         assert!(response.get("data").is_none());
+
         assert_eq!(
             response.pointer("/models/0/slug").and_then(Value::as_str),
             Some("gpt-5.4")
@@ -1289,6 +1858,30 @@ mod tests {
             .pointer("/models/0/input_modalities")
             .and_then(Value::as_array)
             .is_some());
+    }
+
+    #[test]
+    fn codex_client_models_share_unified_compaction_hash() {
+        let response = build_codex_client_models_response(&[
+            "gpt-5.5".to_string(),
+            "gpt-5.6-sol".to_string(),
+            "gpt-6-astra".to_string(),
+            "deepseek-flash".to_string(),
+            "custom-third-party".to_string(),
+        ]);
+        let models = response
+            .get("models")
+            .and_then(Value::as_array)
+            .expect("models should be an array");
+        assert_eq!(models.len(), 5);
+        for model in models {
+            assert_eq!(
+                model.get("comp_hash").and_then(Value::as_str),
+                Some(CODEX_CLIENT_COMP_HASH),
+                "model {:?} should share the unified compaction hash",
+                model.get("slug").and_then(Value::as_str)
+            );
+        }
     }
 
     #[test]
@@ -1326,6 +1919,8 @@ mod tests {
             managed_codex_model_ids(),
             vec![
                 "gpt-6-astra",
+                "gpt-6-sol",
+                "gpt-6-luna",
                 "gpt-5.6-sol",
                 "gpt-5.6-terra",
                 "gpt-5.6-luna"
@@ -1404,15 +1999,20 @@ mod tests {
             .expect("Astra model should be present");
         assert_eq!(
             model.get("display_name").and_then(Value::as_str),
-            Some("6 Astra")
+            Some("GPT-6 Astra")
         );
         assert_eq!(
             model.get("context_window").and_then(Value::as_i64),
-            Some(1_050_000)
+            Some(256_000)
         );
         assert_eq!(
             model.get("max_context_window").and_then(Value::as_i64),
-            Some(1_050_000)
+            Some(256_000)
+        );
+        // 统一口径：上下文窗口必须带 90% 的压缩阈值。
+        assert_eq!(
+            model.get("auto_compact_token_limit").and_then(Value::as_i64),
+            Some(230_400)
         );
         assert_eq!(
             model.get("max_completion_tokens").and_then(Value::as_i64),
@@ -1445,6 +2045,48 @@ mod tests {
             model.get("use_responses_lite").and_then(Value::as_bool),
             Some(true)
         );
+    }
+
+    #[test]
+    fn gpt_6_sol_and_luna_preserve_official_catalog_limits_and_reasoning_levels() {
+        for (slug, official_name, fallback_name, priority, supports_ultra) in [
+            ("gpt-6-sol", "GPT-6 Sol", "GPT-6 Sol", 2, true),
+            ("gpt-6-luna", "GPT-6 Luna", "GPT-6 Luna", 3, false),
+        ] {
+            let response = build_codex_client_models_response(&[slug.to_string()]);
+            let model = response
+                .pointer("/models/0")
+                .expect("GPT-6 model should be present");
+            assert_eq!(
+                model.get("display_name").and_then(Value::as_str),
+                Some(official_name)
+            );
+            assert_eq!(display_name_for_model(slug), fallback_name);
+            assert_eq!(model.get("priority").and_then(Value::as_i64), Some(priority));
+            assert_eq!(
+                model.get("context_window").and_then(Value::as_i64),
+                Some(256_000)
+            );
+            assert_eq!(
+                model.get("max_context_window").and_then(Value::as_i64),
+                Some(256_000)
+            );
+            // 统一口径：上下文窗口必须带 90% 的压缩阈值。
+            assert_eq!(
+                model.get("auto_compact_token_limit").and_then(Value::as_i64),
+                Some(230_400),
+                "{slug}"
+            );
+            let efforts = model
+                .get("supported_reasoning_levels")
+                .and_then(Value::as_array)
+                .expect("GPT-6 reasoning levels should exist")
+                .iter()
+                .filter_map(|level| level.get("effort").and_then(Value::as_str))
+                .collect::<Vec<_>>();
+            assert!(efforts.contains(&"max"), "{slug}: {efforts:?}");
+            assert_eq!(efforts.contains(&"ultra"), supports_ultra, "{slug}: {efforts:?}");
+        }
     }
 
     #[test]
@@ -1507,6 +2149,9 @@ mod tests {
         assert_eq!(custom["description"], "Custom Model");
         assert_eq!(custom["context_window"], DEFAULT_CONTEXT_WINDOW);
         assert_eq!(custom["max_context_window"], DEFAULT_MAX_CONTEXT_WINDOW);
+        // 兜底不再声明 1M 上限；压缩阈值按统一口径派生为窗口的 90%。
+        assert_eq!(custom["max_context_window"], 272_000);
+        assert_eq!(custom["auto_compact_token_limit"], 244_800);
         assert_eq!(
             custom["supported_reasoning_levels"],
             base["supported_reasoning_levels"]
@@ -1537,8 +2182,46 @@ mod tests {
 
         assert_eq!(
             priorities,
-            vec![Some(1), Some(2), Some(3), Some(7), Some(16), Some(23)]
+            vec![Some(4), Some(7), Some(8), Some(12), Some(16), Some(23)]
         );
+    }
+
+    #[test]
+    fn derived_auto_compact_limits_follow_ninety_percent_rule() {
+        for (window, expected) in [
+            (516_000, 464_400),
+            (1_000_000, 900_000),
+            (272_000, 244_800),
+            (128_000, 115_200),
+            (256_000, 230_400),
+            (1_048_576, 943_718),
+        ] {
+            assert_eq!(
+                derived_auto_compact_token_limit(window),
+                expected,
+                "window={window}"
+            );
+        }
+        assert_eq!(derived_auto_compact_token_limit(0), 0);
+        assert_eq!(derived_auto_compact_token_limit(-1), 0);
+        assert_eq!(AUTO_COMPACT_RATIO_PERCENT, 90);
+    }
+
+    #[test]
+    fn catalog_models_without_compact_limit_derive_ninety_percent() {
+        let mut catalog = json!({"models": [
+            {"slug": "windowless-model"},
+            {"slug": "official-model", "context_window": 272_000},
+            {"slug": "explicit-model", "context_window": 516_000, "auto_compact_token_limit": 460_000},
+            {"slug": "stale-model", "context_window": 100_000, "auto_compact_token_limit": 100_000},
+        ]});
+        assert!(ensure_client_model_auto_compact_limits(&mut catalog));
+        assert!(catalog["models"][0].get("auto_compact_token_limit").is_none());
+        assert_eq!(catalog["models"][1]["auto_compact_token_limit"], 244_800);
+        // 显式给出的（小于窗口的）阈值保持原样。
+        assert_eq!(catalog["models"][2]["auto_compact_token_limit"], 460_000);
+        // 大于等于窗口的无效阈值会被 90% 派生值替换。
+        assert_eq!(catalog["models"][3]["auto_compact_token_limit"], 90_000);
     }
 
     #[test]

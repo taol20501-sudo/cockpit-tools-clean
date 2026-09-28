@@ -77,6 +77,9 @@ expectIncludes(releaseWorkflow, '项目来源与许可证 / Project Origin and L
 expectIncludes(releaseWorkflow, '/blob/v${VERSION}/NOTICE', '.github/workflows/release.yml');
 expectIncludes(gitAttributes, 'announcements.json merge=keep-clean', '.gitattributes');
 expectIncludes(gitAttributes, '.github/workflows/release.yml merge=keep-clean', '.gitattributes');
+expectIncludes(gitAttributes, 'src/stores/useSponsorStore.ts merge=keep-clean', '.gitattributes');
+expectIncludes(gitAttributes, 'README.md merge=clean-text', '.gitattributes');
+expectIncludes(syncWorkflow, 'git config merge.clean-text.driver', '.github/workflows/sync-upstream.yml');
 expectIncludes(syncWorkflow, 'node scripts/verify-clean-edition.cjs', '.github/workflows/sync-upstream.yml');
 expectIncludes(syncWorkflow, 'git push origin "HEAD:refs/heads/main"', '.github/workflows/sync-upstream.yml');
 expectIncludes(syncWorkflow, 'gh workflow run release.yml --ref main', '.github/workflows/sync-upstream.yml');
@@ -93,6 +96,7 @@ for (const [file, content] of topLevelReadmes) {
   expectExcludes(content, 'apikey.fun/register?aff=COCKPIT', file);
   expectExcludes(content, 'roxybrowser.cn?code=', file);
   expectExcludes(content, 'docs/DONATE', file);
+  expect(!/register\?aff=/i.test(content), `${file} contains a referral link`);
 }
 
 const desktopAnnouncement = read('src-tauri/src/modules/announcement.rs');
@@ -137,6 +141,7 @@ expectIncludes(updaterNotes, 'taol20501-sudo/cockpit-tools-clean/releases', 'src
 expectExcludes(topRightStore, 'topRightAdService', 'src/stores/useTopRightAdStore.ts');
 expectIncludes(topRightStore, 'localStorage.removeItem', 'src/stores/useTopRightAdStore.ts');
 expectExcludes(sponsorStore, 'sponsorService', 'src/stores/useSponsorStore.ts');
+expectExcludes(desktopAnnouncement, 'sponsor_route_sync::sync_sponsor_routes(&sponsors)', 'src-tauri/src/modules/announcement.rs');
 expectExcludes(apiKeyLinks, 'register?aff=cockpit', 'src/utils/apikeyFunLinks.ts');
 
 if (failures.length > 0) {

@@ -99,10 +99,10 @@ func (a *imageSSEAccumulator) Flush() [][]byte {
 }
 
 func buildImageGenerationRelayRequest(rawJSON []byte) (imageRelayRequest, error) {
-	return buildImageGenerationRelayRequestWithModel(rawJSON, defaultImagesToolModel)
+	return buildImageGenerationRelayRequestWithModel(rawJSON, defaultImagesToolModel, false)
 }
 
-func buildImageGenerationRelayRequestWithModel(rawJSON []byte, imageToolModel string) (imageRelayRequest, error) {
+func buildImageGenerationRelayRequestWithModel(rawJSON []byte, imageToolModel string, allowModelFallback bool) (imageRelayRequest, error) {
 	if !json.Valid(rawJSON) {
 		return imageRelayRequest{}, fmt.Errorf("body must be valid JSON")
 	}
@@ -114,7 +114,7 @@ func buildImageGenerationRelayRequestWithModel(rawJSON []byte, imageToolModel st
 	if prompt == "" {
 		return imageRelayRequest{}, fmt.Errorf("prompt is required")
 	}
-	tool, err := buildImageToolWithModel(payload, "generate", imageToolModel)
+	tool, err := buildImageToolWithModel(payload, "generate", imageToolModel, allowModelFallback)
 	if err != nil {
 		return imageRelayRequest{}, err
 	}
@@ -132,13 +132,13 @@ func buildImageGenerationRelayRequestWithModel(rawJSON []byte, imageToolModel st
 }
 
 func buildImageEditRelayRequest(c *gin.Context) (imageRelayRequest, error) {
-	return buildImageEditRelayRequestWithModel(c, defaultImagesToolModel)
+	return buildImageEditRelayRequestWithModel(c, defaultImagesToolModel, false)
 }
 
-func buildImageEditRelayRequestWithModel(c *gin.Context, imageToolModel string) (imageRelayRequest, error) {
+func buildImageEditRelayRequestWithModel(c *gin.Context, imageToolModel string, allowModelFallback bool) (imageRelayRequest, error) {
 	contentType := strings.ToLower(strings.TrimSpace(c.GetHeader("Content-Type")))
 	if strings.HasPrefix(contentType, "multipart/form-data") || contentType == "" {
-		return buildImageEditRelayRequestFromMultipartWithModel(c, imageToolModel)
+		return buildImageEditRelayRequestFromMultipartWithModel(c, imageToolModel, allowModelFallback)
 	}
 	if !strings.HasPrefix(contentType, "application/json") {
 		return imageRelayRequest{}, fmt.Errorf("unsupported Content-Type %q", contentType)
@@ -162,7 +162,7 @@ func buildImageEditRelayRequestWithModel(c *gin.Context, imageToolModel string) 
 	if len(images) == 0 {
 		return imageRelayRequest{}, fmt.Errorf("images[].image_url is required")
 	}
-	tool, err := buildImageToolWithModel(payload, "edit", imageToolModel)
+	tool, err := buildImageToolWithModel(payload, "edit", imageToolModel, allowModelFallback)
 	if err != nil {
 		return imageRelayRequest{}, err
 	}
@@ -185,10 +185,10 @@ func buildImageEditRelayRequestWithModel(c *gin.Context, imageToolModel string) 
 }
 
 func buildImageEditRelayRequestFromMultipart(c *gin.Context) (imageRelayRequest, error) {
-	return buildImageEditRelayRequestFromMultipartWithModel(c, defaultImagesToolModel)
+	return buildImageEditRelayRequestFromMultipartWithModel(c, defaultImagesToolModel, false)
 }
 
-func buildImageEditRelayRequestFromMultipartWithModel(c *gin.Context, imageToolModel string) (imageRelayRequest, error) {
+func buildImageEditRelayRequestFromMultipartWithModel(c *gin.Context, imageToolModel string, allowModelFallback bool) (imageRelayRequest, error) {
 	form, err := c.MultipartForm()
 	if err != nil {
 		return imageRelayRequest{}, err
@@ -225,7 +225,7 @@ func buildImageEditRelayRequestFromMultipartWithModel(c *gin.Context, imageToolM
 		}
 		images = append(images, dataURL)
 	}
-	tool, err := buildImageToolWithModel(payload, "edit", imageToolModel)
+	tool, err := buildImageToolWithModel(payload, "edit", imageToolModel, allowModelFallback)
 	if err != nil {
 		return imageRelayRequest{}, err
 	}
@@ -357,10 +357,15 @@ func (s *relayServer) forwardImagesStream(c *gin.Context, ctx context.Context, r
 			}
 			idleTimer.Reset(idleTimeout)
 			if !ok {
+				terminal := false
 				for _, frame := range acc.Flush() {
 					if done := forwardImageResponseFrame(frame, imageReq, writeEvent, writeErr); done {
-						return
+						terminal = true
+						break
 					}
+				}
+				if !terminal {
+					writeErr(relayStatusError{status: http.StatusBadGateway, message: "image stream disconnected before completion"})
 				}
 				return
 			}
@@ -438,9 +443,38 @@ func forwardImageResponseFrame(frame []byte, imageReq imageRelayRequest, writeEv
 				writeEvent(eventName, data)
 			}
 			return true
+		case "response.failed", "response.incomplete", "response.error", "error":
+			writeErr(imageResponseTerminalError(event))
+			return true
 		}
 	}
 	return false
+}
+
+func imageResponseTerminalError(event map[string]any) error {
+	status := http.StatusBadGateway
+	message := "upstream image response failed"
+	code := "upstream_image_error"
+	response, _ := event["response"].(map[string]any)
+	if response == nil {
+		response = event
+	}
+	if errPayload, ok := response["error"].(map[string]any); ok {
+		if value := stringField(errPayload, "message"); value != "" {
+			message = value
+		}
+		if value := stringField(errPayload, "code"); value != "" {
+			code = value
+		} else if value := stringField(errPayload, "type"); value != "" {
+			code = value
+		}
+		if value, ok := numericField(errPayload["status_code"]); ok && value > 0 {
+			status = int(value)
+		}
+	} else if value := stringField(response, "message"); value != "" {
+		message = value
+	}
+	return relayStatusError{status: status, message: code + ": " + message}
 }
 
 func stringField(payload map[string]any, key string) string {
@@ -489,17 +523,21 @@ func imageModelOrDefault(payload map[string]any) string {
 }
 
 func buildImageTool(payload map[string]any, action string) (map[string]any, error) {
-	return buildImageToolWithModel(payload, action, defaultImagesToolModel)
+	return buildImageToolWithModel(payload, action, defaultImagesToolModel, false)
 }
 
-func buildImageToolWithModel(payload map[string]any, action string, imageToolModel string) (map[string]any, error) {
+func buildImageToolWithModel(payload map[string]any, action string, imageToolModel string, allowModelFallback bool) (map[string]any, error) {
 	model := imageModelOrDefault(payload)
 	if strings.TrimSpace(imageToolModel) == "" {
 		imageToolModel = defaultImagesToolModel
 	}
 	if modelBase(model) != defaultImagesToolModel && modelBase(model) != legacyImagesToolModel &&
 		modelBase(model) != modelBase(imageToolModel) {
-		return nil, fmt.Errorf("model %s is not supported on %s or %s. Use %s.", model, imagesGenerationsPath, imagesEditsPath, defaultImagesToolModel)
+		// 已配置生图转发账号池的实例：客户端可能带着对话模型名发起生图请求，
+		// 这时回落到配置的图片模型，而不是直接报模型不支持。
+		if !allowModelFallback {
+			return nil, fmt.Errorf("model %s is not supported on %s or %s. Use %s.", model, imagesGenerationsPath, imagesEditsPath, defaultImagesToolModel)
+		}
 	}
 	tool := map[string]any{
 		"type":   "image_generation",
@@ -670,7 +708,11 @@ func processImageResponseFrame(frame []byte, responseFormat string) ([]byte, boo
 		if err := json.Unmarshal(payload, &event); err != nil {
 			return nil, false, relayStatusError{status: http.StatusBadGateway, message: "invalid SSE data JSON"}
 		}
-		if stringField(event, "type") != "response.completed" {
+		switch stringField(event, "type") {
+		case "response.failed", "response.incomplete", "response.error", "error":
+			return nil, false, imageResponseTerminalError(event)
+		case "response.completed":
+		default:
 			continue
 		}
 		results, usage, createdAt := extractImageResults(event)

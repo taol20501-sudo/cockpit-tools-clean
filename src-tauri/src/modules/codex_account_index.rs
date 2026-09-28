@@ -924,7 +924,7 @@ fn load_account_with_summary(
             .unwrap_or(false);
         // 绑定 OAuth 时强制关闭本地网关标志，避免误走旧「禁生图 + 本地网关」路径。
         let cleared_bound_oauth_gateway = clear_bound_oauth_local_gateway_flag(&mut account);
-        let migrated_wire_api = migrate_apikey_fun_wire_api(&mut account);
+        let migrated_apikey_fun = migrate_apikey_fun_account(&mut account);
         let migrated_deepseek = enforce_deepseek_responses_account(&mut account);
         let migrated_websocket = normalize_api_key_websocket_capability(&mut account);
         let cleared_retired_app_server_preflight =
@@ -933,7 +933,7 @@ fn load_account_with_summary(
             return Ok(None);
         }
         if needs_rotation
-            || migrated_wire_api
+            || migrated_apikey_fun
             || migrated_deepseek
             || migrated_websocket
             || cleared_retired_app_server_preflight
@@ -949,7 +949,7 @@ fn load_account_with_summary(
                 move || {
                     crate::modules::secure_account_storage::serialize_account_file(
                         "codex",
-                        &account_for_rewrite,
+                        &crate::modules::codex_account_proxy::storage_value(&account_for_rewrite)?,
                     )
                 },
             );
@@ -961,7 +961,7 @@ fn load_account_with_summary(
         .map_err(|error| format!("账号详情不是有效 JSON ({}): {}", path.display(), error))?;
     let mut account = parse_codex_account_compat(value.clone(), account_id, summary)?
         .ok_or_else(|| format!("账号详情缺少可识别凭据 ({})", path.display()))?;
-    let _ = migrate_apikey_fun_wire_api(&mut account);
+    let _ = migrate_apikey_fun_account(&mut account);
     let _ = enforce_deepseek_responses_account(&mut account);
     let _ = clear_bound_oauth_local_gateway_flag(&mut account);
     let _ = clear_retired_app_server_preflight_reauth(&mut account);
@@ -978,7 +978,7 @@ fn load_account_with_summary(
         move || {
             crate::modules::secure_account_storage::serialize_account_file(
                 "codex",
-                &account_for_rewrite,
+                &crate::modules::codex_account_proxy::storage_value(&account_for_rewrite)?,
             )
         },
     );
@@ -1026,7 +1026,8 @@ fn save_account_with_tombstone_guard(account: &CodexAccount) -> Result<(), Strin
 
 fn save_account_unchecked(account: &CodexAccount) -> Result<(), String> {
     let path = get_accounts_dir().join(format!("{}.json", &account.id));
-    let content = crate::modules::secure_account_storage::serialize_account_file("codex", account)?;
+    let content = crate::modules::secure_account_storage::serialize_account_file("codex",
+        &crate::modules::codex_account_proxy::storage_value(account)?)?;
     write_string_atomic(&path, &content).map_err(|e| format!("写入账号详情失败: {}", e))?;
     Ok(())
 }
@@ -1067,6 +1068,7 @@ fn delete_account_file_unlocked(account_id: &str) -> Result<(), String> {
         crate::modules::atomic_write::remove_file_locked(&path)
             .map_err(|e| format!("删除文件失败: {}", e))?;
     }
+    crate::modules::codex_proxy_runtime::release_deleted_account(account_id);
     Ok(())
 }
 
@@ -1289,4 +1291,14 @@ pub fn list_accounts_checked() -> Result<Vec<CodexAccount>, String> {
     }
 
     Ok(accounts)
+}
+
+/// Destructive proxy-source deletion must see every indexed account before unbinding.
+pub fn list_accounts_for_proxy_removal() -> Result<Vec<CodexAccount>, String> {
+    let index = load_account_index_checked().map_err(|_| "CATALOG_ACCOUNT_READ")?;
+    index.accounts.iter().map(|summary| {
+        load_account_with_summary(&summary.id, Some(summary))
+            .map_err(|_| "CATALOG_ACCOUNT_READ")?
+            .ok_or_else(|| "CATALOG_ACCOUNT_READ".to_string())
+    }).collect()
 }

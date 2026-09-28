@@ -16,12 +16,14 @@ import {
 import {
   APIKEY_FUN_DEFAULT_MODEL_CATALOG,
   isApiKeyFunProviderBaseUrl,
+  normalizeApiKeyFunProviderBaseUrl,
 } from '../utils/apikeyFunLinks';
 import {
   queryModelProviderUsage,
   type ModelProviderUsageSummary,
 } from './modelProviderUsageService';
 import { moveCodexProviderApiKey } from '../utils/codexModelProviderApiKeyMove';
+import { expandLegacyProviderVisionCapabilities } from '../utils/codexModelProviderVision';
 
 export interface CodexModelProviderApiKey {
   id: string;
@@ -188,11 +190,20 @@ function normalizeIntegrationType(value: unknown): 'sub2api' | 'new_api' | undef
   return value === 'sub2api' || value === 'new_api' ? value : undefined;
 }
 
-function migrateApiKeyFunProviderWireApi(
+function migrateApiKeyFunProvider(
   providers: CodexModelProvider[],
 ): { providers: CodexModelProvider[]; changed: boolean } {
   let changed = false;
   const next = providers.map((provider) => {
+    const baseUrl = normalizeApiKeyFunProviderBaseUrl(provider.baseUrl);
+    if (baseUrl !== provider.baseUrl) {
+      changed = true;
+      provider = {
+        ...provider,
+        baseUrl,
+        updatedAt: Date.now(),
+      };
+    }
     if (
       isApiKeyFunProviderBaseUrl(provider.baseUrl) &&
       provider.wireApi === 'chat_completions'
@@ -480,16 +491,23 @@ async function ensureProvidersLoaded(): Promise<CodexModelProvider[]> {
     }
     return true;
   });
-  const migration = migrateApiKeyFunProviderWireApi(loaded);
+  const migration = migrateApiKeyFunProvider(loaded);
   loaded = migration.providers;
   let migratedDeepSeek = false;
+  let migratedLegacyVision = false;
   for (const provider of loaded) {
     migratedDeepSeek = enforceDeepSeekProvider(provider) || migratedDeepSeek;
+    // 旧版本的供应商级识图开关展开成逐模型能力，避免网关把图片当 text-only 丢弃。
+    if (expandLegacyProviderVisionCapabilities(provider)) {
+      provider.updatedAt = Date.now();
+      migratedLegacyVision = true;
+    }
   }
   if (
     loaded.length !== loadedProviders.length ||
     migration.changed ||
     migratedDeepSeek ||
+    migratedLegacyVision ||
     loadResult.removedImageGenerationSetting ||
     loadResult.migratedSupportsWebsockets
   ) {

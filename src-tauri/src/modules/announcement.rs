@@ -163,6 +163,9 @@ pub struct SponsorIntegration {
     pub integration_type: String,
     #[serde(default)]
     pub base_url: String,
+    /// 已废弃的历史线路；命中时自动改写为当前 `base_url`。
+    #[serde(default)]
+    pub base_url_aliases: Vec<String>,
     #[serde(default)]
     pub wire_api: Option<String>,
     #[serde(default)]
@@ -1128,6 +1131,12 @@ pub async fn get_sponsor_module_state() -> Result<SponsorModuleState, String> {
     Ok(SponsorModuleState {
         sponsor_module: None,
     })
+}
+
+pub async fn sync_sponsor_routes_from_announcements(
+) -> Result<crate::modules::sponsor_route_sync::SponsorRouteSyncSummary, String> {
+    // Clean edition never imports promotional routes, including from old caches.
+    Ok(Default::default())
 }
 
 pub async fn force_refresh_sponsor_module() -> Result<SponsorModuleState, String> {

@@ -6,6 +6,11 @@ do not override these Clean safeguards.
 - `Sync Upstream` checks upstream main every three hours (GitHub schedules may be delayed).
 - It merges upstream code, preserves the Clean application identity and updater
   public key, and runs `scripts/verify-clean-edition.cjs` before pushing.
+- Known sponsor sections in the top-level READMEs and referral parameters in
+  the APIKEY registration constant are normalized before a three-way merge.
+  Upstream domain changes and ordinary documentation changes still merge.
+  Disabled sponsor/advertisement stores remain Clean-owned. These rules replay
+  the September 2026 conflicts in regression tests; unrelated conflicts still stop.
 - All `gh` operations in the sync job use `GH_REPO: ${{ github.repository }}`.
   The release dispatch also explicitly passes that repository. Without this,
   GitHub CLI may resolve a fork to its parent, incorrectly inspect the original

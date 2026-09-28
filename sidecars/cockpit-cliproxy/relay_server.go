@@ -14,6 +14,7 @@ import (
 	"os"
 
 	"strings"
+	"sync"
 
 	"time"
 
@@ -29,21 +30,27 @@ import (
 )
 
 type relayServer struct {
-	runtime            executorRuntime
-	cfg                *config.Config
-	manifest           *manifest
-	authManager        *coreauth.Manager
-	emitter            *eventEmitter
-	policy             *requestPolicy
-	responsesWebsocket gin.HandlerFunc
-	codexLive          *codexlive.Handler
-	quotaPoolStatePath string
+	automaticSelector     coreauth.Selector
+	automaticSelectorOnce sync.Once
+	runtime               executorRuntime
+	cfg                   *config.Config
+	manifest              *manifest
+	authManager           *coreauth.Manager
+	emitter               *eventEmitter
+	policy                *requestPolicy
+	responsesWebsocket    gin.HandlerFunc
+	codexLive             *codexlive.Handler
+	quotaPoolStatePath    string
 }
 
 func (s *relayServer) router() *gin.Engine {
 	router := gin.New()
 	router.Use(gin.Recovery())
 	router.Use(corsMiddleware())
+	router.Use(func(c *gin.Context) {
+		s.bindRelayContext(c)
+		c.Next()
+	})
 	router.Use(s.policy.middleware())
 	router.GET("/v1/models", s.handleModels)
 	router.GET(cockpitQuotaPath, s.handleCockpitQuota)
@@ -603,7 +610,7 @@ func (s *relayServer) handleModels(c *gin.Context) {
 	}
 	models := clientCatalogModelsForAPIKey(s.manifest, spec)
 	if isCodexClientModelsRequest(c.Request) {
-		c.JSON(http.StatusOK, buildCodexClientModelsResponse(models, spec, contextWindowsForAPIKey(s.manifest, spec)))
+		c.JSON(http.StatusOK, buildCodexClientModelsResponse(models, spec, contextWindowsForAPIKey(s.manifest, spec), s.manifest))
 		return
 	}
 	c.JSON(http.StatusOK, buildModelsResponse(models))
@@ -883,7 +890,8 @@ func (s *relayServer) handleGeminiAction(c *gin.Context) {
 }
 
 func (s *relayServer) handleImagesGenerations(c *gin.Context) {
-	if _, ok := s.requireAPIKey(c); !ok {
+	spec, ok := s.requireAPIKey(c)
+	if !ok {
 		return
 	}
 	rawJSON, err := c.GetRawData()
@@ -891,7 +899,11 @@ func (s *relayServer) handleImagesGenerations(c *gin.Context) {
 		writeAPIError(c, http.StatusBadRequest, "failed to read request body", "invalid_request")
 		return
 	}
-	imageReq, err := buildImageGenerationRelayRequestWithModel(rawJSON, configuredImagesToolModel(s.manifest))
+	imageReq, err := buildImageGenerationRelayRequestWithModel(
+		rawJSON,
+		configuredImagesToolModel(s.manifest),
+		len(imageGenerationAccountIDsForSpec(spec)) > 0,
+	)
 	if err != nil {
 		writeAPIError(c, http.StatusBadRequest, err.Error(), "invalid_request")
 		return
@@ -900,10 +912,15 @@ func (s *relayServer) handleImagesGenerations(c *gin.Context) {
 }
 
 func (s *relayServer) handleImagesEdits(c *gin.Context) {
-	if _, ok := s.requireAPIKey(c); !ok {
+	spec, ok := s.requireAPIKey(c)
+	if !ok {
 		return
 	}
-	imageReq, err := buildImageEditRelayRequestWithModel(c, configuredImagesToolModel(s.manifest))
+	imageReq, err := buildImageEditRelayRequestWithModel(
+		c,
+		configuredImagesToolModel(s.manifest),
+		len(imageGenerationAccountIDsForSpec(spec)) > 0,
+	)
 	if err != nil {
 		writeAPIError(c, http.StatusBadRequest, err.Error(), "invalid_request")
 		return

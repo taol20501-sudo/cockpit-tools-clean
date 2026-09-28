@@ -11,6 +11,9 @@ export interface CodexExperimentalModelDefinition {
   display_name: string;
   /** undefined follows the official model reasoning levels; otherwise custom multi-select. */
   reasoning_efforts?: CodexReasoningEffort[];
+  /** Omitted values follow the model catalog metadata. */
+  context_window?: number;
+  auto_compact_token_limit?: number;
 }
 
 export type CodexReasoningEffort = 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra';
@@ -61,7 +64,11 @@ export interface CodexAccount {
   api_vision_routing_model?: string | null;
   api_instance_access_mode?: "gateway" | "direct" | "cdp" | string | null;
   api_startup_model?: string | null;
+  /** 网关模式下用于生图转发的 GPT(OAuth) 账号池。 */
+  api_image_generation_account_ids?: string[] | null;
   bound_oauth_account_id?: string | null;
+  /** Grok 供应商账号绑定的 Grok 平台账号 ID：上游凭据来自该 Grok 账号（OAuth）。 */
+  upstream_grok_account_id?: string | null;
   user_id?: string;
   plan_type?: string;
   subscription_active_until?: string;
@@ -76,6 +83,12 @@ export interface CodexAccount {
   account_name?: string;
   account_structure?: string;
   account_note?: string;
+  /** 账号级出口代理；留空时使用现有全局/API 服务代理。 */
+  egress_proxy_url?: string | null;
+  /** Explicit direct mode; absent on older accounts means follow existing defaults. */
+  egress_proxy_disabled?: boolean;
+  /** Backend-provided safe proxy metadata; never contains credentials. */
+  egress_proxy?: { protocol: string; server?: string; port?: number; name?: string; sourceName?: string; sourceId?: string; itemId?: string; groupId?: string | null; selectedName?: string | null } | null;
   /** Legacy import/export metadata; no longer changes outgoing requests. */
   codex_fingerprint_mode?: CodexFingerprintMode;
   /** Legacy backup metadata; no longer restricts clients or reaches the sidecar. */
@@ -425,6 +438,8 @@ export interface CodexSessionRecord {
   sessionKind?: string;
   title: string;
   cwd: string;
+  /** 官方客户端项目名（可重命名），用于分组标题，缺失时回退到目录名。 */
+  projectName?: string | null;
   updatedAt?: number | null;
   locationCount: number;
   locations: CodexSessionLocation[];
@@ -514,6 +529,12 @@ export interface CodexSessionTrashSummary {
   requestedSessionCount: number;
   trashedSessionCount: number;
   trashedInstanceCount: number;
+  /** 运行中、删除后可能需要在客户端刷新才可见的实例数。 */
+  runningInstanceCount?: number;
+  /** 官方删除未完成、已回退到文件方式删除的实例数。 */
+  officialDeleteFallbackInstanceCount?: number;
+  /** 官方侧边栏索引重建失败的实例数。 */
+  metadataRebuildFailedInstanceCount?: number;
   trashDirs: string[];
   message: string;
 }

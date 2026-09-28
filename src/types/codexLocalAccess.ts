@@ -125,6 +125,8 @@ export interface CodexLocalAccessCollection {
     string,
     CodexLocalAccessImageGenerationPolicy
   >;
+  /** 生图转发账号池：生图与图片编辑请求只交给这些 OAuth 账号执行。 */
+  imageGenerationAccountIds?: string[];
   gatewayMode: CodexLocalAccessGatewayMode;
   upstreamProxyUrl?: string | null;
   routingStrategy: CodexLocalAccessRoutingStrategy;
@@ -136,6 +138,8 @@ export interface CodexLocalAccessCollection {
   debugLogs: boolean;
   immediateSseResponse: boolean;
   maxConcurrentImageRequests: number;
+  maxAccountConcurrency: number;
+  accountConcurrencyWaitMs: number;
   excludedModels: string[];
   sessionAffinity: boolean;
   sessionAffinityTtlMs: number;
@@ -252,16 +256,27 @@ export interface CodexTokenBreakdown {
   unclassified_tokens: number;
 }
 
+export interface CodexLocalAccessProxyRoute {
+  kind: "node" | "proxy" | "direct" | "unknown";
+  name: string;
+}
+
 export interface CodexLocalAccessUsageEvent {
   timestamp: number;
   requestId: string;
   accountId: string;
   email: string;
+  /** 请求执行时记录的代理快照；旧日志不按当前账号绑定回填。 */
+  proxyRoute?: CodexLocalAccessProxyRoute | null;
   apiKeyId: string;
   apiKeyLabel: string;
   /** 多开实例目录 ID（x-cockpit-instance-id） */
   clientInstanceId?: string;
   modelId: string;
+  /** 客户端请求的模型（保留路由命名空间前缀）。 */
+  requestedModel?: string;
+  /** 实际发送给上游的模型；与请求模型相同时前端只展示一行。 */
+  upstreamModel?: string;
   gatewayMode?: CodexLocalAccessGatewayMode | null;
   requestKind: CodexLocalAccessRequestKind;
   serviceTier?: string | null;
@@ -417,6 +432,8 @@ export interface CodexLocalAccessState {
   stats: CodexLocalAccessStats;
   accountHealth: CodexLocalAccessAccountHealth[];
   accountPoolHealth: CodexLocalAccessAccountPoolHealth[];
+  /** 手动恢复后仍在抑制窗口内的账号：异常列表里临时隐藏这些账号的行。 */
+  recoverySuppressedAccountIds?: string[];
   quotaReserveStatus: CodexLocalAccessQuotaReserveStatus | null;
 }
 
@@ -424,8 +441,6 @@ export interface CodexLocalAccessAppendAccountSkipped {
   accountId: string;
   reason:
     | "not_found"
-    | "chat_completions_api_key"
-    | "deepseek_unsupported"
     | "free_restricted"
     | "pending_oauth"
     | "web_session_quota_only";
@@ -490,4 +505,38 @@ export type CodexLocalAccessChatStreamEvent =
 export interface CodexLocalAccessPortCleanupResult {
   killedCount: number;
   state: CodexLocalAccessState;
+}
+
+export type CodexInstanceGatewayKind =
+  | "providerGateway"
+  | "mixedModel"
+  | "boundOauth";
+
+export type CodexInstanceGatewayStatus =
+  | "running"
+  | "unreachable"
+  | "portConflict"
+  | "stopped"
+  | "notStarted";
+
+/** 实例级本地网关的运行态快照，仅用于只读展示。 */
+export interface CodexInstanceGatewayView {
+  id: string;
+  kind: CodexInstanceGatewayKind;
+  runtimeId: string;
+  profileDir: string;
+  instanceId: string;
+  instanceName: string;
+  isDefault: boolean;
+  accountId: string | null;
+  accountLabel: string | null;
+  bindHost: string;
+  port: number | null;
+  baseUrl: string | null;
+  wireApi: string | null;
+  upstreamModels: string[];
+  status: CodexInstanceGatewayStatus;
+  managed: boolean;
+  logApiKeyId: string;
+  lastError: string | null;
 }

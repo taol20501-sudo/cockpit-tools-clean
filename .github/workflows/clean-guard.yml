@@ -14,6 +14,8 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Set up Node.js
         uses: actions/setup-node@v4
@@ -24,4 +26,4 @@ jobs:
         run: node scripts/verify-clean-edition.cjs
 
       - name: Test Clean merge and release regression protections
-        run: node --test scripts/merge-clean-tauri-config.test.cjs scripts/release/check_clean_release.test.cjs
+        run: node --test scripts/merge-clean-tauri-config.test.cjs scripts/merge-clean-text.test.cjs scripts/release/check_clean_release.test.cjs

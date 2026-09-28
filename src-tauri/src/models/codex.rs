@@ -45,6 +45,10 @@ pub struct CodexExperimentalModelDefinition {
     /// None 表示跟随官方推理强度；Some 表示用户自定义可选推理强度集合。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_efforts: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_window: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_compact_token_limit: Option<i64>,
 }
 
 /// Codex config.toml 快捷配置
@@ -84,6 +88,8 @@ pub struct CodexQuickConfig {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum CodexAppSpeed {
+    /// 兼容已移除的自定义档位，旧账号、实例及速度偏好统一回落标准速度。
+    #[serde(alias = "ultrafast")]
     Standard,
     Fast,
 }
@@ -152,10 +158,22 @@ pub struct CodexAccount {
     /// Direct-start model for official DeepSeek Responses (`deepseek-v4-flash` / `deepseek-v4-pro`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_startup_model: Option<String>,
+    /// 网关模式下用于生图转发的 GPT(OAuth) 账号池。
+    ///
+    /// 对话仍由本账号的上游模型处理；生图请求（images 端点与对话内触发的生图）
+    /// 交给这里的账号执行，走 `gpt-5.5` 基础模型 + `gpt-image-2.5` 的原有链路。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub api_image_generation_account_ids: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bound_oauth_account_id: Option<String>,
     #[serde(default, skip_serializing_if = "is_false")]
     pub bound_oauth_use_local_gateway: bool,
+    /// 上游凭据来自 Grok 平台账号（OAuth）的供应商账号。
+    ///
+    /// 该账号自身不带上游 API Key：本地网关会把绑定的 Grok 平台账号的 OAuth
+    /// 访问令牌写成 xai auth 文件交给 sidecar，由 Grok(xAI) 执行器完成上游请求。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream_grok_account_id: Option<String>,
     pub user_id: Option<String>,
     pub plan_type: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -172,6 +190,12 @@ pub struct CodexAccount {
     pub account_structure: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub account_note: Option<String>,
+    /// 账号级出口代理。留空时继续使用全局/API 服务代理。
+    #[serde(default, skip_serializing_if = "Option::is_none", rename(serialize = "egress_proxy"), serialize_with = "crate::modules::codex_account_proxy::serialize_summary")]
+    pub egress_proxy_url: Option<String>,
+    /// Explicit opt-out: bypass account/shared proxies without changing other accounts.
+    #[serde(default)]
+    pub egress_proxy_disabled: bool,
     /// Codex OAuth 设备指纹收敛模式。未设置时按 `off` 处理。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     // Legacy import/export metadata only; never projected into runtime credentials.
@@ -398,7 +422,7 @@ pub struct CodexAuthFile {
     /// Official personal access token auth shape (`at-*` only, no refresh/id token).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub personal_access_token: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_refresh: Option<serde_json::Value>, // 可以是字符串或数字
 }
 
@@ -567,8 +591,10 @@ impl CodexAccount {
             api_vision_routing_model: None,
             api_instance_access_mode: None,
             api_startup_model: None,
+            api_image_generation_account_ids: Vec::new(),
             bound_oauth_account_id: None,
             bound_oauth_use_local_gateway: false,
+            upstream_grok_account_id: None,
             user_id: None,
             plan_type: None,
             subscription_active_until: None,
@@ -579,6 +605,8 @@ impl CodexAccount {
             account_name: None,
             account_structure: None,
             account_note: None,
+            egress_proxy_url: None,
+            egress_proxy_disabled: false,
             codex_fingerprint_mode: None,
             codex_cli_only: false,
             codex_cli_only_allow_app_server: false,
