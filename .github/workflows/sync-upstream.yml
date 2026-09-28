@@ -89,7 +89,7 @@ jobs:
       - name: Run Clean edition regression gate
         run: |
           node scripts/verify-clean-edition.cjs
-          node --test scripts/merge-clean-tauri-config.test.cjs scripts/merge-clean-text.test.cjs scripts/release/check_clean_release.test.cjs
+          node --test scripts/merge-clean-tauri-config.test.cjs scripts/merge-clean-text.test.cjs scripts/release/check_clean_release.test.cjs scripts/release/build_clean_latest_json.test.cjs
 
       - name: Push validated merge to main
         if: steps.merge.outputs.changed == 'true'
@@ -106,7 +106,7 @@ jobs:
           release_run_count="$(
             gh run list \
               --workflow release.yml \
-              --commit "$(git rev-parse HEAD)" \
+              --branch main \
               --limit 20 \
               --json status \
               --jq '[.[] | select(.status != "completed")] | length'

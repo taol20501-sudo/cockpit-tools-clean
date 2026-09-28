@@ -87,7 +87,9 @@ expectIncludes(syncWorkflow, 'GH_REPO: ${{ github.repository }}', '.github/workf
 expectIncludes(syncWorkflow, 'gh workflow run release.yml --ref main --repo "${GH_REPO}"', '.github/workflows/sync-upstream.yml');
 expectIncludes(syncWorkflow, 'node scripts/release/check_clean_release.cjs', '.github/workflows/sync-upstream.yml');
 expectIncludes(syncWorkflow, 'cron: "17 */3 * * *"', '.github/workflows/sync-upstream.yml');
-expectIncludes(syncWorkflow, '--commit "$(git rev-parse HEAD)"', '.github/workflows/sync-upstream.yml');
+expectIncludes(syncWorkflow, '--branch main', '.github/workflows/sync-upstream.yml');
+expectExcludes(releaseWorkflow, 'build-linux', '.github/workflows/release.yml');
+expectIncludes(releaseWorkflow, 'node scripts/release/build_clean_latest_json.cjs', '.github/workflows/release.yml');
 
 for (const [file, content] of topLevelReadmes) {
   expectIncludes(content, 'taol20501-sudo/cockpit-tools-clean/releases', file);

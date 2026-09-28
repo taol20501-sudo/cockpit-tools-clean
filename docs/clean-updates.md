@@ -18,11 +18,14 @@ do not override these Clean safeguards.
 - A release is complete only when its current manifest points to this Clean tag
   and all updater installers, signatures, target manifests and checksums exist.
   A matching version number alone is insufficient.
-- An incomplete release triggers `Release` on Clean main unless the same commit
-  already has an active release run. The workflow builds and uploads installers;
+- An incomplete release triggers `Release` on Clean main unless main already
+  has an active release run. The workflow builds and uploads installers;
   maintainers do not need to download, extract or re-upload upstream installers.
-- Windows EXE/MSI, macOS and Linux are built from Clean source using the existing
-  repository signing secrets. Never commit or print the private signing key.
+- Starting with v1.3.61, only Windows EXE/MSI and macOS packages are published.
+  Linux packages and Linux updater entries are omitted; historical releases remain intact.
+  Retain signatures, target manifests and checksums: they support secure automatic updates.
+  Packages are built from Clean source using the existing repository signing secrets.
+  Never commit or print the private signing key.
 - Each Release ends with the original project attribution, unofficial modified
   edition notice and license information. Keep LICENSE and NOTICE intact.
 

@@ -1,7 +1,7 @@
 // Offline completeness check for the scheduled sync. A version number alone
 // does not prove that a staged release contains all signed installation files.
 const fs = require('node:fs');
-const { TARGET_SPECS } = require('./build_target_latest_json.cjs');
+const { CLEAN_TARGETS, isLinuxAsset } = require('./clean_release_policy.cjs');
 const { validatePlatformEntry } = require('./verify_published_updater_manifests.cjs');
 
 function checkCleanRelease({ version, repo, release, manifest }) {
@@ -17,7 +17,11 @@ function checkCleanRelease({ version, repo, release, manifest }) {
     .filter((asset) => asset.size > 0 && asset.state === 'uploaded')
     .map((asset) => asset.name));
   const required = ['latest.json', 'SHA256SUMS.txt'];
-  for (const target of Object.keys(TARGET_SPECS)) {
+  if (Object.keys(manifest.platforms || {}).some((target) => target.startsWith('linux-'))
+      || [...assets].some(isLinuxAsset)) {
+    throw new Error('Clean releases now contain Windows and macOS only');
+  }
+  for (const target of CLEAN_TARGETS) {
     const url = validatePlatformEntry(manifest.platforms?.[target], target, base, 'Clean latest.json');
     const name = decodeURIComponent(new URL(url).pathname.split('/').pop());
     required.push(name, `${name}.sig`, `latest-${target}.json`);

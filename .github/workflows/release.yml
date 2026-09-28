@@ -664,136 +664,6 @@ jobs:
           gh release upload "${TAG}" "${ASSETS[@]}" --clobber
           echo "Uploaded ${#ASSETS[@]} macOS Universal assets"
 
-  build-linux:
-    name: "🏗️ Build: Linux (${{ matrix.label }})"
-    # Parallel with Windows / macOS after prepare; matrix arches run in parallel.
-    needs:
-      - prepare-release
-    runs-on: ${{ matrix.platform }}
-    permissions:
-      contents: write
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - label: "x86_64"
-            platform: "ubuntu-22.04"
-            targets: "linux-x86_64-appimage,linux-x86_64-deb,linux-x86_64-rpm"
-          - label: "aarch64"
-            platform: "ubuntu-24.04-arm"
-            targets: "linux-aarch64-appimage,linux-aarch64-deb,linux-aarch64-rpm"
-    env:
-      GH_REPO: ${{ github.repository }}
-      VERSION: ${{ needs.prepare-release.outputs.version }}
-    steps:
-      - name: 📥 Checkout repository
-        uses: actions/checkout@v4
-
-      - name: 🐧 Install system dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libwebkit2gtk-4.1-dev build-essential curl wget file libssl-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev patchelf pkg-config libsoup-3.0-dev javascriptcoregtk-4.1 libjavascriptcoregtk-4.1-dev
-          sudo apt-get install -y libnm-dev xdg-utils
-
-      - name: 🦀 Rust setup
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: 🦀 Rust cache
-        uses: swatinem/rust-cache@v2
-        with:
-          key: linux-${{ matrix.label }}-release
-
-      - name: 🐹 Go setup
-        uses: actions/setup-go@v5
-        with:
-          go-version-file: sidecars/cockpit-cliproxy/go.mod
-          cache-dependency-path: sidecars/cockpit-cliproxy/go.sum
-
-      - name: ⚙️ Node.js setup
-        uses: actions/setup-node@v4
-        with:
-          node-version: 20
-          cache: "npm"
-
-      - name: 📦 Install frontend dependencies
-        run: npm install
-
-      - name: 🔄 Sync versions
-        run: npm run sync-version
-
-      - name: 💾 Cache Tauri tooling
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/tauri
-          key: tauri-deps-${{ matrix.platform }}-${{ hashFiles('package-lock.json', '**/Cargo.toml') }}
-          restore-keys: |
-            tauri-deps-${{ matrix.platform }}-
-
-      - name: 🏗️ Build Linux app
-        shell: bash
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
-          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-        run: |
-          set -euo pipefail
-          npx tauri build --ci
-
-      - name: 📥 Download release metadata
-        uses: actions/download-artifact@v4
-        with:
-          name: release-metadata
-          path: release-metadata
-
-      - name: 📦 Stage Linux assets
-        shell: bash
-        run: |
-          set -euo pipefail
-          node scripts/release/stage_release_assets.cjs \
-            --platform linux \
-            --assets-dir "target/release/bundle" \
-            --output-dir "release-assets"
-
-      - name: 📤 Upload Linux assets
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          TAG="v${VERSION}"
-          shopt -s nullglob
-          ASSETS=(release-assets/*)
-          test "${#ASSETS[@]}" -gt 0
-          gh release upload "${TAG}" "${ASSETS[@]}" --clobber
-          echo "Uploaded ${#ASSETS[@]} Linux assets"
-
-      - name: 📤 Build and upload Linux updater manifests
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          node scripts/release/build_target_latest_json.cjs \
-            --version "${VERSION}" \
-            --repo "${GITHUB_REPOSITORY}" \
-            --assets-dir "release-assets" \
-            --notes-file "release-metadata/release-notes.md" \
-            --published-at "$(cat release-metadata/published-at.txt)" \
-            --targets "${{ matrix.targets }}" \
-            --output-dir "target-manifests"
-          gh release upload "v${VERSION}" target-manifests/*.json --clobber
-
-      # Tag URL (not /releases/latest/) — see Windows verify comment.
-      - name: 🔍 Verify published Linux updater manifests
-        shell: bash
-        run: |
-          set -euo pipefail
-          node scripts/release/verify_published_updater_manifests.cjs \
-            --version "${VERSION}" \
-            --repo "${GITHUB_REPOSITORY}" \
-            --targets "${{ matrix.targets }}" \
-            --latest-base-url "https://github.com/${GITHUB_REPOSITORY}/releases/download/v${VERSION}"
-
   finalize-legacy-latest:
     name: 🏁 Finalize Legacy Updater Manifest
     # Wait for every platform build so latest.json is complete.
@@ -803,7 +673,6 @@ jobs:
       - build-macos-aarch64
       - build-macos-x86_64
       - build-macos-universal
-      - build-linux
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -851,7 +720,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          node scripts/release/build_merged_latest_json.cjs \
+          node scripts/release/build_clean_latest_json.cjs \
             --version "${VERSION}" \
             --repo "${GITHUB_REPOSITORY}" \
             --assets-dir "release-assets" \
@@ -868,12 +737,7 @@ jobs:
             .platforms["darwin-x86_64"] and
             .platforms["windows-x86_64"] and
             .platforms["windows-x86_64-nsis"] and
-            .platforms["linux-x86_64-appimage"] and
-            .platforms["linux-x86_64-deb"] and
-            .platforms["linux-x86_64-rpm"] and
-            .platforms["linux-aarch64-appimage"] and
-            .platforms["linux-aarch64-deb"] and
-            .platforms["linux-aarch64-rpm"]
+            ([.platforms | keys[] | select(startswith("linux-"))] | length == 0)
           ' latest.json > /dev/null
           jq -r '.platforms | keys[]' latest.json
 
@@ -894,7 +758,7 @@ jobs:
           node scripts/release/verify_published_updater_manifests.cjs \
             --version "${VERSION}" \
             --repo "${GITHUB_REPOSITORY}" \
-            --targets "darwin-aarch64-app,darwin-x86_64-app,windows-x86_64-msi,windows-x86_64-nsis,linux-x86_64-appimage,linux-x86_64-deb,linux-x86_64-rpm,linux-aarch64-appimage,linux-aarch64-deb,linux-aarch64-rpm" \
+            --targets "darwin-aarch64-app,darwin-x86_64-app,windows-x86_64-msi,windows-x86_64-nsis" \
             --legacy
 
   upload-checksums:

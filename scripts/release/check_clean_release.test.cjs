@@ -12,12 +12,6 @@ function fixture() {
     'darwin-x86_64-app': 'Cockpit.Tools.Clean_x64.app.tar.gz',
     'windows-x86_64-msi': 'Cockpit.Tools.Clean_1.3.49_x64_en-US.msi',
     'windows-x86_64-nsis': 'Cockpit.Tools.Clean_1.3.49_x64-setup.exe',
-    'linux-x86_64-appimage': 'Cockpit.Tools.Clean_1.3.49_amd64.AppImage',
-    'linux-x86_64-deb': 'Cockpit.Tools.Clean_1.3.49_amd64.deb',
-    'linux-x86_64-rpm': 'Cockpit.Tools.Clean-1.3.49-1.x86_64.rpm',
-    'linux-aarch64-appimage': 'Cockpit.Tools.Clean_1.3.49_aarch64.AppImage',
-    'linux-aarch64-deb': 'Cockpit.Tools.Clean_1.3.49_arm64.deb',
-    'linux-aarch64-rpm': 'Cockpit.Tools.Clean-1.3.49-1.aarch64.rpm',
   };
   const manifest = { version, platforms: {} };
   const assetNames = ['latest.json', 'SHA256SUMS.txt'];
@@ -43,6 +37,8 @@ for (const [label, mutate] of [
   ['missing signature', (f) => { f.release.assets = f.release.assets.filter((a) => !a.name.endsWith('.exe.sig')); }],
   ['missing checksums', (f) => { f.release.assets = f.release.assets.filter((a) => a.name !== 'SHA256SUMS.txt'); }],
   ['draft', (f) => { f.release.isDraft = true; }],
+  ['Linux attachment', (f) => { f.release.assets.push({ name: 'latest-linux-x86_64-deb.json', state: 'uploaded', size: 1 }); }],
+  ['Linux platform', (f) => { f.manifest.platforms['linux-x86_64'] = {}; }],
   ['upstream installer URL', (f) => { f.manifest.platforms['windows-x86_64-nsis'].url = f.manifest.platforms['windows-x86_64-nsis'].url.replace(f.repo, 'jlcodes99/cockpit-tools'); }],
 ]) {
   test(`rejects ${label}`, () => {
