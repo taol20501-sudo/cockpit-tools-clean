@@ -21,7 +21,7 @@ A **universal AI IDE account management tool**, currently supporting **Antigravi
 
 🇺🇸 English · 🇨🇳 简体中文 · 繁體中文 · 🇯🇵 日本語 · 🇩🇪 Deutsch · 🇪🇸 Español · 🇫🇷 Français · 🇮🇹 Italiano · 🇰🇷 한국어 · 🇧🇷 Português · 🇷🇺 Русский · 🇹🇷 Türkçe · 🇵🇱 Polski · 🇨🇿 Čeština · 🇸🇦 العربية · 🇻🇳 Tiếng Việt · 🇮🇩 Bahasa Indonesia
 
-**Officially supported platforms**: macOS, Windows, and Linux.
+**Clean edition release platforms**: macOS and Windows. Linux packages are no longer published starting with v1.3.61; historical releases remain available.
 
 ---
 
@@ -329,7 +329,7 @@ Go to the [Cockpit Tools Clean Releases page](https://github.com/taol20501-sudo/
 
 *   **macOS**: `.dmg` (Apple Silicon & Intel)
 *   **Windows**: `.msi` (Recommended) or `.exe`
-*   **Linux**: `.deb` (Debian/Ubuntu), `.rpm`, or `.AppImage` (Universal)
+*   **Linux**: historical packages only; new Clean releases no longer build Linux packages or provide Linux automatic updates.
 
 ### Homebrew note (macOS)
 

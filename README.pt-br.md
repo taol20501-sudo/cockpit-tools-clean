@@ -21,7 +21,7 @@ Uma **ferramenta universal de gerenciamento de contas para IDEs de IA**, atualme
 
 🇺🇸 English · 🇨🇳 简体中文 · 繁體中文 · 🇯🇵 日本語 · 🇩🇪 Deutsch · 🇪🇸 Español · 🇫🇷 Français · 🇮🇹 Italiano · 🇰🇷 한국어 · 🇧🇷 Português · 🇷🇺 Русский · 🇹🇷 Türkçe · 🇵🇱 Polski · 🇨🇿 Čeština · 🇸🇦 العربية · 🇻🇳 Tiếng Việt · 🇮🇩 Bahasa Indonesia
 
-**Plataformas oficialmente suportadas**: macOS, Windows e Linux.
+**Plataformas de lançamento da edição Clean**: macOS e Windows. A partir da v1.3.61, não são publicados novos pacotes Linux; as versões anteriores continuam disponíveis.
 
 ---
 
@@ -293,7 +293,7 @@ Acesse a [página de lançamentos do Cockpit Tools Clean](https://github.com/tao
 
 *   **macOS**: `.dmg` (Apple Silicon & Intel)
 *   **Windows**: `.msi` (Recommended) or `.exe`
-*   **Linux**: `.deb` (Debian/Ubuntu), `.rpm`, or `.AppImage` (Universal)
+*   **Linux**: somente pacotes de versões anteriores; as novas versões Clean não oferecem pacotes nem atualizações automáticas para Linux.
 
 ### Observação sobre o Homebrew (macOS)
 

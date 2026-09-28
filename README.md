@@ -39,7 +39,7 @@ Windows 用户请前往本仓库的 Releases 页面下载 `.exe` 安装程序。
 
 🇺🇸 English · 🇨🇳 简体中文 · 繁體中文 · 🇯🇵 日本語 · 🇩🇪 Deutsch · 🇪🇸 Español · 🇫🇷 Français · 🇮🇹 Italiano · 🇰🇷 한국어 · 🇧🇷 Português · 🇷🇺 Русский · 🇹🇷 Türkçe · 🇵🇱 Polski · 🇨🇿 Čeština · 🇸🇦 العربية · 🇻🇳 Tiếng Việt · 🇮🇩 Bahasa Indonesia
 
-**官方支持平台**：macOS、Windows、Linux。
+**Clean 版发布平台**：macOS、Windows。自 v1.3.61 起不再发布 Linux 安装包，历史版本保留。
 
 ---
 
@@ -343,7 +343,7 @@ Grok CLI 默认实例通常直接沿用官方 `~/.grok` 目录，启动时不设
 
 *   **macOS**: `.dmg` (Apple Silicon & Intel)
 *   **Windows**: `.msi` (推荐) 或 `.exe`
-*   **Linux**: `.deb` (Debian/Ubuntu)、`.rpm` 或 `.AppImage` (通用)
+*   **Linux**: 仅保留历史版本安装包，新版 Clean 不再构建或提供 Linux 自动更新。
 
 ### Homebrew 说明 (macOS)
 
