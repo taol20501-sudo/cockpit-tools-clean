@@ -140,8 +140,10 @@ jobs:
           set -euo pipefail
           TAG="v${{ steps.app_version.outputs.VERSION }}"
           TITLE="Cockpit Tools Clean v${{ steps.app_version.outputs.VERSION }}"
-          if gh release view "${TAG}" > /dev/null 2>&1; then
+          if DRAFT="$(gh release view "${TAG}" --json isDraft --jq '.isDraft' 2>/dev/null)"; then
+            test "${DRAFT}" = "true"
             gh release edit "${TAG}" \
+              --target "${GITHUB_SHA}" \
               --title "${TITLE}" \
               --notes-file release-notes.md
           else

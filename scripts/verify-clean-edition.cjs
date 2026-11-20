@@ -110,6 +110,7 @@ const updaterNotes = read('src/utils/updaterReleaseNotes.ts');
 const topRightStore = read('src/stores/useTopRightAdStore.ts');
 const sponsorStore = read('src/stores/useSponsorStore.ts');
 const apiKeyLinks = read('src/utils/apikeyFunLinks.ts');
+const apiKeyCampaign = read('src/utils/apiKeyFunCampaign.ts');
 
 for (const [file, content] of [
   ['src-tauri/src/modules/announcement.rs', desktopAnnouncement],
@@ -145,6 +146,8 @@ expectIncludes(topRightStore, 'localStorage.removeItem', 'src/stores/useTopRight
 expectExcludes(sponsorStore, 'sponsorService', 'src/stores/useSponsorStore.ts');
 expectExcludes(desktopAnnouncement, 'sponsor_route_sync::sync_sponsor_routes(&sponsors)', 'src-tauri/src/modules/announcement.rs');
 expectExcludes(apiKeyLinks, 'register?aff=cockpit', 'src/utils/apikeyFunLinks.ts');
+expect(/function isApiKeyFunCampaignActive\(\): boolean \{\s*\/\/[^\n]*\n\s*return false;\s*\}/.test(apiKeyCampaign), 'APIKEY.FUN promotion was re-enabled');
+expect(!/\?aff=/i.test(apiKeyCampaign), 'APIKEY.FUN campaign contains a referral link');
 
 if (failures.length > 0) {
   console.error('Clean edition guard failed:');
