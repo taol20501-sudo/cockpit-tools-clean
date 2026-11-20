@@ -18,6 +18,8 @@ do not override these Clean safeguards.
 - A release is complete only when its current manifest points to this Clean tag
   and all updater installers, signatures, target manifests and checksums exist.
   A matching version number alone is insufficient.
+- The release stays in draft while packages and checksums are built. After
+  publication, the workflow verifies the same public URLs used by the app.
 - An incomplete release triggers `Release` on Clean main unless main already
   has an active release run. The workflow builds and uploads installers;
   maintainers do not need to download, extract or re-upload upstream installers.
@@ -36,8 +38,8 @@ do not override these Clean safeguards.
    a component to a new file. Never automatically accept all upstream changes.
 3. Run the Clean guard, merge/release regression tests, frontend tests and build.
 4. Push the validated merge to Clean main, then manually run Sync Upstream.
-5. Wait for Release, Finalize Legacy Updater Manifest and Publish SHA256SUMS to
-   succeed. A newly visible release may still be building. Expand all assets to
+5. Wait for Publish verified Clean release in the Release workflow to succeed.
+   Expand all assets to
    find Windows `*_x64-setup.exe` (the `.exe.sig` file is not an installer).
 
 The automation deliberately stops on conflicts or failed Clean safeguards.

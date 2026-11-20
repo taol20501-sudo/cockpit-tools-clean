@@ -41,7 +41,10 @@ if (files.length === 0) {
 
 console.log(`Running ${files.length} TypeScript test files.`);
 const tsxCli = path.join(__dirname, "..", "node_modules", "tsx", "dist", "cli.mjs");
-const result = spawnSync(process.execPath, [tsxCli, "--test", ...files], {
+// Repeating the checkout prefix for every file can exceed the Windows
+// process command-line limit on hosted runners.
+const testPaths = files.map((file) => path.relative(process.cwd(), file));
+const result = spawnSync(process.execPath, [tsxCli, "--test", "--", ...testPaths], {
   stdio: "inherit",
 });
 
