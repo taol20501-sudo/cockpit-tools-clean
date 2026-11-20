@@ -12,6 +12,7 @@ const parseTsx = (name: string) =>
   ts.createSourceFile(name, readSource(name), ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX);
 const addSource = parseTsx('./CodexAddAccountDialog.tsx');
 const overviewSource = parseTsx('./CodexAccountsOverviewPanel.tsx');
+const editorSource = parseTsx('../components/codex/CodexModelProviderEditor.tsx');
 const styles = postcss.parse(readSource('./CodexAccountDialogs.css'));
 
 function nodes<T extends ts.Node>(root: ts.Node, predicate: (node: ts.Node) => node is T): T[] {
@@ -44,14 +45,37 @@ function renderedElements(node: ts.Node): ts.JsxElement[] {
   return [];
 }
 
+// Resolve only finite literal alternatives; a class must exist in every branch
+// to qualify as a structural boundary. Conditional decoration is not a boundary.
+function stringAlternatives(node: ts.Node): string[] {
+  const current = unwrap(node);
+  if (ts.isStringLiteral(current) || ts.isNoSubstitutionTemplateLiteral(current)) return [current.text];
+  if (ts.isJsxExpression(current) && current.expression) return stringAlternatives(current.expression);
+  if (ts.isConditionalExpression(current)) {
+    const yes = stringAlternatives(current.whenTrue);
+    const no = stringAlternatives(current.whenFalse);
+    return yes.length && no.length ? [...yes, ...no] : [];
+  }
+  if (ts.isTemplateExpression(current)) {
+    let values = [current.head.text];
+    for (const span of current.templateSpans) {
+      const alternatives = stringAlternatives(span.expression);
+      if (!alternatives.length) return [];
+      values = values.flatMap((value) => alternatives.map((alternative) => value + alternative + span.literal.text));
+    }
+    return values;
+  }
+  return [];
+}
+
 function classes(element: ts.JsxElement): string[] {
   const attribute = element.openingElement.attributes.properties.find(
     (candidate): candidate is ts.JsxAttribute =>
       ts.isJsxAttribute(candidate) && candidate.name.getText() === 'className',
   );
-  return attribute?.initializer && ts.isStringLiteral(attribute.initializer)
-    ? attribute.initializer.text.split(/\s+/)
-    : [];
+  const alternatives = attribute?.initializer ? stringAlternatives(attribute.initializer) : [];
+  const classesByBranch = alternatives.map((value) => value.split(/\s+/));
+  return classesByBranch[0]?.filter((value) => classesByBranch.every((branch) => branch.includes(value))) ?? [];
 }
 
 function oneElement(elements: ts.JsxElement[], className: string): ts.JsxElement {
@@ -79,22 +103,23 @@ function actionButton(footer: ts.JsxElement, handler: string): ts.JsxElement {
 }
 
 function dialogFor(source: ts.SourceFile, visibility: string) {
-  const branches = nodes(source, ts.isBinaryExpression).filter((node) =>
-    node.operatorToken.kind === ts.SyntaxKind.AmpersandAmpersandToken &&
-    ts.isIdentifier(unwrap(node.left)) && node.left.getText(source) === visibility,
-  );
+  const branches = nodes(source, ts.isBinaryExpression).filter(node =>
+    node.operatorToken.kind === ts.SyntaxKind.AmpersandAmpersandToken && node.left.getText(source) === visibility,
+  ).map(node => unwrap(node.right)).concat(nodes(source, ts.isConditionalExpression)
+    .filter(node => node.condition.getText(source) === visibility).map(node => unwrap(node.whenTrue)))
+    .filter(node => ts.isCallExpression(node) && node.expression.getText(source) === 'createPortal');
   assert.equal(branches.length, 1, `Expected one ${visibility} visibility branch`);
-  const portal = unwrap(branches[0].right);
+  const portal = branches[0];
   assert.ok(ts.isCallExpression(portal), `${visibility} must render through a portal`);
   assert.equal(portal.expression.getText(source), 'createPortal');
   assert.equal(portal.arguments[1]?.getText(source), 'document.body');
-  const overlay = oneElement(renderedElements(portal.arguments[0]), 'codex-account-dialog-overlay');
+  const overlay = oneElement(renderedElements(portal.arguments[0]), visibility === 'showModal' ? 'modal-overlay' : 'codex-account-dialog-overlay');
   assert.ok(classes(overlay).includes('modal-overlay'));
   assert.ok(!overlay.openingElement.attributes.properties.some((attribute) =>
     ts.isJsxAttribute(attribute) && attribute.name.getText(source) === 'onClick',
   ), 'The backdrop must not acquire a close-on-click handler');
-  const dialog = oneElement(overlay.children.flatMap(renderedElements), 'codex-account-dialog');
-  assert.ok(classes(dialog).includes('modal-content'));
+  const dialog = oneElement(overlay.children.flatMap(renderedElements), visibility === 'showModal' ? 'codex-provider-modal' : 'codex-account-dialog');
+  assert.ok(classes(dialog).includes(visibility === 'showModal' ? 'modal' : 'modal-content'));
   const children = dialog.children.flatMap(renderedElements);
   return {
     dialog,
@@ -107,8 +132,8 @@ function dialogFor(source: ts.SourceFile, visibility: string) {
 const dialogs = [
   {
     name: 'add API Key', source: addSource, visibility: 'showAddModal', submit: 'handleApiKeyLogin',
-    ready: { importing: false, addStatus: 'idle', apiModelCatalogFetching: false, apiKeyInput: 'test-key' },
-    blocked: [{ importing: true }, { addStatus: 'loading' }, { apiModelCatalogFetching: true }, { apiKeyInput: '  ' }],
+    ready: { importing: false, addStatus: 'idle', apiModelCatalogFetching: false, hasApiKeyInput: true },
+    blocked: [{ importing: true }, { addStatus: 'loading' }, { apiModelCatalogFetching: true }, { hasApiKeyInput: false }],
   },
   {
     name: 'quick switch', source: overviewSource, visibility: 'quickSwitchAccountId', submit: 'handleSubmitQuickSwitch',
@@ -116,9 +141,8 @@ const dialogs = [
     blocked: [{ quickSwitchSubmitting: true }, { managedProvidersLoading: true }, { selectedQuickSwitchProvider: null }, { selectedQuickSwitchApiKey: null }],
   },
   {
-    name: 'edit API Key', source: overviewSource, visibility: 'editingApiKeyCredentialsId', submit: 'handleSubmitApiKeyCredentials',
-    ready: { savingApiKeyCredentials: false, editingApiModelCatalogFetching: false, editingApiKeyCredentialsValue: 'test-key' },
-    blocked: [{ savingApiKeyCredentials: true }, { editingApiModelCatalogFetching: true }, { editingApiKeyCredentialsValue: '  ' }],
+    name: 'shared provider editor', source: editorSource, visibility: 'showModal', submit: 'handleSaveProvider',
+    ready: { saving: false }, blocked: [{ saving: true }],
   },
 ];
 
@@ -132,7 +156,7 @@ for (const { name, source, visibility, submit, ready, blocked } of dialogs) {
     assert.equal(submitReferences(body).length, 0, `${submit} must not remain inside the scrolling body`);
     assert.ok(source.statements.some((statement) =>
       ts.isImportDeclaration(statement) && ts.isStringLiteral(statement.moduleSpecifier) &&
-      statement.moduleSpecifier.text === './CodexAccountDialogs.css',
+      statement.moduleSpecifier.text === (visibility === 'showModal' ? './CodexModelProviderEditor.css' : './CodexAccountDialogs.css'),
     ), 'The shared dialog stylesheet must be loaded by this entry');
   });
 
@@ -148,6 +172,8 @@ for (const { name, source, visibility, submit, ready, blocked } of dialogs) {
     let calls = 0;
     const onClick = vm.runInNewContext(`(${attributeExpression(button, 'onClick').getText(source)})`, {
       [submit]: () => { calls += 1; },
+      copyError: { clear() {} },
+      officialUsage: true, usageApiKeyDraft: 'test-admin-key',
     });
     onClick();
     assert.equal(calls, 1, 'The relocated button must invoke the original submit handler once');
@@ -172,20 +198,27 @@ test('structure: the relocated add footer only appears on the API Key tab', () =
   assert.ok(apiKeyOnly, 'The API Key action must not leak onto OAuth/import/token tabs');
 });
 
-test('structure: background scroll locks follow add and both edit visibility states', () => {
-  for (const [source, expected] of [
-    [addSource, 'Boolean(showAddModal)'],
-    [overviewSource, 'Boolean(quickSwitchAccountId||editingApiKeyCredentialsId)'],
+test('background scroll locks follow account dialogs and reset confirmation visibility', () => {
+  for (const [source, hidden, opened] of [
+    [addSource, { showAddModal: false }, [{ showAddModal: true }]],
+    [overviewSource, { quickSwitchAccountId: null, resetCreditConfirmAccount: null },
+      [{ quickSwitchAccountId: 'account' }, { resetCreditConfirmAccount: {} }]],
+    [editorSource, { showModal: false }, [{ showModal: true }]],
   ] as const) {
     assert.ok(source.statements.some((statement) =>
       ts.isImportDeclaration(statement) && ts.isStringLiteral(statement.moduleSpecifier) &&
-      statement.moduleSpecifier.text === '../hooks/useModalScrollLock',
+      statement.moduleSpecifier.text.endsWith('/hooks/useModalScrollLock'),
     ), 'Each entry must import the shared reference-counted scroll lock');
     const hooks = nodes(source, ts.isCallExpression).filter((node) =>
       ts.isIdentifier(node.expression) && node.expression.text === 'useModalScrollLock',
     );
     assert.equal(hooks.length, 1);
-    assert.equal(hooks[0].arguments[0]?.getText(source).replace(/\s+/g, ''), expected);
+    const active = hooks[0].arguments[0]?.getText(source);
+    assert.ok(active);
+    assert.equal(vm.runInNewContext(active, { ...hidden }), false);
+    for (const visible of opened) {
+      assert.equal(vm.runInNewContext(active, { ...hidden, ...visible }), true);
+    }
   }
 });
 
@@ -223,4 +256,15 @@ test('CSS: viewport bounds and one scrolling body keep the shell and action area
 test('CSS: dialog scroll boundaries contain wheel/touch chaining', () => {
   assert.equal(declarations('.codex-account-dialog-overlay')['overscroll-behavior'], 'contain');
   assert.equal(declarations('.modal-content.codex-account-dialog > .modal-body')['overscroll-behavior'], 'contain');
+});
+
+
+test('structure: official authorization is separate from the existing account-add shell', () => {
+  const { dialog } = dialogFor(addSource, 'showAddModal');
+  assert.equal(nodes(dialog, ts.isJsxSelfClosingElement).filter((element) =>
+    element.tagName.getText() === 'ChatGptPlanDialog').length, 0);
+  assert.equal(addSource.text.includes('chatgpt-plan-embedded'), false);
+  assert.equal(addSource.text.includes('chatgptPlan.addTab'), false);
+  const children = dialog.children.flatMap(renderedElements);
+  assert.ok(oneElement(children, 'modal-body'));
 });

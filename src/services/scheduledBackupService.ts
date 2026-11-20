@@ -1,6 +1,7 @@
 import { invoke } from '@tauri-apps/api/core';
-import { DataTransferSelection, exportDataTransferJson } from './dataTransferService';
+import { type DataTransferSelection, exportDataTransferBundle } from './dataTransferService';
 import { ALL_PLATFORM_IDS, PlatformId } from '../types/platform';
+import type { CodexAccount } from '../types/codex';
 import { getWebdavSyncSettings, uploadAutoBackupToWebdav } from './webdavSyncService';
 
 export type AutoBackupMode = 'full' | 'accounts' | 'config';
@@ -10,6 +11,8 @@ export const AUTO_BACKUP_STATE_CHANGED_EVENT = 'auto-backup-state-changed';
 export const BACKUP_DIRECTORY_MIGRATION_PROGRESS_EVENT = 'backup-directory-migration-progress';
 
 const AUTO_BACKUP_INTERVAL_MS = 24 * 60 * 60 * 1000;
+const BACKUP_LOAD_TIMEOUT_MS = 15_000;
+const pendingBackupReads = new Map<string, Promise<unknown>>();
 
 export interface AutoBackupSettings {
   enabled: boolean;
@@ -56,6 +59,7 @@ export interface BackupDirectoryMigrationPreview {
   file_count: number;
   size_bytes: number;
   sources: BackupMigrationSourceSummary[];
+  source_error: string | null;
 }
 
 export type BackupDirectoryMigrationPhase =
@@ -113,6 +117,7 @@ export interface ManagedBackupResult {
 }
 
 function dispatchAutoBackupStateChanged() {
+  pendingBackupReads.clear();
   if (typeof window === 'undefined') return;
   window.dispatchEvent(new Event(AUTO_BACKUP_STATE_CHANGED_EVENT));
 }
@@ -169,9 +174,12 @@ function buildManagedBackupFileName(
   selection: DataTransferSelection,
   trigger: AutoBackupTrigger,
   date: Date,
+  savedMfaPending: boolean,
+  refreshId?: string,
 ): string {
   const mode = selectionToAutoBackupMode(selection);
-  return `cockpit_${trigger}_backup_${mode}_${formatTimestampForFileName(date)}.json`;
+  const refresh = refreshId ? `_token-refresh-${refreshId}` : '';
+  return `cockpit_${trigger}_backup_${mode}_${formatTimestampForFileName(date)}${refresh}${savedMfaPending ? '_mfa-pending' : ''}.json`;
 }
 
 function normalizeDate(value: string | null | undefined): Date | null {
@@ -255,6 +263,36 @@ export async function updateAutoBackupLastRun(lastBackupAt: string | null): Prom
 
 export async function listAutoBackupFiles(): Promise<AutoBackupFileEntry[]> {
   return invoke<AutoBackupFileEntry[]>('list_auto_backup_files');
+}
+
+// A failed file list or usage scan must not discard successfully loaded settings.
+export async function getAutoBackupState() {
+  const [settings, files, usage] = await Promise.allSettled([
+    boundedBackupRead('settings', getAutoBackupSettings),
+    boundedBackupRead('files', listAutoBackupFiles),
+    boundedBackupRead('usage', getBackupUsage),
+  ]);
+  return { settings, files, usage };
+}
+
+function boundedBackupRead<T>(key: string, read: () => Promise<T>): Promise<T> {
+  let pending = pendingBackupReads.get(key) as Promise<T> | undefined;
+  if (!pending) {
+    pending = read();
+    pendingBackupReads.set(key, pending);
+    const release = () => {
+      if (pendingBackupReads.get(key) === pending) pendingBackupReads.delete(key);
+    };
+    void pending.then(release, release);
+  }
+  // Keep the underlying operation single-flight even after the UI times out.
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error('backup_load_timeout')), BACKUP_LOAD_TIMEOUT_MS);
+    pending.then(
+      (value) => { clearTimeout(timer); resolve(value); },
+      (error) => { clearTimeout(timer); reject(error); },
+    );
+  });
 }
 
 export async function readAutoBackupFile(fileName: string): Promise<string> {
@@ -348,17 +386,34 @@ export async function createManagedBackup(params: {
   selection: DataTransferSelection;
   retentionDays: number;
   markAsLastRun?: boolean;
+  refreshedCodexAccount?: CodexAccount;
 }): Promise<ManagedBackupResult> {
   if (!hasSelection(params.selection)) {
     throw new Error('transfer_selection_required');
   }
 
   const executedAt = new Date();
-  const content = await exportDataTransferJson(params.selection);
-  const fileName = buildManagedBackupFileName(params.selection, params.trigger, executedAt);
+  const bundle = await exportDataTransferBundle(params.selection);
+  const fresh = params.refreshedCodexAccount;
+  if (fresh) {
+    const codexAccounts = bundle.accounts?.platforms.codex?.exported_data;
+    const containsFreshToken = Array.isArray(codexAccounts) && codexAccounts.some((item: unknown) => {
+      if (!isRecord(item) || item.id !== fresh.id || !isRecord(item.tokens)) return false;
+      const refreshToken = item.tokens.refresh_token;
+      return typeof refreshToken === 'string' && refreshToken.length > 0 && (
+        refreshToken === fresh.tokens.refresh_token
+        || (typeof item.token_generation === 'number' && item.token_generation > (fresh.token_generation ?? 0))
+      );
+    });
+    if (!containsFreshToken) throw new Error('codex_backup_missing_refreshed_token');
+  }
+  const savedMfaPending = params.selection.includeConfig && bundle.config?.verification_records === undefined;
+  const fileName = buildManagedBackupFileName(
+    params.selection, params.trigger, executedAt, savedMfaPending, fresh ? crypto.randomUUID() : undefined,
+  );
   const path = await invoke<string>('write_auto_backup_file', {
     fileName,
-    content,
+    content: JSON.stringify(bundle, null, 2),
   });
   const deletedFiles = await cleanupAutoBackupFilesInternal(params.retentionDays);
 
@@ -376,6 +431,18 @@ export async function createManagedBackup(params: {
     selection: params.selection,
     trigger: params.trigger,
   };
+}
+
+export async function backUpRefreshedCodexAccount(account: CodexAccount): Promise<ManagedBackupResult | null> {
+  const settings = await getAutoBackupSettings();
+  if (!settings.enabled || !settings.include_accounts) return null;
+  return createManagedBackup({
+    trigger: 'auto',
+    selection: getSelectionFromAutoBackupSettings(settings),
+    retentionDays: settings.retention_days,
+    markAsLastRun: false,
+    refreshedCodexAccount: account,
+  });
 }
 
 export async function runAutoBackupCycle(): Promise<ManagedBackupResult | null> {

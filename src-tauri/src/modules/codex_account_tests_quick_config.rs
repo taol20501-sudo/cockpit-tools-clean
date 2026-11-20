@@ -295,6 +295,8 @@
             model_id: "gpt-5".to_string(),
             display_name: "GPT-5".to_string(),
             reasoning_efforts: None,
+            default_reasoning_effort: None,
+            ultra_reasoning_effort: None,
             context_window: None,
             auto_compact_token_limit: None,
         }];
@@ -372,6 +374,26 @@
     }
 
     #[test]
+    fn retired_catalog_choice_falls_back_only_when_it_is_absent() {
+        for (selected, expected) in [("gpt-5.4", "gpt-5.6-sol"), ("gpt-6.1-sol", "gpt-6.1-sol")] {
+            let dir = make_temp_dir("retired-model-selection");
+            fs::write(dir.join("config.toml"), format!("model = \"{selected}\"\n")).unwrap();
+            fs::write(
+                dir.join(super::CODEX_EXPERIMENTAL_MODEL_POLICY_FILE),
+                "enabled\n",
+            )
+            .unwrap();
+            super::enforce_experimental_model_policy_for_dir(&dir).unwrap();
+            let config = fs::read_to_string(dir.join("config.toml"))
+                .unwrap()
+                .parse::<toml_edit::Document>()
+                .unwrap();
+            assert_eq!(config["model"].as_str(), Some(expected));
+            fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    #[test]
     fn quick_config_initializes_full_visible_model_catalog() {
         let base_dir = make_temp_dir("codex-experimental-enable-test");
         fs::write(base_dir.join("config.toml"), "model = \"gpt-5.6-sol\"\n").expect("write config");
@@ -385,11 +407,11 @@
             result.experimental_model_catalog_reset_default_model_id.as_deref(),
             Some("gpt-5.6-sol")
         );
-        let expected_shipped_models = super::SHIPPED_VISIBLE_CODEX_MODEL_IDS
-            .iter()
-            .filter(|model_id| !crate::modules::codex_wakeup::is_codex_model_before_5_5(model_id))
-            .copied()
-            .collect::<Vec<_>>();
+        let expected_shipped_models = [
+            "gpt-6.1-sol", "gpt-6.2-sol", "gpt-6.2-astra", "gpt-6.1-terra",
+            "gpt-6-astra", "gpt-6-sol", "gpt-6-luna", "gpt-5.6-sol", "gpt-5.6-terra",
+            "gpt-5.6-luna", "gpt-reserve",
+        ];
         assert_eq!(
             result
                 .experimental_model_catalog_reset_models
@@ -410,24 +432,14 @@
         )
         .expect("parse generated catalog");
         let models = generated["models"].as_array().expect("models array");
-        assert_eq!(
-            models[0].get("slug").and_then(serde_json::Value::as_str),
-            Some("gpt-6-astra")
-        );
-        for expected in [
-            "gpt-6-astra",
-            "gpt-6-sol",
-            "gpt-6-luna",
-            "gpt-5.6-sol",
-            "gpt-5.6-terra",
-            "gpt-5.6-luna",
-            "gpt-5.5",
-        ] {
-            assert!(models.iter().any(|model| {
-                model.get("slug").and_then(serde_json::Value::as_str) == Some(expected)
-            }));
-        }
+        let ordered: Vec<_> = models
+            .iter()
+            .filter_map(|model| model["slug"].as_str())
+            .take(10)
+            .collect();
+        assert_eq!(ordered, expected_shipped_models[..10]);
         for legacy in [
+            "gpt-5.5",
             "gpt-5.4",
             "gpt-5.4-mini",
             "gpt-5.3-codex",
@@ -483,7 +495,8 @@
         .expect("enable experimental catalog");
 
         let mut previous_defaults = super::default_experimental_model_definitions(&base_dir);
-        previous_defaults.retain(|model| model.model_id != "gpt-6-astra");
+        previous_defaults.retain(|model| model.model_id != "gpt-6-astra" && model.model_id != "gpt-6.1-sol"
+            && !crate::modules::codex_model_catalog::GPT_6_2_MODELS.contains(&model.model_id.as_str()));
         let previous_config = serde_json::json!({
             "version": super::EXPERIMENTAL_MODEL_CATALOG_CONFIG_VERSION,
             "models": previous_defaults,
@@ -514,7 +527,7 @@
             .as_array()
             .expect("models")
             .first()
-            .is_some_and(|model| model["slug"] == "gpt-6-astra"));
+            .is_some_and(|model| model["slug"] == "gpt-6.2-sol"));
         assert!(generated["models"]
             .as_array()
             .expect("models")
@@ -538,6 +551,26 @@
     }
 
     #[test]
+    fn gpt_6_1_sol_catalog_migration_preserves_customization() {
+        let dir = make_temp_dir("codex-gpt61-migration");
+        let mut previous = super::default_experimental_model_definitions(&dir);
+        previous.retain(|model| model.model_id != "gpt-6.1-sol"
+            && !crate::modules::codex_model_catalog::GPT_6_2_MODELS.contains(&model.model_id.as_str()));
+        let upgraded =
+            super::maybe_add_gpt_6_1_sol_to_previous_shipped_model_definitions(&dir, previous.clone());
+        assert_eq!(upgraded[0].model_id, "gpt-6.1-sol");
+        let again =
+            super::maybe_add_gpt_6_1_sol_to_previous_shipped_model_definitions(&dir, upgraded.clone());
+        assert_eq!(again.len(), upgraded.len());
+        previous.retain(|model| model.model_id != "gpt-6-luna");
+        let curated =
+            super::maybe_add_gpt_6_1_sol_to_previous_shipped_model_definitions(&dir, previous.clone());
+        assert_eq!(curated.len(), previous.len());
+        assert!(!curated.iter().any(|model| model.model_id == "gpt-6.1-sol"));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn account_switch_adds_gpt_6_sol_luna_only_to_unmodified_shipped_catalog() {
         let base_dir = make_temp_dir("codex-gpt-6-sol-luna-visible-model-migration-test");
         fs::write(base_dir.join("config.toml"), "model = \"gpt-5.6-sol\"\n")
@@ -551,7 +584,8 @@
         // 上一版随包发布的自动清单：只有 astra，没有 gpt-6-sol / gpt-6-luna。
         let mut previous_defaults = super::default_experimental_model_definitions(&base_dir);
         previous_defaults.retain(|model| {
-            model.model_id != "gpt-6-sol" && model.model_id != "gpt-6-luna"
+            model.model_id != "gpt-6-sol" && model.model_id != "gpt-6-luna" && model.model_id != "gpt-6.1-sol"
+                && !crate::modules::codex_model_catalog::GPT_6_2_MODELS.contains(&model.model_id.as_str())
         });
         let previous_config = serde_json::json!({
             "version": super::EXPERIMENTAL_MODEL_CATALOG_CONFIG_VERSION,
@@ -587,8 +621,8 @@
             .filter_map(|model| model["slug"].as_str())
             .collect::<Vec<_>>();
         assert_eq!(
-            slugs.iter().take(3).copied().collect::<Vec<_>>(),
-            vec!["gpt-6-astra", "gpt-6-sol", "gpt-6-luna"]
+            slugs.iter().take(7).copied().collect::<Vec<_>>(),
+            crate::modules::codex_model_catalog::RECOMMENDED_FRONTIER_MODELS
         );
         let luna_index = slugs.iter().position(|slug| *slug == "gpt-6-luna");
         let legacy_sol_index = slugs.iter().position(|slug| *slug == "gpt-5.6-sol");
@@ -598,7 +632,7 @@
 
         // 用户手工删掉这两个模型的精修清单不再被自动补回。
         let mut curated = super::default_experimental_model_definitions(&base_dir);
-        curated.retain(|model| model.model_id != "gpt-6-sol" && model.model_id != "gpt-6-luna");
+        curated.retain(|model| model.model_id != "gpt-6-sol" && model.model_id != "gpt-6-luna" && model.model_id != "gpt-6.1-sol");
         super::save_model_catalog_for_base_dir_preserving_context(
             &base_dir,
             true,
@@ -640,6 +674,8 @@
             model_id: model_id.to_string(),
             display_name: model_id.to_string(),
             reasoning_efforts: None,
+            default_reasoning_effort: None,
+            ultra_reasoning_effort: None,
             context_window: None,
             auto_compact_token_limit: None,
         })
@@ -671,7 +707,7 @@
                 .expect("read repaired catalog"),
         )
         .expect("parse repaired catalog");
-        assert_eq!(catalog_config["models"][0]["model_id"], "gpt-6-astra");
+        assert_eq!(catalog_config["models"][0]["model_id"], "gpt-6.1-sol");
         assert_eq!(catalog_config["default_model_id"], "gpt-5.6-sol");
         assert!(catalog_config["migrations"]
             .as_array()
@@ -764,6 +800,8 @@
                 model_id: "custom-model-a".to_string(),
                 display_name: "Custom Model A".to_string(),
                 reasoning_efforts: None,
+                default_reasoning_effort: None,
+                ultra_reasoning_effort: None,
                 context_window: None,
                 auto_compact_token_limit: None,
             },
@@ -771,6 +809,8 @@
                 model_id: "custom-model-b".to_string(),
                 display_name: "Custom Model B".to_string(),
                 reasoning_efforts: None,
+                default_reasoning_effort: None,
+                ultra_reasoning_effort: None,
                 context_window: None,
                 auto_compact_token_limit: None,
             },
@@ -790,6 +830,8 @@
             model_id: "gpt-reserve".to_string(),
             display_name: "GPT-5.6 Reserve".to_string(),
             reasoning_efforts: None,
+            default_reasoning_effort: None,
+            ultra_reasoning_effort: None,
             context_window: None,
             auto_compact_token_limit: None,
         });
@@ -799,7 +841,7 @@
                 .experimental_model_catalog_reset_models
                 .first()
                 .map(|model| model.model_id.as_str()),
-            Some("gpt-6-astra")
+            Some("gpt-6.1-sol")
         );
         assert!(!result
             .experimental_model_catalog_reset_models
@@ -837,6 +879,8 @@
             model_id: "custom-reasoning-model".to_string(),
             display_name: "Custom Reasoning Model".to_string(),
             reasoning_efforts: Some(vec!["low".to_string(), "high".to_string()]),
+            default_reasoning_effort: None,
+            ultra_reasoning_effort: None,
             context_window: None,
             auto_compact_token_limit: None,
         }];
@@ -879,6 +923,8 @@
             model_id: "gpt-5.6-sol".to_string(),
             display_name: "5.6 Sol".to_string(),
             reasoning_efforts: None,
+            default_reasoning_effort: None,
+            ultra_reasoning_effort: None,
             context_window: None,
             auto_compact_token_limit: None,
         }];
@@ -971,6 +1017,8 @@
             model_id: "gpt-5.6-sol".into(),
             display_name: "Sol".into(),
             reasoning_efforts: None,
+            default_reasoning_effort: None,
+            ultra_reasoning_effort: None,
             context_window: Some(800_000),
             auto_compact_token_limit: Some(700_000),
         };
@@ -1014,7 +1062,7 @@
         ] {
             let definition = CodexExperimentalModelDefinition {
                 model_id: "custom-model".into(), display_name: "Custom".into(),
-                reasoning_efforts: None, context_window: window, auto_compact_token_limit: compact,
+                reasoning_efforts: None, default_reasoning_effort: None, ultra_reasoning_effort: None, context_window: window, auto_compact_token_limit: compact,
             };
             assert_eq!(super::normalize_experimental_model_definitions(vec![definition]).unwrap_err(), error);
         }
@@ -1023,7 +1071,7 @@
         let derived = super::normalize_experimental_model_definitions(vec![
             CodexExperimentalModelDefinition {
                 model_id: "custom-model".into(), display_name: "Custom".into(),
-                reasoning_efforts: None, context_window: Some(516_000),
+                reasoning_efforts: None, default_reasoning_effort: None, ultra_reasoning_effort: None, context_window: Some(516_000),
                 auto_compact_token_limit: None,
             },
         ])
@@ -1040,6 +1088,8 @@
             model_id: "custom-model".to_string(),
             display_name: "Custom Model".to_string(),
             reasoning_efforts: None,
+            default_reasoning_effort: None,
+            ultra_reasoning_effort: None,
             context_window: None,
             auto_compact_token_limit: None,
         }];
@@ -1059,6 +1109,8 @@
             model_id: "gpt-reserve".to_string(),
             display_name: "GPT-5.6 Reserve".to_string(),
             reasoning_efforts: None,
+            default_reasoning_effort: None,
+            ultra_reasoning_effort: None,
             context_window: None,
             auto_compact_token_limit: None,
         });
@@ -1090,6 +1142,8 @@
             model_id: "custom-model".to_string(),
             display_name: "Custom Model".to_string(),
             reasoning_efforts: None,
+            default_reasoning_effort: None,
+            ultra_reasoning_effort: None,
             context_window: None,
             auto_compact_token_limit: None,
         }];
@@ -1122,6 +1176,8 @@
             model_id: "custom-model".to_string(),
             display_name: "Custom Model".to_string(),
             reasoning_efforts: None,
+            default_reasoning_effort: None,
+            ultra_reasoning_effort: None,
             context_window: None,
             auto_compact_token_limit: None,
         }];
@@ -1478,6 +1534,8 @@
             model_id: "bad model id".to_string(),
             display_name: String::new(),
             reasoning_efforts: Some(vec!["not-a-real-effort".to_string()]),
+            default_reasoning_effort: None,
+            ultra_reasoning_effort: None,
             context_window: None,
             auto_compact_token_limit: None,
         }];
@@ -1516,9 +1574,7 @@
             .parse::<toml_edit::Document>()
             .expect("parse config");
 
-        assert!(super::remove_provider_managed_model_catalog_from_doc(
-            &mut doc
-        ));
+        assert!(super::remove_provider_managed_model_catalog_from_doc(Path::new("."), &mut doc));
         assert!(doc.get("model_catalog_json").is_none());
     }
 
@@ -1762,6 +1818,31 @@ wire_api = "responses"
     }
 
     /// 一次性迁移：把历史遗留的「模型管理」关闭并恢复跟随官方模型目录，
+    #[test]
+    fn model_management_default_off_does_not_remove_the_active_api_service_catalog() {
+        let profile = tempfile::tempdir().unwrap();
+        let base_dir = profile.path();
+        let catalog = base_dir.join(super::CODEX_MANAGED_MODEL_CATALOG_FILE);
+        let config = base_dir.join("config.toml");
+        let mut doc = toml_edit::Document::new();
+        doc["model_provider"] = toml_edit::value("codex_local_access");
+        doc["model_catalog_json"] = toml_edit::value(catalog.to_str().unwrap());
+        doc["model_providers"]["codex_local_access"]["base_url"] =
+            toml_edit::value("http://127.0.0.1:53823/v1");
+        let config_contents = doc.to_string();
+        fs::write(&config, &config_contents).unwrap();
+        fs::write(&catalog, r#"{"models":[]}"#).unwrap();
+
+        assert!(!super::migrate_model_management_default_off_once(base_dir).unwrap());
+        assert_eq!(fs::read_to_string(&config).unwrap(), config_contents);
+        assert!(catalog.is_file());
+
+        doc["model_provider"] = toml_edit::value("openai");
+        fs::write(&config, doc.to_string()).unwrap();
+        assert!(super::migrate_model_management_default_off_once(base_dir).unwrap());
+        assert!(!catalog.exists());
+    }
+
     /// 只执行一次，且保留用户已保存的模型清单（重新开启后仍可用）。
     #[test]
     fn model_management_default_off_migration_runs_once_and_keeps_definitions() {

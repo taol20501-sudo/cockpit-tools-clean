@@ -1,9 +1,10 @@
+import { hydrateDurableUiSettings } from '../utils/durableUiSettings';
 import { useEffect, useState } from 'react';
 import {
   ANTIGRAVITY_RUNTIME_TARGET_CHANGED_EVENT,
-  ANTIGRAVITY_RUNTIME_TARGET_STORAGE_KEY,
   AntigravityRuntimeTarget,
   getAntigravityRuntimeTarget,
+  hasSavedAntigravityRuntimeTarget,
   normalizeAntigravityRuntimeTarget,
   setAntigravityRuntimeTarget,
 } from '../utils/antigravityRuntimeTarget';
@@ -18,21 +19,12 @@ export function useAntigravityRuntimeTarget(): AntigravityRuntimeTarget {
 
   useEffect(() => {
     const handleChange = (event: Event) => {
-      if (event instanceof StorageEvent) {
-        if (event.key !== ANTIGRAVITY_RUNTIME_TARGET_STORAGE_KEY) {
-          return;
-        }
-        setTarget(normalizeAntigravityRuntimeTarget(event.newValue));
-        return;
-      }
       setTarget(normalizeAntigravityRuntimeTarget((event as CustomEvent).detail));
     };
 
     window.addEventListener(ANTIGRAVITY_RUNTIME_TARGET_CHANGED_EVENT, handleChange);
-    window.addEventListener('storage', handleChange);
     return () => {
       window.removeEventListener(ANTIGRAVITY_RUNTIME_TARGET_CHANGED_EVENT, handleChange);
-      window.removeEventListener('storage', handleChange);
     };
   }, []);
 
@@ -42,18 +34,19 @@ export function useAntigravityRuntimeTarget(): AntigravityRuntimeTarget {
     }
     antigravityRuntimeTargetAutoResolveStarted = true;
 
-    const initialTarget = getAntigravityRuntimeTarget();
-    void resolvePreferredAntigravityRuntimeTarget(initialTarget)
-      .then((preferredTarget) => {
-        if (preferredTarget === initialTarget) {
-          return;
-        }
-        if (getAntigravityRuntimeTarget() !== initialTarget) {
-          return;
-        }
+    // Only discover a fallback after the Rust configuration has been read.
+    void hydrateDurableUiSettings().then(async () => {
+      if (hasSavedAntigravityRuntimeTarget()) return;
+      const initialTarget = getAntigravityRuntimeTarget();
+      const preferredTarget = await resolvePreferredAntigravityRuntimeTarget(initialTarget);
+      if (!hasSavedAntigravityRuntimeTarget()
+          && preferredTarget !== initialTarget
+          && getAntigravityRuntimeTarget() === initialTarget) {
         setAntigravityRuntimeTarget(preferredTarget);
-      })
+      }
+    })
       .catch((error) => {
+        antigravityRuntimeTargetAutoResolveStarted = false;
         console.warn('[AntigravityRuntime] failed to resolve preferred target:', error);
       });
   }, []);

@@ -28,6 +28,7 @@ const REFRESH_TIMEOUT: Duration = Duration::from_secs(120);
 
 type RefreshResult = Result<CodexQuota, String>;
 type Waiter = oneshot::Sender<RefreshResult>;
+type RefreshOperation = Box<dyn FnOnce(String) -> futures_util::future::BoxFuture<'static, RefreshResult> + Send>;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum RefreshPriority {
@@ -40,6 +41,7 @@ struct PendingRefresh {
     priority: RefreshPriority,
     started: bool,
     generation: u64,
+    operation: Option<RefreshOperation>,
 }
 
 static IN_FLIGHT: LazyLock<Mutex<HashMap<String, PendingRefresh>>> =
@@ -72,7 +74,8 @@ fn normalize_account_id(account_id: &str) -> Result<String, String> {
 ///
 /// `runtime_snapshot` is used by batch refreshes so all accounts in that batch
 /// reuse one process snapshot. If a duplicate request arrives with another
-/// snapshot, the first queued request remains authoritative.
+/// snapshot, the first queued request remains authoritative unless an explicit
+/// manual refresh takes over before the worker starts.
 pub(crate) async fn refresh_account(
     account_id: &str,
     runtime_snapshot: Option<std::sync::Arc<CodexQuotaRuntimeSnapshot>>,
@@ -96,13 +99,32 @@ pub(crate) async fn refresh_account_background(
     .await
 }
 
+/// Activity synchronization shares the same per-account flight and background
+/// permit, but never waits for optional subscription enrichment.
+pub(crate) async fn refresh_active_account(
+    account_id: &str,
+    runtime: Option<std::sync::Arc<CodexQuotaRuntimeSnapshot>>,
+) -> RefreshResult {
+    refresh_with_operation(account_id, RefreshPriority::Background, Some(background_epoch()), |id| async move {
+        crate::modules::codex_device_restrictions::ensure_allowed(
+            &id, crate::modules::codex_device_restrictions::QUOTA).await?;
+        Box::pin(crate::modules::codex_quota::refresh_active_account_quota(&id, runtime)).await
+    }).await
+}
+
 pub(crate) async fn refresh_account_with_priority(
     account_id: &str,
     runtime_snapshot: Option<std::sync::Arc<CodexQuotaRuntimeSnapshot>>,
     priority: RefreshPriority,
     epoch: Option<u64>,
 ) -> RefreshResult {
-    refresh_with_operation(account_id, priority, epoch, |account_id| async move {
+    refresh_with_operation(account_id, priority, epoch, move |account_id| async move {
+        // Check on the shared worker: enqueueing and joining a flight must not wait
+        // for storage, and cancelled/duplicate callers must not repeat the read.
+        if priority == RefreshPriority::Background {
+            crate::modules::codex_device_restrictions::ensure_allowed(
+                &account_id, crate::modules::codex_device_restrictions::QUOTA).await?;
+        }
         Box::pin(crate::modules::codex_quota::refresh_account_quota_unqueued(
             &account_id,
             runtime_snapshot.as_deref(),
@@ -123,6 +145,9 @@ where
     Fut: Future<Output = RefreshResult> + Send + 'static,
 {
     let account_id = normalize_account_id(account_id)?;
+    let defer_operation = move || -> RefreshOperation {
+        Box::new(move |id| Box::pin(async move { operation(id).await }))
+    };
     let (receiver, leader, generation, changed) = {
         let (sender, receiver) = oneshot::channel();
         let mut pending = IN_FLIGHT
@@ -150,6 +175,7 @@ where
             item.waiters.push(sender);
             if promoted {
                 item.priority = RefreshPriority::Manual;
+                item.operation = Some(defer_operation());
             }
             (receiver, false, item.generation, promoted)
         } else {
@@ -178,6 +204,7 @@ where
                     priority,
                     started: false,
                     generation,
+                    operation: Some(defer_operation()),
                 },
             );
             (receiver, true, generation, true)
@@ -189,7 +216,7 @@ where
     }
 
     if leader {
-        tauri::async_runtime::spawn(run_refresh(account_id, generation, operation));
+        tauri::async_runtime::spawn(run_refresh(account_id, generation));
     }
 
     receiver
@@ -197,14 +224,10 @@ where
         .unwrap_or_else(|_| Err(message("interrupted")))
 }
 
-async fn run_refresh<F, Fut>(account_id: String, generation: u64, operation: F)
-where
-    F: FnOnce(String) -> Fut,
-    Fut: Future<Output = RefreshResult>,
-{
+async fn run_refresh(account_id: String, generation: u64) {
     let result = async {
         let deadline = tokio::time::Instant::now() + QUEUE_WAIT_TIMEOUT;
-        let permit = loop {
+        let (permit, operation) = loop {
             // Register before inspecting state: a promotion/cancellation between
             // the state read and select must not be lost.
             let notified = QUEUE_CHANGED.notified();
@@ -238,24 +261,20 @@ where
                     }
                 }
             };
-            let still_current = {
+            let operation = {
                 let mut pending = IN_FLIGHT
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
                 match pending.get_mut(&account_id) {
-                    Some(item) if item.generation == generation => {
-                        if item.priority == priority {
-                            item.started = true;
-                            true
-                        } else {
-                            false
-                        }
+                    Some(item) if item.generation == generation && item.priority == priority => {
+                        item.started = true;
+                        item.operation.take()
                     }
-                    _ => false,
+                    _ => None,
                 }
             };
-            if still_current {
-                break permit;
+            if let Some(operation) = operation {
+                break (permit, operation);
             }
             drop(permit);
         };

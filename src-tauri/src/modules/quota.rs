@@ -19,15 +19,17 @@ const BACKOFF_BASE_MS: u64 = 500;
 const BACKOFF_MAX_MS: u64 = 4000;
 const ONBOARD_POLL_DELAY_MS: u64 = 500;
 const API_CACHE_DIR: &str = "cache/quota_api_v1_desktop";
-const API_CACHE_VERSION: u8 = 1;
+const API_CACHE_VERSION: u8 = 2;
 const API_CACHE_TTL_MS: i64 = 60_000;
-const DEFAULT_CLOUD_CODE_IDE_VERSION: &str = "1.20.5";
+const DEFAULT_CLOUD_CODE_IDE_VERSION: &str = "2.25.0";
+const DEFAULT_CLOUD_CODE_CL: &str = "1003475615";
 const DEFAULT_LOAD_CODE_ASSIST_UA_OS: &str = "windows";
 const DEFAULT_LOAD_CODE_ASSIST_UA_ARCH: &str = "amd64";
 const DEFAULT_GOOGLE_API_NODEJS_CLIENT_VERSION: &str = "10.3.0";
-const DEFAULT_CLOUD_CODE_USER_AGENT: &str = "antigravity/1.20.5 windows/amd64";
+const DEFAULT_CLOUD_CODE_USER_AGENT: &str =
+    "antigravity/2.25.0 (aidev_client; os_type=windows; arch=amd64; cl=1003475615)";
 const DEFAULT_LOAD_CODE_ASSIST_USER_AGENT: &str =
-    "antigravity/1.20.5 windows/amd64 google-api-nodejs-client/10.3.0";
+    "antigravity/2.25.0 windows/amd64 google-api-nodejs-client/10.3.0";
 const DEFAULT_X_GOOG_API_CLIENT_NODE_VERSION: &str = "22.21.1";
 
 #[derive(Debug, Clone, Default)]
@@ -42,6 +44,15 @@ impl QuotaCloudCodeContext {
             preferred_project_id: valid_cloud_code_project_id(token.project_id.as_deref())
                 .map(str::to_string),
             is_gcp_tos: token.is_gcp_tos.unwrap_or(false),
+        }
+    }
+
+    fn after_project_discovery(&self, metadata: &ProjectMetadataResult) -> Self {
+        Self {
+            preferred_project_id: valid_cloud_code_project_id(metadata.project_id.as_deref())
+                .map(str::to_owned)
+                .or_else(|| self.preferred_project_id.clone()),
+            is_gcp_tos: metadata.is_gcp_tos.unwrap_or(self.is_gcp_tos),
         }
     }
 }
@@ -80,13 +91,83 @@ fn env_quality_is_insider_or_dev() -> bool {
     )
 }
 
-fn official_antigravity_version_for_cloud_code() -> String {
-    let version = crate::modules::wakeup_gateway::official_antigravity_app_version();
-    let trimmed = version.trim();
-    if trimmed.is_empty() {
-        return DEFAULT_CLOUD_CODE_IDE_VERSION.to_string();
+fn parse_semver_tuple(version: &str) -> Option<(u32, u32, u32)> {
+    let mut parts = version
+        .trim()
+        .trim_start_matches('v')
+        .split(|c: char| !c.is_ascii_digit())
+        .filter(|s| !s.is_empty());
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next().unwrap_or("0").parse().ok()?;
+    let patch = parts.next().unwrap_or("0").parse().ok()?;
+    Some((major, minor, patch))
+}
+
+fn resolve_cloud_code_version(
+    official_version: &str,
+    cached_installed_version: impl FnOnce() -> Option<String>,
+) -> String {
+    let installed;
+    let version = if official_version.trim().is_empty() {
+        installed = cached_installed_version().unwrap_or_default();
+        installed.trim()
+    } else {
+        official_version.trim()
+    };
+    match (
+        parse_semver_tuple(version),
+        parse_semver_tuple(DEFAULT_CLOUD_CODE_IDE_VERSION),
+    ) {
+        (Some(detected), Some(minimum)) if detected >= minimum => version.to_string(),
+        _ => DEFAULT_CLOUD_CODE_IDE_VERSION.to_string(),
     }
-    trimmed.to_string()
+}
+
+// Quota reads use cached metadata immediately; native process/file probes run off-thread.
+static VERSION_PROBE: std::sync::Mutex<(bool, Option<std::time::Instant>)> =
+    std::sync::Mutex::new((false, None));
+
+fn schedule_installed_version_probe() {
+    let Ok(mut state) = VERSION_PROBE.try_lock() else {
+        return;
+    };
+    if state.0
+        || state
+            .1
+            .is_some_and(|started| started.elapsed() < std::time::Duration::from_secs(60))
+    {
+        return;
+    }
+    *state = (true, Some(std::time::Instant::now()));
+    drop(state);
+    tauri::async_runtime::spawn(async {
+        let result = tauri::async_runtime::spawn_blocking(|| {
+            crate::commands::system::resolve_antigravity_installed_version_info_for_target(None)
+        })
+        .await;
+        if let Err(error) = result {
+            modules::logger::log_warn(&format!("[Quota] Installed version probe failed: {error}"));
+        }
+        if let Ok(mut state) = VERSION_PROBE.lock() {
+            state.0 = false;
+        }
+    });
+}
+
+fn official_antigravity_version_for_cloud_code() -> String {
+    resolve_cloud_code_version(
+        &crate::modules::wakeup_gateway::official_antigravity_app_version(),
+        || {
+            let cached =
+                crate::commands::system::get_cached_antigravity_installed_version_info_for_target(
+                    None,
+                );
+            if cached.is_none() {
+                schedule_installed_version_probe();
+            }
+            cached.map(|info| info.version)
+        },
+    )
 }
 
 fn load_code_assist_user_agent_os() -> &'static str {
@@ -165,14 +246,17 @@ fn build_load_code_assist_user_agent() -> String {
     )
 }
 
-fn build_cloud_code_user_agent() -> String {
+pub(crate) fn build_cloud_code_user_agent() -> String {
     let ide_version = official_antigravity_version_for_cloud_code();
     let os = load_code_assist_user_agent_os();
     let arch = load_code_assist_user_agent_arch();
     if ide_version.trim().is_empty() || os.trim().is_empty() || arch.trim().is_empty() {
         return DEFAULT_CLOUD_CODE_USER_AGENT.to_string();
     }
-    format!("antigravity/{} {}/{}", ide_version, os, arch)
+    format!(
+        "antigravity/{} (aidev_client; os_type={}; arch={}; cl={})",
+        ide_version, os, arch, DEFAULT_CLOUD_CODE_CL
+    )
 }
 
 fn load_code_assist_user_agent() -> String {
@@ -257,7 +341,7 @@ fn build_cloud_code_metadata(duet_project: Option<&str>) -> Value {
     Value::Object(metadata)
 }
 
-fn resolve_cloud_code_base_url(ctx: &QuotaCloudCodeContext) -> String {
+pub(crate) fn resolve_cloud_code_base_url(ctx: &QuotaCloudCodeContext) -> String {
     select_cloud_code_base_url(
         ctx,
         env_var_trimmed("ANTIGRAVITY_CLOUD_CODE_URL_OVERRIDE").as_deref(),
@@ -422,6 +506,11 @@ pub struct QuotaFetchError {
     pub validation_url: Option<String>,
 }
 
+pub(crate) fn is_explicit_quota_denial(reason: Option<&str>, validation_url: Option<&str>) -> bool {
+    matches!(reason, Some("VALIDATION_REQUIRED" | "SUBSCRIPTION_REQUIRED"))
+        || validation_url.is_some_and(|url| !url.trim().is_empty())
+}
+
 pub fn format_google_validation_url(raw_url: &str, email: &str) -> String {
     let email = email.trim();
     if raw_url.trim().is_empty() || email.is_empty() {
@@ -443,10 +532,16 @@ pub fn format_google_validation_url(raw_url: &str, email: &str) -> String {
 
             let mut pairs: Vec<(String, String)> = parsed.query_pairs().into_owned().collect();
             let has_valid_authuser = pairs.iter().any(|(k, v)| {
-                k == "authuser" && !v.trim().is_empty() && !v.trim().chars().all(|c| c.is_ascii_digit())
+                k == "authuser"
+                    && !v.trim().is_empty()
+                    && !v.trim().chars().all(|c| c.is_ascii_digit())
             });
-            let has_login_hint = pairs.iter().any(|(k, v)| k == "login_hint" && !v.trim().is_empty());
-            let has_email = pairs.iter().any(|(k, v)| k == "Email" && !v.trim().is_empty());
+            let has_login_hint = pairs
+                .iter()
+                .any(|(k, v)| k == "login_hint" && !v.trim().is_empty());
+            let has_email = pairs
+                .iter()
+                .any(|(k, v)| k == "Email" && !v.trim().is_empty());
 
             if !has_valid_authuser {
                 pairs.retain(|(k, _)| k != "authuser");
@@ -472,7 +567,11 @@ pub fn parse_google_api_error(status: u16, text: &str) -> QuotaFetchError {
     parse_google_api_error_with_email(status, text, None)
 }
 
-pub fn parse_google_api_error_with_email(status: u16, text: &str, email: Option<&str>) -> QuotaFetchError {
+pub fn parse_google_api_error_with_email(
+    status: u16,
+    text: &str,
+    email: Option<&str>,
+) -> QuotaFetchError {
     let mut message = if text.trim().is_empty() {
         format!("API returned status {}", status)
     } else {
@@ -495,7 +594,9 @@ pub fn parse_google_api_error_with_email(status: u16, text: &str, email: Option<
                     }
                     if validation_url.is_none() {
                         if let Some(metadata) = detail.get("metadata") {
-                            if let Some(url) = metadata.get("validation_url").and_then(|v| v.as_str()) {
+                            if let Some(url) =
+                                metadata.get("validation_url").and_then(|v| v.as_str())
+                            {
                                 validation_url = Some(url.to_string());
                             }
                         }
@@ -543,6 +644,18 @@ struct LoadProjectResponse {
     paid_tier: Option<Tier>,
     #[serde(rename = "allowedTiers")]
     allowed_tiers: Option<Vec<AllowedTier>>,
+}
+
+impl LoadProjectResponse {
+    fn current_gcp_tos(&self) -> Option<bool> {
+        let current = self.current_tier.as_ref()?;
+        current.uses_gcp_tos.or_else(|| {
+            let id = current.id.as_deref()?;
+            self.allowed_tiers.as_ref()?.iter().find_map(|tier| {
+                (tier.id.as_deref() == Some(id)).then_some(tier.uses_gcp_tos).flatten()
+            })
+        })
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -855,19 +968,8 @@ pub async fn fetch_project_metadata_with_context(
                                     subscription_tier =
                                         paid_tier_id.clone().or(current_tier_id.clone());
 
-                                    // 从 currentTier / allowedTiers 中解析 usesGcpTos（严格遵循 Google 返回的真实字段）
-                                    let detected_gcp_tos = data
-                                        .current_tier
-                                        .as_ref()
-                                        .and_then(|t| t.uses_gcp_tos)
-                                        .or_else(|| {
-                                            data.allowed_tiers.as_ref().and_then(|tiers| {
-                                                tiers
-                                                    .iter()
-                                                    .find(|t| t.is_default.unwrap_or(false))
-                                                    .and_then(|t| t.uses_gcp_tos)
-                                            })
-                                        });
+                                    // The default allowed tier is an onboarding option, not the active tier.
+                                    let detected_gcp_tos = data.current_gcp_tos();
                                     if detected_gcp_tos.is_some() {
                                         resolved_is_gcp_tos = detected_gcp_tos;
                                     }
@@ -928,7 +1030,9 @@ pub async fn fetch_project_metadata_with_context(
                                         .project
                                         .as_ref()
                                         .and_then(extract_project_id)
-                                        .filter(|id| !id.trim().is_empty() && id.trim() != "aicode-consumers");
+                                        .filter(|id| {
+                                            !id.trim().is_empty() && id.trim() != "aicode-consumers"
+                                        });
                                     if let Some(project_id) = response_project_id.clone() {
                                         return ProjectMetadataResult {
                                             project_id: Some(project_id),
@@ -959,7 +1063,8 @@ pub async fn fetch_project_metadata_with_context(
                                         {
                                             Ok(project_id) => {
                                                 let clean_project_id = project_id.filter(|id| {
-                                                    !id.trim().is_empty() && id.trim() != "aicode-consumers"
+                                                    !id.trim().is_empty()
+                                                        && id.trim() != "aicode-consumers"
                                                 });
                                                 if let Some(project_id) = clean_project_id {
                                                     return ProjectMetadataResult {
@@ -1115,25 +1220,29 @@ fn build_quota_data_from_response(
     project_id: Option<String>,
 ) -> QuotaData {
     let mut quota_data = QuotaData::new();
-    let is_free_tier = subscription_tier
-        .as_deref()
-        .map(str::to_lowercase)
-        .map(|s| s.contains("free") || (!s.contains("pro") && !s.contains("ultra")))
-        .unwrap_or(false);
-    quota_data.quota_summary_stale = if is_free_tier {
-        false
-    } else {
-        !quota_summary.as_ref()
-            .and_then(|summary| summary.get("groups")).and_then(Value::as_array)
-            .is_some_and(|groups| groups.iter().all(|group| {
-                group.get("buckets").and_then(Value::as_array).is_some_and(|buckets| {
-                    buckets.iter().all(|bucket| {
-                        bucket.get("bucketId").and_then(Value::as_str).is_some_and(|id| !id.is_empty())
-                            && bucket.get("remainingFraction").and_then(Value::as_f64).is_some()
+    quota_data.quota_summary_stale = !quota_summary
+        .as_ref()
+        .and_then(|summary| summary.get("groups"))
+        .and_then(Value::as_array)
+        .is_some_and(|groups| {
+            groups.iter().all(|group| {
+                group
+                    .get("buckets")
+                    .and_then(Value::as_array)
+                    .is_some_and(|buckets| {
+                        buckets.iter().all(|bucket| {
+                            bucket
+                                .get("bucketId")
+                                .and_then(Value::as_str)
+                                .is_some_and(|id| !id.is_empty())
+                                && bucket
+                                    .get("remainingFraction")
+                                    .and_then(Value::as_f64)
+                                    .is_some()
+                        })
                     })
-                })
-            }))
-    };
+            })
+        });
     if !quota_data.quota_summary_stale {
         quota_data.quota_summary_updated_at = Some(quota_data.last_updated);
     }
@@ -1178,9 +1287,13 @@ fn build_quota_data_from_response(
                             .map(|s| s.to_string());
 
                         if let (Some(id), Some(fraction)) = (bucket_id, remaining_fraction) {
-                            let percentage = (fraction * 100.0) as i32;
-                            let reset_str = reset_time.unwrap_or_default();
-                            quota_data.add_model(id, display_name, percentage, reset_str);
+                            quota_data.models.push(crate::models::quota::ModelQuota {
+                                name: id,
+                                display_name,
+                                percentage: (fraction * 100.0) as i32,
+                                reset_time: reset_time.unwrap_or_default(),
+                                summary_exhausted: Some(fraction == 0.0),
+                            });
                         }
                     }
                 }
@@ -1195,25 +1308,63 @@ fn build_quota_data_from_response(
     quota_data
 }
 
-fn is_summary_bucket(name: &str) -> bool {
-    matches!(name, "3p-5h" | "claude:5h" | "3p-weekly" | "claude:weekly"
-        | "gemini-5h" | "gemini:5h" | "gemini-weekly" | "gemini:weekly")
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum SummaryBucketFamily {
+    Claude,
+    Gemini,
+    Argon,
+    Carbon,
+}
+
+pub(super) fn summary_bucket_family(name: &str) -> Option<SummaryBucketFamily> {
+    use SummaryBucketFamily::*;
+    match name {
+        "3p-5h" | "claude:5h" | "3p-weekly" | "claude:weekly" => Some(Claude),
+        "gemini-5h" | "gemini:5h" | "gemini-weekly" | "gemini:weekly" => Some(Gemini),
+        "argon:weekly" | "argon:5h" => Some(Argon),
+        "carbon:weekly" | "gemini-carbon-wtu-weekly" => Some(Carbon),
+        name if name.starts_with("gemini-argon-")
+            && (name.ends_with("-weekly") || name.ends_with("-5h")) => Some(Argon),
+        "carbon:weekly" | "gemini-carbon-wtu-weekly" => Some(Carbon),
+        _ => None,
+    }
 }
 
 /// Merge only real quota windows from this account's last successful summary.
 /// Fresh model-level data remains fresh; no model name is interpreted as a window.
 pub(crate) fn preserve_failed_quota_summary(quota: &mut QuotaData, previous: Option<&QuotaData>) {
-    if !quota.quota_summary_stale || quota.is_forbidden { return; }
-    let Some(previous) = previous else { return; };
-    if previous.is_forbidden || previous.project_id != quota.project_id
-        || previous.subscription_tier != quota.subscription_tier { return; }
-    for model in previous.models.iter().filter(|model| is_summary_bucket(&model.name)) {
-        if !quota.models.iter().any(|current| current.name == model.name) {
+    if !quota.quota_summary_stale || quota.is_forbidden {
+        return;
+    }
+    let Some(previous) = previous else {
+        return;
+    };
+    if previous.is_forbidden
+        || previous.project_id != quota.project_id
+        || previous.subscription_tier != quota.subscription_tier
+    {
+        return;
+    }
+    for model in previous
+        .models
+        .iter()
+        .filter(|model| summary_bucket_family(&model.name).is_some())
+    {
+        if !quota
+            .models
+            .iter()
+            .any(|current| current.name == model.name)
+        {
             quota.models.push(model.clone());
         }
     }
-    if quota.models.iter().any(|model| is_summary_bucket(&model.name)) {
-        quota.quota_summary_updated_at = previous.quota_summary_updated_at
+    if quota
+        .models
+        .iter()
+        .any(|model| summary_bucket_family(&model.name).is_some())
+    {
+        quota.quota_summary_updated_at = previous
+            .quota_summary_updated_at
             .or_else(|| (!previous.quota_summary_stale).then_some(previous.last_updated));
     }
 }
@@ -1226,27 +1377,41 @@ pub async fn fetch_quota_for_token(
     token: &TokenData,
     email: &str,
     skip_cache: bool,
-) -> crate::error::AppResult<QuotaFetchResult> {
+) -> (
+    ProjectMetadataResult,
+    crate::error::AppResult<QuotaFetchResult>,
+) {
     let ctx = QuotaCloudCodeContext::from_token(token);
-    fetch_quota_with_context(&token.access_token, email, skip_cache, &ctx).await
+    let meta = fetch_project_metadata_with_context(&token.access_token, email, &ctx).await;
+    let resolved_context = ctx.after_project_discovery(&meta);
+    let base_url = resolve_cloud_code_base_url(&resolved_context);
+    let route_changed = base_url != resolve_cloud_code_base_url(&ctx);
+    let quota = fetch_quota_with_project_metadata(
+        &token.access_token,
+        email,
+        skip_cache || route_changed,
+        &resolved_context,
+        &meta,
+        &base_url,
+    )
+    .await;
+    (meta, quota)
 }
 
-pub async fn fetch_quota_with_context(
+async fn fetch_quota_with_project_metadata(
     access_token: &str,
     email: &str,
     skip_cache: bool,
     ctx: &QuotaCloudCodeContext,
+    meta: &ProjectMetadataResult,
+    base_url: &str,
 ) -> crate::error::AppResult<QuotaFetchResult> {
     use crate::error::AppError;
 
-    let base_url = resolve_cloud_code_base_url(ctx);
-    let meta = fetch_project_metadata_with_context(access_token, email, ctx).await;
-    let resolved_project_id = meta
-        .project_id
-        .map(|id| id.trim().to_string())
-        .filter(|id| !id.is_empty() && id != "aicode-consumers");
-    let subscription_tier = meta.subscription_tier;
-    let credits = meta.credits;
+    let resolved_project_id =
+        valid_cloud_code_project_id(meta.project_id.as_deref()).map(ToOwned::to_owned);
+    let subscription_tier = meta.subscription_tier.clone();
+    let credits = meta.credits.clone();
     let is_gcp_tos = meta.is_gcp_tos;
     let effective_project_id = resolved_project_id
         .clone()
@@ -1324,42 +1489,41 @@ pub async fn fetch_quota_with_context(
             .await
         {
             Ok(response) => {
-                if response.error_for_status_ref().is_err() {
-                    let status = response.status();
-
-                    if status == reqwest::StatusCode::FORBIDDEN {
-                        crate::modules::logger::log_warn(&format!(
-                            "账号无权限 (403 Forbidden), 标记为 forbidden 状态: {}",
-                            email
-                        ));
-                        let text = response.text().await.unwrap_or_default();
-                        let mut q = QuotaData::new();
-                        q.is_forbidden = true;
-                        q.subscription_tier = subscription_tier.clone();
-                        q.is_gcp_tos = is_gcp_tos;
-                        q.project_id = resolved_project_id.clone();
-                        let parsed_error = parse_google_api_error_with_email(status.as_u16(), &text, Some(email));
-                        return Ok(QuotaFetchResult {
-                            quota: q,
-                            error: Some(parsed_error),
-                        });
-                    }
-
-                    if attempt < max_retries {
-                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-                        continue;
-                    }
-
+                let status = response.status();
+                let mut models_error = None;
+                let mut payload_value = if status == reqwest::StatusCode::FORBIDDEN {
                     let text = response.text().await.unwrap_or_default();
-                    return Err(AppError::Unknown(format!(
-                        "API 错误: {} - {}",
-                        status, text
-                    )));
-                }
-
-                let body = response.text().await.map_err(AppError::Network)?;
-                let mut payload_value: serde_json::Value = serde_json::from_str(&body)
-                    .map_err(|e| AppError::Unknown(format!("API 响应解析失败: {}", e)))?;
+                    let error = parse_google_api_error_with_email(status.as_u16(), &text, Some(email));
+                    if is_explicit_quota_denial(
+                        error.reason.as_deref(),
+                        error.validation_url.as_deref(),
+                    ) {
+                        let mut quota = QuotaData::new();
+                        quota.is_forbidden = true;
+                        quota.subscription_tier = subscription_tier.clone();
+                        quota.credits = credits.clone();
+                        quota.is_gcp_tos = is_gcp_tos;
+                        quota.project_id = resolved_project_id.clone();
+                        return Ok(QuotaFetchResult { quota, error: Some(error) });
+                    }
+                    crate::modules::logger::log_warn(
+                        "[Quota] fetchAvailableModels 返回 403，继续检查配额摘要",
+                    );
+                    models_error = Some(error);
+                    json!({"models": {}})
+                } else {
+                    if response.error_for_status_ref().is_err() {
+                        if attempt < max_retries {
+                            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                            continue;
+                        }
+                        let text = response.text().await.unwrap_or_default();
+                        return Err(AppError::Unknown(format!("API 错误: {} - {}", status, text)));
+                    }
+                    let body = response.text().await.map_err(AppError::Network)?;
+                    serde_json::from_str::<serde_json::Value>(&body)
+                        .map_err(|e| AppError::Unknown(format!("API 响应解析失败: {}", e)))?
+                };
 
                 // Fetch retrieveUserQuotaSummary to get weekly and 5h buckets
                 let mut quota_summary_val: Option<serde_json::Value> = None;
@@ -1417,11 +1581,22 @@ pub async fn fetch_quota_with_context(
                                 "[Quota] retrieveUserQuotaSummary 请求未成功: {}, body: {}",
                                 status, err_text
                             ));
-                            let parsed = parse_google_api_error_with_email(status.as_u16(), &err_text, Some(email));
-                            if parsed.reason.as_deref() == Some("VALIDATION_REQUIRED")
-                                || parsed.validation_url.is_some()
-                                || parsed.message.contains("Verify your account")
-                            {
+                            let parsed = parse_google_api_error_with_email(
+                                status.as_u16(),
+                                &err_text,
+                                Some(email),
+                            );
+                            let explicitly_denied = if models_error.is_some() {
+                                is_explicit_quota_denial(
+                                    parsed.reason.as_deref(),
+                                    parsed.validation_url.as_deref(),
+                                )
+                            } else {
+                                parsed.reason.as_deref() == Some("VALIDATION_REQUIRED")
+                                    || parsed.validation_url.is_some()
+                                    || parsed.message.contains("Verify your account")
+                            };
+                            if explicitly_denied {
                                 quota_summary_error = Some(parsed);
                             }
                         }
@@ -1434,17 +1609,19 @@ pub async fn fetch_quota_with_context(
                     }
                 }
 
-                write_api_cache(
-                    "authorized",
-                    "desktop",
-                    email,
-                    effective_project_id.clone(),
-                    payload_value.clone(),
-                );
+                if models_error.is_none() && quota_summary_error.is_none() {
+                    write_api_cache(
+                        "authorized",
+                        "desktop",
+                        email,
+                        effective_project_id.clone(),
+                        payload_value.clone(),
+                    );
+                }
 
                 let quota_response: QuotaResponse = serde_json::from_value(payload_value)
                     .map_err(|e| AppError::Unknown(format!("API 响应解析失败: {}", e)))?;
-                let quota_data = build_quota_data_from_response(
+                let mut quota_data = build_quota_data_from_response(
                     quota_response,
                     subscription_tier.clone(),
                     credits.clone(),
@@ -1453,9 +1630,17 @@ pub async fn fetch_quota_with_context(
                     resolved_project_id.clone(),
                 );
 
+                if models_error.is_some() {
+                    quota_data.is_forbidden = quota_summary_error.is_some();
+                    if quota_data.models.is_empty() {
+                        quota_data.quota_summary_stale = true;
+                        quota_data.quota_summary_updated_at = None;
+                    }
+                }
                 return Ok(QuotaFetchResult {
+                    error: quota_summary_error
+                        .or_else(|| models_error.filter(|_| quota_data.models.is_empty())),
                     quota: quota_data,
-                    error: quota_summary_error,
                 });
             }
             Err(e) => {
@@ -1476,6 +1661,60 @@ mod tests {
     use super::*;
 
     #[test]
+    fn cloud_code_version_uses_installed_metadata_when_wakeup_metadata_is_missing() {
+        assert_eq!(
+            resolve_cloud_code_version("", || Some("2.26.0".to_string())),
+            "2.26.0"
+        );
+    }
+
+    #[test]
+    fn cloud_code_version_preserves_explicit_or_legacy_metadata_without_scanning() {
+        assert_eq!(
+            resolve_cloud_code_version(" 2.26.0\n", || {
+                panic!("installed metadata must not override the wakeup version")
+            }),
+            "2.26.0"
+        );
+    }
+
+    #[test]
+    fn cloud_code_version_trims_installed_metadata() {
+        assert_eq!(
+            resolve_cloud_code_version(" \n", || Some(" 2.26.0.0\r\n".to_string())),
+            "2.26.0.0"
+        );
+    }
+
+    #[test]
+    fn cloud_code_version_preserves_minimum_for_stale_or_invalid_metadata() {
+        assert_eq!(
+            resolve_cloud_code_version("1.23.3", || None),
+            DEFAULT_CLOUD_CODE_IDE_VERSION
+        );
+        assert_eq!(
+            resolve_cloud_code_version("", || Some("2.17.0".into())),
+            DEFAULT_CLOUD_CODE_IDE_VERSION
+        );
+        assert_eq!(
+            resolve_cloud_code_version("invalid", || None),
+            DEFAULT_CLOUD_CODE_IDE_VERSION
+        );
+    }
+
+    #[test]
+    fn cloud_code_version_keeps_compatibility_default_without_installed_metadata() {
+        assert_eq!(
+            resolve_cloud_code_version("", || None),
+            DEFAULT_CLOUD_CODE_IDE_VERSION
+        );
+        assert_eq!(
+            resolve_cloud_code_version("", || Some(" \n".to_string())),
+            DEFAULT_CLOUD_CODE_IDE_VERSION
+        );
+    }
+
+    #[test]
     fn test_format_google_validation_url_empty_authuser() {
         let raw = "https://accounts.google.com/signin/continue?sarp=1&scc=1&continue=https%3A%2F%2Fdevelopers.google.com%2Fgemini-code-assist%2Fauth%2Fauth_success_gemini&plt=AKgnsbtp&flowName=GlifWebSignIn&authuser";
         let email = "target@gmail.com";
@@ -1483,9 +1722,18 @@ mod tests {
 
         let parsed = url::Url::parse(&formatted).unwrap();
         let pairs: std::collections::HashMap<_, _> = parsed.query_pairs().into_owned().collect();
-        assert_eq!(pairs.get("authuser").map(|s| s.as_str()), Some("target@gmail.com"));
-        assert_eq!(pairs.get("login_hint").map(|s| s.as_str()), Some("target@gmail.com"));
-        assert_eq!(pairs.get("Email").map(|s| s.as_str()), Some("target@gmail.com"));
+        assert_eq!(
+            pairs.get("authuser").map(|s| s.as_str()),
+            Some("target@gmail.com")
+        );
+        assert_eq!(
+            pairs.get("login_hint").map(|s| s.as_str()),
+            Some("target@gmail.com")
+        );
+        assert_eq!(
+            pairs.get("Email").map(|s| s.as_str()),
+            Some("target@gmail.com")
+        );
         assert_eq!(pairs.get("plt").map(|s| s.as_str()), Some("AKgnsbtp"));
     }
 
@@ -1496,9 +1744,18 @@ mod tests {
 
         let parsed = url::Url::parse(&formatted).unwrap();
         let pairs: std::collections::HashMap<_, _> = parsed.query_pairs().into_owned().collect();
-        assert_eq!(pairs.get("authuser").map(|s| s.as_str()), Some("target@gmail.com"));
-        assert_eq!(pairs.get("login_hint").map(|s| s.as_str()), Some("target@gmail.com"));
-        assert_eq!(pairs.get("Email").map(|s| s.as_str()), Some("target@gmail.com"));
+        assert_eq!(
+            pairs.get("authuser").map(|s| s.as_str()),
+            Some("target@gmail.com")
+        );
+        assert_eq!(
+            pairs.get("login_hint").map(|s| s.as_str()),
+            Some("target@gmail.com")
+        );
+        assert_eq!(
+            pairs.get("Email").map(|s| s.as_str()),
+            Some("target@gmail.com")
+        );
     }
 
     #[test]
@@ -1508,8 +1765,14 @@ mod tests {
 
         let parsed = url::Url::parse(&formatted).unwrap();
         let pairs: std::collections::HashMap<_, _> = parsed.query_pairs().into_owned().collect();
-        assert_eq!(pairs.get("authuser").map(|s| s.as_str()), Some("existing@gmail.com"));
-        assert_eq!(pairs.get("login_hint").map(|s| s.as_str()), Some("target@gmail.com"));
+        assert_eq!(
+            pairs.get("authuser").map(|s| s.as_str()),
+            Some("existing@gmail.com")
+        );
+        assert_eq!(
+            pairs.get("login_hint").map(|s| s.as_str()),
+            Some("target@gmail.com")
+        );
     }
 
     #[test]
@@ -1519,10 +1782,15 @@ mod tests {
         assert_eq!(format_google_validation_url(raw, ""), raw);
 
         let fake_host = "https://evil-google.com/signin?authuser";
-        assert_eq!(format_google_validation_url(fake_host, "target@gmail.com"), fake_host);
+        assert_eq!(
+            format_google_validation_url(fake_host, "target@gmail.com"),
+            fake_host
+        );
 
         let query_substr = "https://attacker.com/login?redirect=accounts.google.com&authuser";
-        assert_eq!(format_google_validation_url(query_substr, "target@gmail.com"), query_substr);
+        assert_eq!(
+            format_google_validation_url(query_substr, "target@gmail.com"),
+            query_substr
+        );
     }
 }
-

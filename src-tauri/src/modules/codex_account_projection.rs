@@ -1,5 +1,8 @@
 // Codex 账号模块：Auth projection, bundle writing and managed sidecar persistence。
 // 通过 include! 保持原 modules::codex_account 作用域，完整保留私有调用关系。
+#[path = "codex_external_bridge.rs"]
+mod external_bridge;
+
 /// 获取当前激活的账号（基于 Tools 显式 current_account_id）
 pub fn get_current_account() -> Option<CodexAccount> {
     let base_dir = get_codex_home();
@@ -19,7 +22,11 @@ fn get_current_account_from_loaded(
     let mut account = load(&current_id)?;
 
     if account.is_api_key_auth() {
-        sync_api_key_account_from_local_state(&mut account, base_dir);
+        let original = account.clone();
+        if let Err(error) = sync_api_key_account_from_local_state(&mut account, base_dir) {
+            logger::log_warn(&format!("同步当前 API Key 账号本地状态失败，保留已有账号: {error}"));
+            account = original;
+        }
     }
     Some(account)
 }
@@ -79,8 +86,7 @@ fn should_drop_existing_auth_metadata_key(key: &str) -> bool {
 fn read_existing_auth_file_object(
     base_dir: &Path,
 ) -> Option<serde_json::Map<String, serde_json::Value>> {
-    let content = fs::read_to_string(base_dir.join("auth.json")).ok()?;
-    match serde_json::from_str(&content).ok()? {
+    match read_configured_codex_auth_value(base_dir).ok()?? {
         serde_json::Value::Object(map) => Some(map),
         _ => None,
     }
@@ -130,6 +136,7 @@ fn build_merged_auth_file_value(
 }
 
 fn build_auth_file_value(account: &CodexAccount) -> Result<serde_json::Value, String> {
+    reject_chatgpt_plan_client_injection(account)?;
     if account.is_api_key_auth() {
         let api_key = normalize_optional_ref(account.openai_api_key.as_deref())
             .ok_or("API Key 账号缺少 OPENAI_API_KEY")?;
@@ -181,7 +188,11 @@ fn build_auth_file_value(account: &CodexAccount) -> Result<serde_json::Value, St
             refresh_token: Some(
                 normalize_optional_ref(account.tokens.refresh_token.as_deref()).unwrap_or_default(),
             ),
-            account_id: account.account_id.clone(),
+            // Missing id_token metadata must not discard an available workspace identity.
+            // Preserve an explicit stored identity; otherwise use the access-token claim.
+            account_id: normalize_optional_ref(account.account_id.as_deref()).or_else(|| {
+                extract_chatgpt_account_id_from_access_token(&account.tokens.access_token)
+            }),
         }),
         agent_identity: None,
         personal_access_token: None,
@@ -201,10 +212,10 @@ fn build_codex_keychain_account(base_dir: &Path) -> String {
     format!("cli|{}", &digest_hex[..16])
 }
 
-/// 判断指定 profile 目录在 macOS 钥匙串中是否已有官方凭据条目。
+/// 判断指定 profile 是否已有官方安全存储凭据。
 ///
-/// 只查询条目是否存在（不读取密钥内容），因此不会触发钥匙串授权弹框，
-/// 可用于「官方客户端是否已经写入登录信息」的高频探测。
+/// macOS 只查询条目是否存在，不读取密钥。Windows 检查加密文件或直接凭据条目，
+/// 不解密加密文件；仅用于失败后的凭据保留判断。
 pub(crate) fn codex_keychain_entry_exists_for_dir(base_dir: &Path) -> bool {
     #[cfg(all(target_os = "macos", not(test)))]
     {
@@ -223,7 +234,11 @@ pub(crate) fn codex_keychain_entry_exists_for_dir(base_dir: &Path) -> bool {
         }
     }
 
-    #[cfg(not(all(target_os = "macos", not(test))))]
+    #[cfg(target_os = "windows")]
+    {
+        return windows_auth_store::credentials_present(base_dir);
+    }
+    #[cfg(not(any(target_os = "windows", all(target_os = "macos", not(test)))))]
     {
         let _ = base_dir;
     }
@@ -268,7 +283,11 @@ pub(crate) fn delete_codex_keychain_entry_for_dir(base_dir: &Path) -> Result<boo
         ));
     }
 
-    #[cfg(not(all(target_os = "macos", not(test))))]
+    #[cfg(target_os = "windows")]
+    {
+        return windows_auth_store::delete(base_dir);
+    }
+    #[cfg(not(any(target_os = "windows", all(target_os = "macos", not(test)))))]
     {
         let _ = base_dir;
     }
@@ -331,12 +350,20 @@ fn write_codex_keychain_value_to_dir(
     Err("测试环境不写入 macOS keychain".to_string())
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
 fn write_codex_keychain_value_to_dir(
     _base_dir: &Path,
     _payload: &serde_json::Value,
 ) -> Result<(), String> {
     Err("当前平台尚未实现 Codex keyring 写入".to_string())
+}
+
+#[cfg(target_os = "windows")]
+fn write_codex_keychain_value_to_dir(
+    base_dir: &Path,
+    payload: &serde_json::Value,
+) -> Result<(), String> {
+    windows_auth_store::write(base_dir, payload)
 }
 
 fn is_disk_full_io_error(error: &std::io::Error) -> bool {
@@ -694,57 +721,59 @@ fn write_auth_value_to_configured_store(
     auth_path: &Path,
     auth_value: &serde_json::Value,
 ) -> Result<&'static str, String> {
-    let mode = codex_auth_credentials_store_mode(base_dir);
-
-    #[cfg(target_os = "macos")]
-    match mode {
+    match codex_auth_credentials_store_mode(base_dir) {
         CodexAuthCredentialsStoreMode::File => {
             write_auth_json_value(auth_path, auth_value)?;
-            return Ok("file");
+            Ok("file")
         }
+        CodexAuthCredentialsStoreMode::Ephemeral => Err("CODEX_AUTH_STORE_EPHEMERAL".to_string()),
         CodexAuthCredentialsStoreMode::Keyring => {
             write_codex_keychain_value_to_dir(base_dir, auth_value)?;
             remove_auth_json_after_keyring_write(auth_path);
-            return Ok("keyring");
+            Ok("keyring")
         }
         CodexAuthCredentialsStoreMode::Auto => {
             match write_codex_keychain_value_to_dir(base_dir, auth_value) {
                 Ok(()) => {
                     remove_auth_json_after_keyring_write(auth_path);
-                    return Ok("auto:keyring");
+                    Ok("auto:keyring")
                 }
-                Err(error) => logger::log_warn(&format!(
-                    "[Codex切号] auto 模式写入 keyring 失败，回退 auth.json: {}",
-                    error
-                )),
+                Err(error) => {
+                    // A valid old secure-store entry would win over a new auth.json.
+                    // Never report a successful fallback while that old entry exists.
+                    if read_codex_keychain_auth_file_from_dir(base_dir)?.is_some() {
+                        return Err(error);
+                    }
+                    write_auth_json_value(auth_path, auth_value)?;
+                    Ok("auto:file")
+                }
             }
-            write_auth_json_value(auth_path, auth_value)?;
-            return Ok("auto:file");
         }
-    }
-
-    #[cfg(not(target_os = "macos"))]
-    {
-        if mode != CodexAuthCredentialsStoreMode::File {
-            logger::log_warn(
-                "[Codex切号] 当前平台暂不支持直接写入 Codex keyring，保留 auth.json 兼容写入",
-            );
-        }
-        write_auth_json_value(auth_path, auth_value)?;
-        Ok("file")
     }
 }
 
+#[cfg(test)]
 pub fn write_auth_file_to_dir(base_dir: &Path, account: &CodexAccount) -> Result<(), String> {
-    write_auth_file_to_dir_with_after_commit(base_dir, account, || {
-        crate::modules::codex_cli_daemon::after_auth_commit(base_dir);
-    })
+    write_auth_file_to_dir_with_after_commit(base_dir, account, || {})
 }
 
 fn write_auth_file_to_dir_with_after_commit(
     base_dir: &Path,
     account: &CodexAccount,
     after_commit: impl FnOnce(),
+) -> Result<(), String> {
+    // Inspect the previous auth before replacing it: this compatibility policy
+    // applies only to OAuth -> OAuth, never to an old API Service/key route.
+    let existing_auth = read_configured_codex_auth_value(base_dir).ok().flatten();
+    let bridge_url = external_bridge::preserved_url(base_dir, account, existing_auth.as_ref());
+    write_auth_file_to_dir_with_after_commit_and_bridge(base_dir, account, after_commit, bridge_url)
+}
+
+fn write_auth_file_to_dir_with_after_commit_and_bridge(
+    base_dir: &Path,
+    account: &CodexAccount,
+    after_commit: impl FnOnce(),
+    bridge_url: Option<String>,
 ) -> Result<(), String> {
     let auth_path = base_dir.join("auth.json");
     logger::log_info(&format!(
@@ -781,7 +810,7 @@ fn write_auth_file_to_dir_with_after_commit(
     } else {
         let provider_config = ApiProviderConfig {
             mode: CodexApiProviderMode::OpenaiBuiltin,
-            base_url: None,
+            base_url: bridge_url,
             provider_id: None,
             provider_name: None,
         };
@@ -846,8 +875,54 @@ pub(crate) fn write_prepared_account_bundle_to_dir(
     base_dir: &Path,
     account: &CodexAccount,
 ) -> Result<(), String> {
+    write_bundle_with_cli_daemon_notice(
+        base_dir,
+        |credentials_changed| write_prepared_account_bundle(base_dir, account, credentials_changed),
+        |complete| notify_after_account_bundle_write(base_dir, account, complete),
+    )
+}
+
+fn notify_after_account_bundle_write(base_dir: &Path, account: &CodexAccount, complete: bool) {
+    if crate::modules::codex_local_access::is_local_access_runtime_account_id(&account.id) {
+        crate::modules::codex_cli_daemon::after_profile_write(base_dir, false);
+        return;
+    }
+    // The switch prepares the gateway's final model catalog after this bundle.
+    if !complete || !crate::modules::codex_local_access::account_requires_provider_gateway(account) {
+        crate::modules::codex_cli_daemon::after_profile_write(base_dir, complete);
+    }
+}
+
+fn write_bundle_with_cli_daemon_notice(
+    base_dir: &Path,
+    write: impl FnOnce(&std::cell::Cell<bool>) -> Result<(), String>,
+    notify: impl FnOnce(bool),
+) -> Result<(), String> {
+    let previous_provider = read_api_provider_from_config_toml(base_dir);
+    let previous_account = read_managed_projection_account_id_from_dir(base_dir);
+    let credentials_changed = std::cell::Cell::new(false);
+    let result = write(&credentials_changed);
+    let account_or_provider_changed = result.is_ok()
+        && (previous_provider != read_api_provider_from_config_toml(base_dir)
+            || previous_account != read_managed_projection_account_id_from_dir(base_dir));
+    if credentials_changed.get() || account_or_provider_changed {
+        notify(result.is_ok());
+    }
+    result
+}
+
+pub(crate) fn configured_provider_base_url(base_dir: &Path) -> Option<String> {
+    read_api_provider_from_config_toml(base_dir).base_url
+}
+
+fn write_prepared_account_bundle(
+    base_dir: &Path,
+    account: &CodexAccount,
+    credentials_changed: &std::cell::Cell<bool>,
+) -> Result<(), String> {
+    reject_chatgpt_plan_client_injection(account)?;
     let account = resolve_account_for_bundle_write(base_dir, account)?;
-    write_auth_file_to_dir(base_dir, &account)?;
+    write_auth_file_to_dir_with_after_commit(base_dir, &account, || credentials_changed.set(true))?;
     write_managed_projection_to_dir(base_dir, &account)?;
     sync_or_cleanup_managed_model_catalog_for_dir(base_dir, &account)?;
     Ok(())
@@ -945,7 +1020,7 @@ fn refresh_api_key_provider_projection_in_dir(
     Ok(())
 }
 
-fn write_api_key_account_bundle_with_oauth_to_dir(
+pub(crate) fn write_api_key_account_bundle_with_oauth_to_dir(
     base_dir: &Path,
     api_key_account: &CodexAccount,
     oauth_account: &CodexAccount,
@@ -971,26 +1046,30 @@ fn write_api_key_account_bundle_with_oauth_to_dir(
         return Ok(());
     }
 
-    write_prepared_account_bundle_to_dir(base_dir, oauth_account)?;
-    let provider_config =
-        write_api_key_provider_override_to_config_toml(base_dir, api_key_account)?;
-    // config/Provider 归 API Key 账号所有，但 auth.json/keychain 中的一次性 RT 链
-    // 归绑定的 OAuth 账号所有。必须同时持久化两种归属，否则官方客户端轮换 RT 后，
-    // OAuth 账号单独启动时可能找不到最新凭据并再次消费旧 RT。
-    write_managed_projection_with_credential_owner_to_dir(
+    write_bundle_with_cli_daemon_notice(
         base_dir,
-        api_key_account,
-        oauth_account,
-    )?;
-    sync_or_cleanup_managed_model_catalog_for_dir(base_dir, api_key_account)?;
-    logger::log_info(&format!(
-        "[Codex切号] 已写入 API Key 账号绑定 OAuth 的组合配置: api_account_id={}, oauth_account_id={}, target_dir={}, has_base_url={}",
-        api_key_account.id,
-        oauth_account.id,
-        base_dir.display(),
-        provider_config.base_url.is_some()
-    ));
-    Ok(())
+        |credentials_changed| {
+            write_prepared_account_bundle(base_dir, oauth_account, credentials_changed)?;
+            let provider_config =
+                write_api_key_provider_override_to_config_toml(base_dir, api_key_account)?;
+            // Provider 归 API Key 账号，凭据及其刷新链归绑定的 OAuth 账号。
+            write_managed_projection_with_credential_owner_to_dir(
+                base_dir,
+                api_key_account,
+                oauth_account,
+            )?;
+            sync_or_cleanup_managed_model_catalog_for_dir(base_dir, api_key_account)?;
+            logger::log_info(&format!(
+            "[Codex切号] 已写入 API Key 账号绑定 OAuth 的组合配置: api_account_id={}, oauth_account_id={}, target_dir={}, has_base_url={}",
+            api_key_account.id,
+            oauth_account.id,
+            base_dir.display(),
+            provider_config.base_url.is_some()
+            ));
+            Ok(())
+        },
+        |complete| notify_after_account_bundle_write(base_dir, api_key_account, complete),
+    )
 }
 
 pub fn write_account_bundle_to_dir(base_dir: &Path, account: &CodexAccount) -> Result<(), String> {
@@ -1410,4 +1489,127 @@ pub async fn sync_bound_oauth_consumers_after_reauth(account_id: &str) -> Result
     tauri::async_runtime::spawn_blocking(move || sync_managed_account_sidecar_checked(&account))
         .await
         .map_err(|_| "PROXY_RUNTIME_FAILED".to_string())?
+}
+
+/// Derive the Desktop renderer owner from the actual projected credential,
+/// including API keys bound to OAuth. Never use Cockpit account IDs or email.
+pub(crate) fn desktop_renderer_project_owner(
+    base_dir: &Path,
+) -> Result<Option<Option<String>>, String> {
+    let Some(auth) = read_configured_codex_auth_value(base_dir)? else {
+        return Ok(None);
+    };
+    renderer_project_owner_from_auth(&auth)
+}
+
+fn renderer_project_owner_from_auth(
+    auth: &serde_json::Value,
+) -> Result<Option<Option<String>>, String> {
+    if auth["auth_mode"] == "apikey" {
+        return Ok(Some(None));
+    }
+    let tokens = &auth["tokens"];
+    if !tokens.is_object() {
+        return Ok(
+            if auth["auth_mode"] == "apikey" || auth["OPENAI_API_KEY"].is_string() {
+                Some(None)
+            } else {
+                None
+            },
+        );
+    }
+    let access = tokens["access_token"]
+        .as_str()
+        .and_then(decode_jwt_payload_value);
+    let Some(claims) = access
+        .as_ref()
+        .and_then(|value| value.get("https://api.openai.com/auth"))
+    else {
+        return Ok(None);
+    };
+    // Both desktop builds derive the renderer principal from these access-token claims.
+    let user = claims["user_id"]
+        .as_str()
+        .or_else(|| claims["chatgpt_user_id"].as_str());
+    let account = claims["chatgpt_account_id"]
+        .as_str()
+        .or_else(|| claims["account_id"].as_str());
+    Ok(match (user, account) {
+        (Some(user), Some(account)) if !user.is_empty() && !account.is_empty() => {
+            let identity = serde_json::to_vec(&serde_json::json!([user, account]))
+                .map_err(|e| e.to_string())?;
+            Some(Some(format!("{:x}", Sha256::digest(identity))))
+        }
+        _ => None,
+    })
+}
+
+#[cfg(test)]
+mod account_project_switch_identity_tests {
+    use super::*;
+    fn token(identity: serde_json::Value) -> String {
+        let claims = serde_json::json!({"https://api.openai.com/auth":identity});
+        format!(
+            "e30.{}.sig",
+            URL_SAFE_NO_PAD.encode(serde_json::to_vec(&claims).unwrap())
+        )
+    }
+    #[test]
+    fn account_project_switch_prefers_official_access_token_claims_when_fields_conflict() {
+        let auth = serde_json::json!({"auth_mode":"chatgpt","tokens":{
+            "access_token":token(serde_json::json!({
+                "user_id":"user-one","chatgpt_user_id":"legacy-user",
+                "chatgpt_account_id":"token-workspace","account_id":"legacy-workspace"
+            })),
+            "id_token":token(serde_json::json!({
+                "user_id":"id-token-user","chatgpt_account_id":"id-token-workspace"
+            })),
+            "account_id":"projected-workspace"
+        }});
+        assert_eq!(
+            renderer_project_owner_from_auth(&auth).unwrap(),
+            Some(Some(format!(
+                "{:x}",
+                Sha256::digest(br#"["user-one","token-workspace"]"#)
+            )))
+        );
+    }
+    #[test]
+    fn account_project_switch_accepts_user_id_without_chatgpt_user_id() {
+        let auth = serde_json::json!({"tokens":{
+            "access_token":token(serde_json::json!({"user_id":"user","account_id":"workspace"}))
+        }});
+        assert_eq!(
+            renderer_project_owner_from_auth(&auth).unwrap(),
+            Some(Some(format!(
+                "{:x}",
+                Sha256::digest(br#"["user","workspace"]"#)
+            )))
+        );
+    }
+    #[test]
+    fn account_project_switch_distinguishes_key_unknown_and_oauth() {
+        assert_eq!(
+            renderer_project_owner_from_auth(&serde_json::json!({
+                "auth_mode":"apikey","OPENAI_API_KEY":"fake","tokens":{}
+            }))
+            .unwrap(),
+            Some(None)
+        );
+        assert_eq!(
+            renderer_project_owner_from_auth(&serde_json::json!({
+                "auth_mode":"chatgpt","tokens":{"access_token":"opaque"}
+            }))
+            .unwrap(),
+            None
+        );
+        let auth = serde_json::json!({"tokens":{
+            "access_token":token(serde_json::json!({"user_id":"user"})),
+            "id_token":token(serde_json::json!({
+                "user_id":"user","chatgpt_account_id":"workspace"
+            })),
+            "account_id":"workspace"
+        }});
+        assert_eq!(renderer_project_owner_from_auth(&auth).unwrap(), None);
+    }
 }

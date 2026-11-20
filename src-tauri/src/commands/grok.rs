@@ -152,6 +152,10 @@ pub(crate) fn parse_grok_client_version(value: &str) -> Option<String> {
 
 pub(crate) async fn detect_grok_client_version() -> Option<String> {
     let (path, _) = resolve_grok_cli_path().ok()?;
+    detect_grok_client_version_at_path(&path).await
+}
+
+async fn detect_grok_client_version_at_path(path: &Path) -> Option<String> {
     let mut command = tokio::process::Command::new(path);
     command
         .arg("--version")
@@ -282,6 +286,85 @@ mod tests {
             Some("1.0.0-beta.1".to_string())
         );
         assert_eq!(parse_grok_client_version("grok unknown"), None);
+    }
+
+    #[cfg(unix)]
+    struct TestGrokCli {
+        directory: std::path::PathBuf,
+        path: std::path::PathBuf,
+    }
+
+    #[cfg(unix)]
+    impl TestGrokCli {
+        fn new(body: &str) -> Self {
+            use std::os::unix::fs::PermissionsExt;
+
+            let directory = std::env::temp_dir().join(format!(
+                "cockpit-grok-version-test-{}",
+                uuid::Uuid::new_v4()
+            ));
+            std::fs::create_dir(&directory).expect("create test directory");
+            let path = directory.join("grok");
+            std::fs::write(
+                &path,
+                format!("#!/bin/sh\n[ \"$1\" = --version ] || exit 2\n{body}\n"),
+            )
+            .expect("write fake CLI");
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))
+                .expect("make fake CLI executable");
+            Self { directory, path }
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for TestGrokCli {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.directory);
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn detects_grok_client_version_from_fake_cli() {
+        for (body, expected) in [
+            ("echo 'grok 1.0.46 (2765805b9442) [stable]'", Some("1.0.46")),
+            ("echo 'grok v1.0.47' >&2", Some("1.0.47")),
+            ("echo 'grok 0.2.93'", Some("0.2.93")),
+            ("echo 'grok unknown'", None),
+            ("echo 'grok 1.0.46'; exit 1", None),
+        ] {
+            let cli = TestGrokCli::new(body);
+            assert_eq!(
+                super::detect_grok_client_version_at_path(&cli.path)
+                    .await
+                    .as_deref(),
+                expected,
+                "fake CLI body: {body}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn missing_grok_cli_has_no_detected_version() {
+        let cli = TestGrokCli::new("echo 'grok 1.0.46'");
+        std::fs::remove_file(&cli.path).expect("remove fake CLI");
+        assert_eq!(
+            super::detect_grok_client_version_at_path(&cli.path).await,
+            None
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unresponsive_grok_cli_has_no_detected_version() {
+        let cli = TestGrokCli::new("exec sleep 30");
+        let started = std::time::Instant::now();
+        assert_eq!(
+            super::detect_grok_client_version_at_path(&cli.path).await,
+            None
+        );
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
     }
 
     #[cfg(unix)]
@@ -485,10 +568,7 @@ fn apply_grok_switch_opencode_projection(account_id: &str, user_config: &config:
             } else {
                 logger::log_info("OpenCode 未在运行，准备启动");
             }
-            if let Err(e) = process::start_opencode_with_path(Some(&user_config.opencode_app_path))
-            {
-                logger::log_warn(&format!("OpenCode 启动失败: {}", e));
-            }
+            opencode_auth::launch_after_account_sync(&user_config.opencode_app_path);
         } else if !user_config.grok_opencode_auth_overwrite_on_switch {
             logger::log_info("OpenCode 登录覆盖已关闭，跳过自动重启");
         } else {

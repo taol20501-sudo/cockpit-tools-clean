@@ -1,6 +1,8 @@
 use crate::modules::linux_updater::{self, UpdateRuntimeInfo};
 use crate::modules::logger;
-use crate::modules::update_checker::{self, ReleaseHistoryItem, UpdateSettings, VersionJumpInfo};
+use crate::modules::update_checker::{
+    self, ReleaseHistoryItem, ReleaseNotes, UpdateSettings, VersionJumpInfo,
+};
 use std::time::Instant;
 
 /// Check if we should check for updates (based on interval settings)
@@ -87,16 +89,6 @@ pub fn patch_update_settings(
     })
 }
 
-/// Save release notes for a downloaded/pending update
-#[tauri::command]
-pub fn save_pending_update_notes(
-    version: String,
-    release_notes: String,
-    release_notes_zh: String,
-) -> Result<(), String> {
-    update_checker::save_pending_update_notes(version, release_notes, release_notes_zh)
-}
-
 /// Check if a version jump occurred (for post-update changelog display)
 #[tauri::command]
 pub fn check_version_jump() -> Result<Option<VersionJumpInfo>, String> {
@@ -122,13 +114,49 @@ pub fn check_version_jump() -> Result<Option<VersionJumpInfo>, String> {
     result
 }
 
-/// Read release history from changelog files
+/// Read the changelog bundled with the application.
 #[tauri::command]
-pub fn get_release_history(
+pub async fn get_release_history(
     locale: Option<String>,
     limit: Option<usize>,
 ) -> Result<Vec<ReleaseHistoryItem>, String> {
-    update_checker::get_release_history(locale.as_deref(), limit)
+    tokio::task::spawn_blocking(move || {
+        update_checker::get_local_release_history(locale.as_deref(), limit)
+    })
+    .await
+    .map_err(|error| error.to_string())
+}
+
+/// Return bundled notes immediately while installation-time notes are read separately.
+#[tauri::command]
+pub async fn get_bundled_release_notes(version: String) -> Result<ReleaseNotes, String> {
+    tokio::task::spawn_blocking(move || update_checker::get_bundled_release_notes(&version))
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub async fn get_pending_release_notes(version: String) -> Result<Option<ReleaseNotes>, String> {
+    tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        tokio::task::spawn_blocking(move || update_checker::get_pending_release_notes(&version)),
+    )
+    .await
+    .map_err(|_| "Local update notes read timed out".to_string())?
+    .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub async fn save_pending_update_notes(
+    version: String,
+    release_notes: String,
+    release_notes_zh: String,
+) -> Result<(), String> {
+    tokio::task::spawn_blocking(move || {
+        update_checker::save_pending_update_notes(version, release_notes, release_notes_zh)
+    })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 /// Write updater lifecycle logs from frontend into app.log
@@ -161,4 +189,94 @@ pub async fn install_linux_update(
     expected_version: Option<String>,
 ) -> Result<(), String> {
     linux_updater::install_linux_update(app, expected_version).await
+}
+
+// Opening the app bundle through LaunchServices after the old process exits
+// keeps the new app out of the old registration's subtree.
+#[cfg(target_os = "macos")]
+const MACOS_UPDATE_RELAUNCH: &str = r#"
+bundle="$1"
+shift
+while IFS= read -r line; do :; done
+if [ "$#" -eq 0 ]; then
+    exec /usr/bin/open -n -a "$bundle"
+fi
+exec /usr/bin/open -n -a "$bundle" --args "$@"
+"#;
+
+#[cfg(any(test, target_os = "macos"))]
+fn macos_update_bundle(executable: &std::path::Path) -> Option<&std::path::Path> {
+    let macos = executable.parent()?;
+    let contents = macos.parent()?;
+    let bundle = contents.parent()?;
+    (macos.file_name()? == "MacOS" && contents.file_name()? == "Contents"
+        && bundle.extension()? == "app")
+        .then_some(bundle)
+}
+
+#[tauri::command]
+pub fn relaunch_after_update(app: tauri::AppHandle) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    {
+        use std::process::{ChildStdin, Command, Stdio};
+        use std::sync::Mutex;
+        use tauri::Manager;
+
+        // Holding the writer until this process exits is more reliable than
+        // sleeping or checking whether a PID still exists.
+        static RELAUNCH_PIPE: Mutex<Option<ChildStdin>> = Mutex::new(None);
+        let env = app.env();
+        let exe = tauri::process::current_binary(&env).map_err(|error| error.to_string())?;
+        if let Some(bundle) = macos_update_bundle(&exe) {
+            let mut pipe = RELAUNCH_PIPE.lock().map_err(|error| error.to_string())?;
+            if pipe.is_some() {
+                return Ok(());
+            }
+            let spawn_guard = crate::modules::app_lifecycle::acquire_process_spawn_guard(
+                "macOS 更新重启",
+            ).map_err(|error| error.to_string())?;
+            let mut child = Command::new("/bin/sh")
+                .args(["-c", MACOS_UPDATE_RELAUNCH, "cockpit-update-relaunch"])
+                .arg(bundle)
+                .args(env.args_os.iter().skip(1))
+                .env_remove("__CFBundleIdentifier")
+                .env_remove("XPC_SERVICE_NAME")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .spawn()
+                .map_err(|error| format!("无法安排 macOS 更新重启: {error}"))?;
+            *pipe = child.stdin.take();
+            drop(spawn_guard);
+            drop(pipe);
+            crate::modules::floating_card_window::request_app_exit();
+            app.exit(0);
+            return Ok(());
+        }
+    }
+
+    app.request_restart();
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    #[test]
+    fn macos_update_relaunch_uses_the_bundle_path() {
+        let bundle = Path::new("/Applications/Cockpit Tools.app");
+        assert_eq!(
+            macos_update_bundle(&bundle.join("Contents/MacOS/cockpit-tools")),
+            Some(bundle)
+        );
+        assert_eq!(
+            macos_update_bundle(Path::new("/tmp/target/debug/cockpit-tools")),
+            None
+        );
+        assert_eq!(
+            macos_update_bundle(&bundle.join("Contents/Resources/cockpit-tools")),
+            None
+        );
+    }
 }

@@ -1,10 +1,12 @@
 import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { useDropdownPanelPlacement } from '../hooks/useDropdownPanelPlacement';
+import { useEscCloseTopmost } from '../hooks/useEscClose';
 import './AccountFilterDropdown.css';
 
 export interface SingleSelectFilterOption {
   value: string;
   label: string;
+  badge?: ReactNode;
 }
 
 interface SingleSelectFilterDropdownProps {
@@ -28,6 +30,10 @@ export function SingleSelectFilterDropdown({
 }: SingleSelectFilterDropdownProps) {
   const [open, setOpen] = useState(false);
   const rootRef = useRef<HTMLDivElement | null>(null);
+  useEscCloseTopmost(open, () => {
+    setOpen(false);
+    rootRef.current?.querySelector<HTMLButtonElement>('button')?.focus();
+  }, rootRef);
   const { panelPlacement, panelRef, scrollContainerStyle } = useDropdownPanelPlacement(
     rootRef,
     open,
@@ -79,6 +85,7 @@ export function SingleSelectFilterDropdown({
         <span className="single-filter-label" title={selectedOption?.label ?? placeholder ?? ''}>
           {selectedOption?.label ?? placeholder ?? ''}
         </span>
+        {selectedOption?.badge}
       </button>
       {open && (
         <div
@@ -99,6 +106,7 @@ export function SingleSelectFilterDropdown({
                   }}
                 >
                   <span className="tag-filter-name">{option.label}</span>
+                  {option.badge}
                 </button>
               );
             })}

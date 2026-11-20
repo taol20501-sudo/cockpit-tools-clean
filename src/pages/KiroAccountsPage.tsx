@@ -1,3 +1,5 @@
+import { useAccountsOverviewFilterState } from '../hooks/useAccountsOverviewFilterState';
+import { formatKiroImportError } from '../services/kiroImportErrors';
 import { useState, useEffect, useMemo, useCallback, Fragment } from 'react';
 import {
   Plus,
@@ -11,7 +13,8 @@ import {
   Database,
   Copy,
   Check,
-  ChevronLeft,
+  ArrowDown,
+  ArrowUp,
   RotateCw,
   CircleAlert,
   LayoutGrid,
@@ -26,6 +29,7 @@ import {
   Lock,
   BookOpen,
 } from 'lucide-react';
+import { AccountLastUsed } from '../components/AccountLastUsed';
 import { useKiroAccountStore } from '../stores/useKiroAccountStore';
 import * as kiroService from '../services/kiroService';
 import { TagEditModal } from '../components/TagEditModal';
@@ -64,12 +68,9 @@ import {
   normalizeAccountsOverviewScope,
   readAccountsOverviewFilterPersistenceEnabled,
   readAccountsOverviewFilterStringArray,
-  removeAccountsOverviewFilterField,
-  writeAccountsOverviewFilterField,
 } from '../utils/accountsOverviewFilterPersistence';
 
 const KIRO_FLOW_NOTICE_COLLAPSED_KEY = 'agtools.kiro.flow_notice_collapsed';
-const KIRO_CURRENT_ACCOUNT_ID_KEY = 'agtools.kiro.current_account_id';
 const KIRO_KNOWN_PLAN_FILTERS = ['FREE', 'INDIVIDUAL', 'PRO', 'BUSINESS', 'ENTERPRISE'] as const;
 const KIRO_FILTER_PERSISTENCE_SCOPE = normalizeAccountsOverviewScope('Kiro');
 const FILTER_TYPES_FIELD = 'filter_types';
@@ -85,7 +86,7 @@ export function KiroAccountsPage() {
   const [idcRegion, setIdcRegion] = useState('us-east-1');
   const [idcStartUrl, setIdcStartUrl] = useState('');
   const [idcFormError, setIdcFormError] = useState<string | null>(null);
-  const [filterTypes, setFilterTypes] = useState<string[]>(() =>
+  const [filterTypes, setFilterTypes] = useAccountsOverviewFilterState<string[]>(KIRO_FILTER_PERSISTENCE_SCOPE, FILTER_TYPES_FIELD, () =>
     readAccountsOverviewFilterPersistenceEnabled(KIRO_FILTER_PERSISTENCE_SCOPE)
       ? readAccountsOverviewFilterStringArray(KIRO_FILTER_PERSISTENCE_SCOPE, FILTER_TYPES_FIELD)
       : [],
@@ -98,7 +99,6 @@ export function KiroAccountsPage() {
     platformKey: 'Kiro',
     oauthLogPrefix: 'KiroOAuth',
     flowNoticeCollapsedKey: KIRO_FLOW_NOTICE_COLLAPSED_KEY,
-    currentAccountIdKey: KIRO_CURRENT_ACCOUNT_ID_KEY,
     exportFilePrefix: 'kiro_accounts',
     store: {
       accounts: store.accounts,
@@ -143,7 +143,6 @@ export function KiroAccountsPage() {
   const {
     t, locale, privacyModeEnabled, togglePrivacyMode, maskAccountText,
     viewMode, setViewMode, searchQuery, setSearchQuery,
-    filterPersistenceEnabled, filterPersistenceScope,
     sortBy, setSortBy, sortDirection, setSortDirection,
     selected, toggleSelect, toggleSelectAll,
     tagFilter, groupByTag, setGroupByTag, showTagFilter, setShowTagFilter,
@@ -197,14 +196,6 @@ export function KiroAccountsPage() {
     setIdcFormError(null);
     prepareOauthUrl();
   }, [idcRegion, idcStartUrl, prepareOauthUrl, t]);
-
-  useEffect(() => {
-    if (!filterPersistenceEnabled) {
-      removeAccountsOverviewFilterField(filterPersistenceScope, FILTER_TYPES_FIELD);
-      return;
-    }
-    writeAccountsOverviewFilterField(filterPersistenceScope, FILTER_TYPES_FIELD, filterTypes);
-  }, [filterPersistenceEnabled, filterPersistenceScope, filterTypes]);
 
   const toggleFilterTypeValue = useCallback((value: string) => {
     setFilterTypes((prev) => {
@@ -619,9 +610,11 @@ export function KiroAccountsPage() {
       const moreTagCount = Math.max(0, accountTags.length - visibleTags.length);
       const isSelected = selected.has(account.id);
       const isCurrent = currentAccountId === account.id;
-      const quotaError = account.quota_query_last_error?.trim();
+      const quotaError = account.quota_query_last_error?.trim()
+        ? formatKiroImportError(account.quota_query_last_error.trim(), t) : undefined;
       const hasQuotaData = hasKiroQuotaData(account);
-      const statusReason = presentation.accountStatusReason;
+      const statusReason = presentation.accountStatusReason
+        ? formatKiroImportError(presentation.accountStatusReason, t) : null;
       const isBanned = presentation.isBanned;
       const hasStatusError = presentation.hasStatusError;
       const bannedTitle = statusReason || t('accounts.status.forbidden_tooltip');
@@ -723,7 +716,7 @@ export function KiroAccountsPage() {
           </div>
 
           <div className="card-footer">
-            <span className="card-date">{formatDate(account.created_at)}</span>
+            <AccountLastUsed accountId={account.id} lastSwitchedAt={account.last_switched_at} createdAt={account.created_at} formatDate={formatDate} />
             <div className="card-actions">
               <button className="card-action-btn success" onClick={() => handleInjectToVSCode?.(account.id)} disabled={!!injecting || isBanned}
                 title={isBanned ? t('accounts.status.forbidden_msg') : t('kiro.injectToVSCode', '切换到 Kiro')}>
@@ -771,9 +764,11 @@ export function KiroAccountsPage() {
       const visibleTags = accountTags.slice(0, 3);
       const moreTagCount = Math.max(0, accountTags.length - visibleTags.length);
       const isCurrent = currentAccountId === account.id;
-      const quotaError = account.quota_query_last_error?.trim();
+      const quotaError = account.quota_query_last_error?.trim()
+        ? formatKiroImportError(account.quota_query_last_error.trim(), t) : undefined;
       const hasQuotaData = hasKiroQuotaData(account);
-      const statusReason = presentation.accountStatusReason;
+      const statusReason = presentation.accountStatusReason
+        ? formatKiroImportError(presentation.accountStatusReason, t) : null;
       const isBanned = presentation.isBanned;
       const hasStatusError = presentation.hasStatusError;
       const bannedTitle = statusReason || t('accounts.status.forbidden_tooltip');
@@ -996,7 +991,7 @@ export function KiroAccountsPage() {
           <button className="sort-direction-btn" onClick={() => setSortDirection((prev) => (prev === 'desc' ? 'asc' : 'desc'))}
             title={sortDirection === 'desc' ? t('common.shared.sort.descTooltip', '当前：降序，点击切换为升序') : t('common.shared.sort.ascTooltip', '当前：升序，点击切换为降序')}
             aria-label={t('common.shared.sort.toggleDirection', '切换排序方向')}>
-            {sortDirection === 'desc' ? '⬇' : '⬆'}
+            {sortDirection === 'desc' ? <ArrowDown size={15} /> : <ArrowUp size={15} />}
           </button>
         </div>
         <div className="toolbar-right">
@@ -1154,7 +1149,6 @@ export function KiroAccountsPage() {
         <div className="modal-overlay">
           <div className="modal-content ghcp-add-modal platform-account-add-modal" onClick={(e) => e.stopPropagation()}>
             <div className="modal-header">
-              <button className="btn btn-secondary icon-only" onClick={closeAddModal} title={t('common.back', '返回')} aria-label={t('common.back', '返回')}><ChevronLeft size={14} /></button>
               <h2>{t('kiro.addModal.title', '添加 Kiro 账号')}</h2>
               <button className="modal-close" onClick={closeAddModal} aria-label={t('common.close', '关闭')}><X /></button>
             </div>
@@ -1292,15 +1286,26 @@ export function KiroAccountsPage() {
                 <div className="add-section">
                   <p className="section-desc">{t('kiro.token.desc', '粘贴您的 Kiro Access Token 或导出的 JSON 数据。')}</p>
                   <details className="token-format-collapse">
-                    <summary className="token-format-collapse-summary">必填字段与示例（点击展开）</summary>
+                    <summary className="token-format-collapse-summary">
+                      {t('common.shared.tokenFormat.summary', '必填字段与示例（点击展开）')}
+                    </summary>
                     <div className="token-format">
-                      <p className="token-format-required">必填字段：JSON 建议使用 access_token + refresh_token（accessToken/refreshToken 仅兼容）</p>
+                      <p className="token-format-required">
+                        {t(
+                          'kiro.token.requiredFields',
+                          '必填字段：JSON 建议使用 access_token + refresh_token（accessToken/refreshToken 仅兼容）',
+                        )}
+                      </p>
                       <div className="token-format-group">
-                        <div className="token-format-label">单条示例（JSON）</div>
+                        <div className="token-format-label">
+                          {t('common.shared.tokenFormat.singleJson', '单条示例（JSON）')}
+                        </div>
                         <pre className="token-format-code">{KIRO_TOKEN_SINGLE_EXAMPLE}</pre>
                       </div>
                       <div className="token-format-group">
-                        <div className="token-format-label">批量示例（JSON）</div>
+                        <div className="token-format-label">
+                          {t('common.shared.tokenFormat.batchJson', '批量示例（JSON）')}
+                        </div>
                         <pre className="token-format-code">{KIRO_TOKEN_BATCH_EXAMPLE}</pre>
                       </div>
                     </div>

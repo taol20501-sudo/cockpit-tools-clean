@@ -25,9 +25,20 @@
   padding-bottom: 32px;
 }
 
+.codex-api-service-page .page-tabs-row-with-leading .page-tabs {
+  min-width: 0;
+  max-width: 100%;
+  overflow-x: auto;
+}
+
+.codex-api-service-page .page-tabs .filter-tab {
+  flex: 0 0 auto;
+  white-space: nowrap;
+}
+
 .codex-api-service-hero {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) auto;
+  grid-template-columns: minmax(220px, 1fr) minmax(0, 1.5fr);
   align-items: center;
   gap: 10px;
   min-width: 0;
@@ -45,6 +56,23 @@
 
 .codex-api-service-hero-main {
   min-width: 0;
+}
+
+.codex-api-service-hero-speed {
+  grid-column: 1 / -1;
+  min-width: 0;
+  padding-top: 10px;
+  border-top: 1px solid var(--codex-api-border-soft);
+}
+
+.codex-api-service-hero-speed .codex-speed-control {
+  width: 100%;
+  gap: 8px 12px;
+}
+
+.codex-api-service-hero-speed .codex-speed-control-hint {
+  flex: 1 1 260px;
+  max-width: none;
 }
 
 .codex-api-service-title-row {
@@ -88,6 +116,7 @@
 
 .codex-api-service-title-row h1 {
   min-width: 0;
+  white-space: nowrap;
   color: var(--text-primary);
   font-size: 14px;
   line-height: 1.2;
@@ -334,7 +363,7 @@
 
 .codex-api-service-summary-grid {
   display: grid;
-  grid-template-columns: repeat(5, minmax(112px, 1fr));
+  grid-template-columns: repeat(6, minmax(112px, 1fr));
   gap: 8px;
   min-width: 0;
   overflow-x: auto;
@@ -604,10 +633,48 @@
   font-size: 12px;
 }
 
-.codex-api-service-config-list label > input[type="checkbox"] {
+.codex-api-service-config-list label > input[type="checkbox"],
+.codex-api-service-routing-form label > input[type="checkbox"],
+.codex-api-service-account-model-check input[type="checkbox"] {
+  appearance: none;
   width: 18px;
   height: 18px;
-  accent-color: var(--primary);
+  flex: 0 0 18px;
+  margin: 0;
+  border: 1.5px solid var(--border-strong, var(--border));
+  border-radius: 6px;
+  background: var(--bg-surface);
+  cursor: pointer;
+  transition:
+    border-color 140ms ease,
+    background-color 140ms ease,
+    box-shadow 140ms ease;
+}
+
+.codex-api-service-config-list label > input[type="checkbox"]:checked,
+.codex-api-service-routing-form label > input[type="checkbox"]:checked,
+.codex-api-service-account-model-check input[type="checkbox"]:checked {
+  border-color: var(--primary);
+  background-color: var(--primary);
+  background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 16 16' xmlns='http://www.w3.org/2000/svg'%3E%3Cpath d='M3.5 8.2 6.6 11.2 12.6 4.8' fill='none' stroke='white' stroke-width='2.1' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+  background-position: center;
+  background-repeat: no-repeat;
+  background-size: 14px 14px;
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--primary) 12%, transparent);
+}
+
+.codex-api-service-config-list label > input[type="checkbox"]:focus-visible,
+.codex-api-service-routing-form label > input[type="checkbox"]:focus-visible,
+.codex-api-service-account-model-check input[type="checkbox"]:focus-visible {
+  border-color: var(--primary);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--primary) 16%, transparent);
+}
+
+.codex-api-service-config-list label > input[type="checkbox"]:disabled,
+.codex-api-service-routing-form label > input[type="checkbox"]:disabled,
+.codex-api-service-account-model-check input[type="checkbox"]:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
 }
 
 .codex-api-service-routing-form {
@@ -696,7 +763,7 @@
 }
 
 .codex-api-service-proxy-input-row {
-  max-width: 67%;
+  width: 100%;
 }
 
 .codex-api-service-stacked-control {
@@ -1022,6 +1089,11 @@
   transition: border-color 0.16s ease, background 0.16s ease, box-shadow 0.16s ease;
 }
 
+.codex-api-service-key-card:focus {
+  outline: 2px solid var(--primary);
+  outline-offset: 2px;
+}
+
 .codex-api-service-key-main {
   display: grid;
   grid-template-columns: minmax(180px, 0.9fr) minmax(260px, 1.25fr) minmax(78px, auto) minmax(122px, auto) auto;
@@ -1076,7 +1148,7 @@
 
 .api-key-details-row {
   display: grid;
-  grid-template-columns: minmax(190px, 0.55fr) minmax(180px, 0.5fr) minmax(500px, 1.45fr);
+  grid-template-columns: minmax(170px, 0.6fr) minmax(160px, 0.55fr) minmax(0, 1.45fr);
   gap: 10px;
   min-width: 0;
 }
@@ -1266,11 +1338,6 @@
   transform: rotate(180deg);
 }
 
-html[data-reduced-motion="true"] .codex-api-service-summary-card:hover,
-html[data-reduced-motion="true"] .codex-api-service-key-advanced-toggle[aria-expanded="true"] .codex-api-service-key-advanced-state svg {
-  transform: none;
-}
-
 .codex-api-service-key-policy {
   display: grid;
   gap: 9px;
@@ -1330,6 +1397,12 @@ html[data-reduced-motion="true"] .codex-api-service-key-advanced-toggle[aria-exp
   color: var(--text-muted);
   font-size: 11px;
   line-height: 1.4;
+}
+
+.api-key-token-limit-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
 }
 
 .api-key-account-scope {
@@ -1540,6 +1613,12 @@ html[data-reduced-motion="true"] .codex-api-service-key-advanced-toggle[aria-exp
   align-items: stretch;
 }
 
+.codex-key-model-allowlist-editor {
+  display: grid;
+  gap: 8px;
+  min-width: 0;
+}
+
 .codex-api-service-policy-grid label {
   display: grid;
   grid-template-rows: 18px auto;
@@ -1632,6 +1711,47 @@ html[data-reduced-motion="true"] .codex-api-service-key-advanced-toggle[aria-exp
   flex-wrap: wrap;
   gap: 7px;
   min-width: 0;
+}
+
+.codex-pool-quota-floor {
+  grid-column: 1 / -1;
+  color: var(--text-secondary);
+  font-size: 12px;
+}
+
+.codex-pool-quota-floor summary {
+  width: fit-content;
+  cursor: pointer;
+  color: var(--text-info);
+}
+
+.codex-pool-quota-floor form {
+  display: grid;
+  gap: 8px;
+  margin-top: 8px;
+}
+
+.codex-pool-quota-floor form p {
+  margin: 0;
+}
+
+.codex-pool-quota-floor form > div {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.codex-pool-quota-floor input {
+  width: 4.5em;
+  padding: 5px 8px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg-surface);
+  color: var(--text-primary);
+}
+
+.codex-pool-quota-floor [role="alert"] {
+  color: var(--text-negative);
 }
 
 .codex-api-service-account-card strong {
@@ -1879,7 +1999,8 @@ html[data-reduced-motion="true"] .codex-api-service-key-advanced-toggle[aria-exp
   padding: 24px;
 }
 
-.codex-api-service-pricing-modal {
+.modal.codex-api-service-pricing-modal {
+  width: min(980px, calc(100vw - 48px));
   max-width: min(980px, calc(100vw - 48px));
   max-height: min(760px, calc(100vh - 48px));
 }
@@ -1923,13 +2044,13 @@ html[data-reduced-motion="true"] .codex-api-service-key-advanced-toggle[aria-exp
 .codex-api-service-pricing-reprice.is-failed {
   border-color: rgba(239, 68, 68, 0.24);
   background: rgba(239, 68, 68, 0.1);
-  color: #b91c1c;
+  color: var(--text-negative);
 }
 
 .codex-api-service-pricing-reprice.is-completed {
   border-color: rgba(34, 197, 94, 0.22);
   background: rgba(34, 197, 94, 0.1);
-  color: #15803d;
+  color: var(--text-positive);
 }
 
 .codex-api-service-pricing-reprice-head {
@@ -1952,7 +2073,8 @@ html[data-reduced-motion="true"] .codex-api-service-key-advanced-toggle[aria-exp
   font-size: 12px;
 }
 
-.codex-api-service-timeouts-modal {
+.modal.codex-api-service-timeouts-modal {
+  width: min(760px, calc(100vw - 48px));
   max-width: min(760px, calc(100vw - 48px));
   max-height: min(720px, calc(100vh - 48px));
 }
@@ -1968,6 +2090,10 @@ html[data-reduced-motion="true"] .codex-api-service-key-advanced-toggle[aria-exp
 .codex-api-service-timeout-section {
   display: grid;
   gap: 10px;
+}
+
+.codex-api-service-timeouts-body input[aria-invalid="true"] {
+  border-color: var(--danger);
 }
 
 .codex-api-service-timeout-section h3 {
@@ -1992,13 +2118,15 @@ html[data-reduced-motion="true"] .codex-api-service-key-advanced-toggle[aria-exp
   gap: 12px;
 }
 
-.codex-api-service-timeout-preset-row label {
+.codex-api-service-timeout-preset-row label,
+.codex-api-service-timeout-preset-select {
   display: grid;
   gap: 6px;
   min-width: 0;
 }
 
-.codex-api-service-timeout-preset-row label > span {
+.codex-api-service-timeout-preset-row label > span,
+.codex-api-service-timeout-preset-select > span {
   color: var(--text-secondary);
   font-size: 12px;
   line-height: 1.35;
@@ -2013,9 +2141,10 @@ html[data-reduced-motion="true"] .codex-api-service-key-advanced-toggle[aria-exp
 .codex-api-service-pricing-table {
   --codex-api-service-pricing-x-padding: 12px;
   display: grid;
+  flex: 1 1 auto;
   min-width: 0;
-  min-height: 0;
-  max-height: 536px;
+  min-height: 160px;
+  max-height: none;
   overflow: auto;
   border: 1px solid var(--border-light);
   border-radius: var(--radius-lg);
@@ -2072,14 +2201,6 @@ html[data-reduced-motion="true"] .codex-api-service-key-advanced-toggle[aria-exp
   align-items: center;
   min-width: 0;
   cursor: pointer;
-}
-
-.codex-api-service-account-model-check input {
-  width: 16px;
-  height: 16px;
-  flex: 0 0 16px;
-  margin: 0;
-  accent-color: var(--color-primary);
 }
 
 .codex-api-service-account-model-check > span {
@@ -2361,7 +2482,7 @@ html[data-reduced-motion="true"] .codex-api-service-key-advanced-toggle[aria-exp
 
 .codex-api-service-log-filters {
   display: grid;
-  grid-template-columns: repeat(7, minmax(120px, 1fr)) auto;
+  grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
   align-items: end;
   gap: 8px;
   min-width: 0;
@@ -2676,12 +2797,12 @@ html[data-reduced-motion="true"] .codex-api-service-key-advanced-toggle[aria-exp
     padding: 12px;
   }
 
-  .codex-api-service-pricing-modal {
+  .modal.codex-api-service-pricing-modal {
     max-width: calc(100vw - 24px);
     max-height: calc(100vh - 24px);
   }
 
-  .codex-api-service-timeouts-modal {
+  .modal.codex-api-service-timeouts-modal {
     max-width: calc(100vw - 24px);
     max-height: calc(100vh - 24px);
   }
@@ -2733,10 +2854,6 @@ html[data-reduced-motion="true"] .codex-api-service-key-advanced-toggle[aria-exp
   .codex-api-service-input-row .btn,
   .codex-api-service-hero-actions .btn {
     width: 100%;
-  }
-
-  .codex-api-service-proxy-input-row {
-    max-width: none;
   }
 
   .codex-api-service-copy-row .folder-icon-btn {
@@ -2816,8 +2933,8 @@ html[data-reduced-motion="true"] .codex-api-service-key-advanced-toggle[aria-exp
 }
 
 .codex-api-service-hero {
-  min-height: 76px;
-  padding: 16px 18px;
+  min-height: 60px;
+  padding: 12px 16px;
   border-radius: var(--codex-api-studio-radius);
   background:
     linear-gradient(135deg, color-mix(in srgb, var(--primary) 10%, transparent), transparent 48%),
@@ -2889,7 +3006,7 @@ html[data-reduced-motion="true"] .codex-api-service-key-advanced-toggle[aria-exp
 }
 
 .codex-api-service-summary-card:nth-child(2) strong {
-  color: #0f8b6d;
+  color: var(--text-teal);
 }
 
 .codex-api-service-summary-card:nth-child(3)::before {
@@ -2897,7 +3014,7 @@ html[data-reduced-motion="true"] .codex-api-service-key-advanced-toggle[aria-exp
 }
 
 .codex-api-service-summary-card:nth-child(3) strong {
-  color: #b85d0c;
+  color: var(--text-caution);
 }
 
 .codex-api-service-summary-card:nth-child(4)::before {
@@ -2905,7 +3022,7 @@ html[data-reduced-motion="true"] .codex-api-service-key-advanced-toggle[aria-exp
 }
 
 .codex-api-service-summary-card:nth-child(4) strong {
-  color: #087ca0;
+  color: var(--text-info);
 }
 
 .codex-api-service-summary-card:nth-child(5)::before {
@@ -2913,7 +3030,7 @@ html[data-reduced-motion="true"] .codex-api-service-key-advanced-toggle[aria-exp
 }
 
 .codex-api-service-summary-card:nth-child(5) strong {
-  color: #7045bf;
+  color: var(--text-purple);
 }
 
 .codex-api-service-panel {
@@ -2959,9 +3076,14 @@ html[data-reduced-motion="true"] .codex-api-service-key-advanced-toggle[aria-exp
 }
 
 /* The sidebar consumes width even when the native window is wider than 860px. */
-@container (max-width: 760px) {
+@container (max-width: 900px) {
   .codex-api-service-hero { grid-template-columns: minmax(0, 1fr); align-items: start; }
   .codex-api-service-hero-actions, .codex-api-service-head-actions { justify-content: flex-start; }
   .codex-api-service-panel-head { flex-wrap: wrap; }
   .codex-api-service-panel-head h2 { flex-basis: 100%; }
+}
+
+.codex-overload-attempt code {
+  min-width: 0;
+  overflow-wrap: anywhere;
 }

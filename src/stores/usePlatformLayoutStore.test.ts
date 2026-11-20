@@ -1,0 +1,240 @@
+import assert from 'node:assert/strict';
+import test from 'node:test';
+import { clearMocks, mockIPC } from '@tauri-apps/api/mocks';
+import { ALL_PLATFORM_IDS, MENU_VISIBLE_PLATFORM_IDS } from '../types/platform';
+
+test('only Codex and its API service are grouped by default and explicit layouts survive hydration', async () => {
+  const previousWindow = Object.getOwnPropertyDescriptor(globalThis, 'window');
+  const previousStorage = Object.getOwnPropertyDescriptor(globalThis, 'localStorage');
+  const key = 'agtools.platform_layout.v1';
+  const values = new Map<string, string>();
+  const storage = {
+    getItem: (name: string) => values.get(name) ?? null,
+    setItem: (name: string, value: string) => { values.set(name, value); },
+    removeItem: (name: string) => { values.delete(name); },
+  };
+  const windowMock = Object.assign(new EventTarget(), {
+    localStorage: storage,
+    setTimeout: () => 0,
+    clearTimeout: () => {},
+  });
+  const layout = (client: 'antigravity' | 'antigravity_ide', includeIde: boolean) => JSON.stringify({
+    orderedPlatformIds: ['antigravity', 'antigravity_ide'],
+    platformGroups: [{
+      id: 'antigravity-suite', name: 'My Antigravity',
+      platformIds: includeIde ? ['antigravity', 'antigravity_ide'] : ['antigravity'],
+      defaultPlatformId: client, iconKind: 'platform', iconPlatformId: client,
+    }],
+  });
+  try {
+    Object.defineProperty(globalThis, 'window', { configurable: true, value: windowMock });
+    Object.defineProperty(globalThis, 'localStorage', { configurable: true, value: storage });
+    const savedAppLayout = layout('antigravity', false);
+    let durable = savedAppLayout;
+    let revision = 1;
+    mockIPC((command, args) => {
+      if (command === 'load_ui_preferences') return { values: { [key]: durable }, revisions: { [key]: revision } };
+      if (command === 'update_ui_preference') {
+        durable = (args as { value: string }).value;
+        revision++;
+        return { values: { [key]: durable }, revisions: { [key]: revision } };
+      }
+      return null;
+    });
+    storage.setItem(key, savedAppLayout);
+    const prefs = await import('../utils/uiPreferences.ts');
+    const { usePlatformLayoutStore } = await import('./usePlatformLayoutStore.ts');
+    const group = () => usePlatformLayoutStore.getState().platformGroups.find(
+      (item) => item.id === 'antigravity-suite',
+    )!;
+    assert.deepEqual(group().platformIds, ['antigravity']);
+    assert.equal(group().defaultPlatformId, 'antigravity');
+    assert.equal(group().iconPlatformId, 'antigravity');
+    assert.equal(storage.getItem(key), savedAppLayout, 'startup normalization must not rewrite preferences');
+    for (const client of ['antigravity_ide', 'antigravity'] as const) {
+      await prefs.restorePlatformLayout(prefs.validateImportedPlatformLayout(layout(client, true)));
+      assert.deepEqual(group().platformIds, ['antigravity']);
+      assert.equal(group().defaultPlatformId, 'antigravity');
+      assert.equal(group().iconPlatformId, 'antigravity');
+    }
+    const hydrate = async (value: object | null) => {
+      await prefs.restorePlatformLayout(prefs.validateImportedPlatformLayout(value));
+      return usePlatformLayoutStore.getState();
+    };
+    const assertDefaultGrouping = (state: ReturnType<typeof usePlatformLayoutStore.getState>) => {
+      assert.equal(state.platformGroups.length, 1);
+      assert.deepEqual(state.platformGroups[0].platformIds, ['codex', 'codex_api_service']);
+      for (const id of MENU_VISIBLE_PLATFORM_IDS.filter((id) => id !== 'codex' && id !== 'codex_api_service')) {
+        assert.ok(state.orderedEntryIds.includes(`platform:${id}`));
+      }
+    };
+    const independent = await hydrate(null);
+    assertDefaultGrouping(independent);
+    assert.deepEqual(independent.orderedEntryIds, MENU_VISIBLE_PLATFORM_IDS.filter((id) => id !== 'codex_api_service')
+      .map((id) => id === 'codex' ? 'group:codex-suite' : `platform:${id}`));
+    assert.equal(independent.independentPlatformsMigrated, true);
+    assert.equal(independent.codexApiServiceDefaultGrouped, true);
+    assertDefaultGrouping(await hydrate({ orderedPlatformIds: ['codex'] }));
+    assertDefaultGrouping(await hydrate({ platformGroups: [], traeSuiteDefaultGroupRestored: false, codexApiServiceSuiteMigrated: false }));
+
+    // Older standalone items must not be reassembled into automatic suites.
+    const singletons = ALL_PLATFORM_IDS.map((id) => ({
+      id: `platform-${id}`, name: id === 'codex' ? 'Codex' : id,
+      platformIds: [id], defaultPlatformId: id, iconKind: 'platform', iconPlatformId: id,
+    }));
+    const oldStandalone = await hydrate({ platformGroups: [singletons.find((item) => item.id === 'platform-codex')] });
+    assertDefaultGrouping(oldStandalone);
+    for (const [platformId, members] of [
+      ['antigravity', ['antigravity', 'antigravity_ide']],
+      ['codex', ['codex', 'codex_api_service']],
+    ] as const) {
+      const legacyExpanded = await hydrate({ platformGroups: [{
+        id: `platform-${platformId}`, name: platformId === 'codex' ? 'Codex' : 'Antigravity',
+        platformIds: members, defaultPlatformId: platformId, iconKind: 'platform', iconPlatformId: platformId,
+      }], orderedEntryIds: [`group:platform-${platformId}`] });
+      assertDefaultGrouping(legacyExpanded);
+      if (platformId === 'codex') {
+        assert.equal(legacyExpanded.orderedEntryIds[0], 'group:platform-codex');
+      } else {
+        assert.equal(legacyExpanded.orderedEntryIds[0], 'platform:antigravity');
+        assert.ok(!legacyExpanded.orderedEntryIds.includes('platform:antigravity_ide'));
+      }
+    }
+
+    const suites = [
+      { id: 'antigravity-suite', name: 'Antigravity', platformIds: ['antigravity', 'antigravity_ide'], defaultPlatformId: 'antigravity_ide', iconKind: 'platform', iconPlatformId: 'antigravity_ide' },
+      { id: 'codex-suite', name: 'Codex', platformIds: ['codex', 'codex_api_service'], defaultPlatformId: 'codex', iconKind: 'platform', iconPlatformId: 'codex' },
+      { id: 'codebuddy-suite', name: 'CodeBuddy', platformIds: ['codebuddy', 'codebuddy_cn', 'workbuddy'], defaultPlatformId: 'codebuddy', iconKind: 'platform', iconPlatformId: 'codebuddy' },
+      { id: 'trae-suite', name: 'Trae', platformIds: ['trae', 'trae_solo', 'trae_cn', 'trae_solo_cn'], defaultPlatformId: 'trae', iconKind: 'platform', iconPlatformId: 'trae' },
+    ];
+    const old = {
+      platformGroups: suites,
+      orderedEntryIds: ['group:codex-suite', 'platform:zed', 'group:trae-suite', 'group:antigravity-suite', 'group:codebuddy-suite'],
+      hiddenEntryIds: ['group:codex-suite'], sidebarEntryIds: ['group:trae-suite'],
+      apiRelayEntryOrder: 1,
+    };
+    const migrated = await hydrate(old);
+    assertDefaultGrouping(migrated);
+    assert.deepEqual(migrated.orderedEntryIds.slice(0, 2), ['group:codex-suite', 'platform:zed']);
+    assert.deepEqual(migrated.hiddenEntryIds, ['group:codex-suite']);
+    assert.deepEqual(migrated.sidebarEntryIds, ['platform:trae', 'platform:trae_solo', 'platform:trae_cn', 'platform:trae_solo_cn']);
+    assert.equal(migrated.apiRelayEntryOrder, 1);
+    assert.deepEqual(JSON.parse(prefs.readPlatformLayout()!).orderedEntryIds, old.orderedEntryIds);
+    assert.equal(storage.getItem(key), savedAppLayout, 'imports do not write the old cache');
+
+    const traeSuite = {
+      ...suites[3],
+      childConfigs: [
+        { platformId: 'trae_solo', name: 'TRAE SOLO' },
+        { platformId: 'trae_solo_cn', name: 'TRAE SOLO CN\u200b' },
+        { platformId: 'trae_cn', name: 'My Trae IDE' },
+      ],
+    };
+    const renamedLayout = await hydrate({ independentPlatformsMigrated: true, platformGroups: [traeSuite] });
+    const renamedSuite = renamedLayout.platformGroups.find((item) => item.id === traeSuite.id)!;
+    assert.deepEqual(renamedSuite.platformIds, traeSuite.platformIds);
+    const childNames = Object.fromEntries(renamedSuite.childConfigs!.map(({ platformId, name }) => [platformId, name]));
+    assert.deepEqual(childNames, {
+      trae_solo: 'TraeWork',
+      trae_solo_cn: 'TraeWork CN',
+      trae_cn: 'My Trae IDE',
+    });
+
+    for (const customized of [
+      { ...suites[1], name: 'My models' },
+      { ...suites[1], defaultPlatformId: 'codex_api_service' },
+      { ...suites[1], platformIds: ['codex'] },
+      { ...suites[1], iconKind: 'custom', iconCustomDataUrl: 'data:image/png;base64,AQ==' },
+      { ...suites[1], childConfigs: [{ platformId: 'codex', name: 'My Codex' }] },
+      { ...suites[0], name: 'Antigravity IDE' },
+    ]) {
+      const kept = await hydrate({ platformGroups: [customized] });
+      const savedGroup = kept.platformGroups.find((item) => item.id === customized.id)!;
+      assert.equal(savedGroup.name, customized.name);
+      assert.deepEqual(savedGroup.platformIds, customized.platformIds.filter((id) => id !== 'antigravity_ide'));
+    }
+    const merged = await hydrate({
+      orderedEntryIds: ['platform:antigravity_ide', 'platform:zed', 'platform:antigravity'],
+      sidebarEntryIds: ['platform:antigravity_ide'],
+      disabledPlatformIds: ['antigravity_ide'],
+      apiRelayEntryOrder: 3,
+    });
+    assert.deepEqual(merged.orderedEntryIds.slice(0, 2), ['platform:antigravity', 'platform:zed']);
+    assert.deepEqual(merged.sidebarEntryIds, ['platform:antigravity']);
+    assert.deepEqual(merged.disabledPlatformIds, ['antigravity_ide']);
+    assert.equal(merged.apiRelayEntryOrder, 2);
+    const legacyPlacement = await hydrate({
+      orderedPlatformIds: ['antigravity_ide', 'zed'],
+      sidebarPlatformIds: ['antigravity_ide'],
+    });
+    assert.deepEqual(legacyPlacement.sidebarEntryIds, ['platform:antigravity']);
+    assert.deepEqual(legacyPlacement.orderedEntryIds.slice(0, 2), ['platform:antigravity', 'platform:zed']);
+    await hydrate(null);
+    usePlatformLayoutStore.getState().upsertPlatformGroup(suites[1] as Parameters<typeof independent.upsertPlatformGroup>[0]);
+    const manuallySaved = JSON.parse(prefs.readPlatformLayout()!);
+    assert.equal(manuallySaved.independentPlatformsMigrated, true);
+    assert.equal(manuallySaved.codexApiServiceDefaultGrouped, true);
+    assert.equal((await hydrate(manuallySaved)).platformGroups[0].id, 'codex-suite', 'explicit regrouping survives reload');
+    usePlatformLayoutStore.getState().removePlatformGroup('codex-suite');
+    assert.deepEqual(usePlatformLayoutStore.getState().platformGroups, []);
+    assert.ok(usePlatformLayoutStore.getState().orderedEntryIds.includes('platform:codex'));
+    assert.ok(usePlatformLayoutStore.getState().orderedEntryIds.includes('platform:codex_api_service'));
+    assert.deepEqual((await hydrate(JSON.parse(prefs.readPlatformLayout()!))).platformGroups, [], 'a later explicit split must not be re-grouped');
+    assertDefaultGrouping(await hydrate({ platformGroups: suites, orderedEntryIds: 'invalid' }));
+    const previewUpgrade = await hydrate({ independentPlatformsMigrated: true, platformGroups: [],
+      orderedEntryIds: ['platform:codex', 'platform:codex_api_service', 'platform:zed'],
+      hiddenEntryIds: ['platform:codex_api_service'], sidebarEntryIds: ['platform:codex'], apiRelayEntryOrder: 2 });
+    assertDefaultGrouping(previewUpgrade);
+    assert.equal(previewUpgrade.orderedEntryIds[0], 'group:codex-suite');
+    assert.equal(previewUpgrade.apiRelayEntryOrder, 1);
+    assert.deepEqual(previewUpgrade.hiddenEntryIds, ['group:codex-suite']);
+    assert.deepEqual(previewUpgrade.sidebarEntryIds, ['group:codex-suite']);
+    const grouped = await hydrate({
+      platformGroups: [suites[1]],
+      sidebarEntryIds: ['group:codex-suite', 'platform:codex_api_service'],
+    });
+    assert.deepEqual(grouped.sidebarEntryIds, ['group:codex-suite', 'platform:codex_api_service']);
+    assert.deepEqual(grouped.platformGroups[0].platformIds, ['codex', 'codex_api_service']);
+    grouped.setSidebarEntry('group:codex-suite', false);
+    assert.deepEqual(usePlatformLayoutStore.getState().sidebarEntryIds, ['platform:codex_api_service']);
+    grouped.setSidebarEntry('platform:codex_api_service', false);
+    assert.deepEqual(usePlatformLayoutStore.getState().sidebarEntryIds, []);
+    grouped.setSidebarEntry('group:codex-suite', true);
+    assert.deepEqual(usePlatformLayoutStore.getState().sidebarEntryIds, ['group:codex-suite']);
+    grouped.upsertPlatformGroup({ ...grouped.platformGroups[0], platformIds: ['codex'] });
+    usePlatformLayoutStore.getState().setSidebarPlatform('codex_api_service', true);
+    const separated = usePlatformLayoutStore.getState();
+    assert.ok(separated.sidebarEntryIds.includes('platform:codex_api_service'));
+    assert.ok(separated.sidebarEntryIds.includes('group:codex-suite'));
+    const restored = await hydrate({
+      platformGroups: separated.platformGroups,
+      orderedEntryIds: separated.orderedEntryIds,
+      sidebarEntryIds: separated.sidebarEntryIds,
+      codexApiServiceDefaultGrouped: true,
+    });
+    assert.ok(restored.sidebarEntryIds.includes('platform:codex_api_service'));
+    restored.upsertPlatformGroup({ ...restored.platformGroups[0], platformIds: ['codex', 'codex_api_service'] });
+    assert.deepEqual(usePlatformLayoutStore.getState().sidebarEntryIds, ['group:codex-suite', 'platform:codex_api_service']);
+    const customWithAntigravity = await hydrate({
+      platformGroups: [{ ...suites[0], id: 'my-editors', platformIds: ['antigravity', 'qoder'] }],
+      sidebarEntryIds: ['platform:antigravity'],
+    });
+    assert.deepEqual(customWithAntigravity.sidebarEntryIds, ['platform:antigravity']);
+    const customCodex = { ...suites[1], id: 'my-codex', name: 'My Codex', platformIds: ['codex'] };
+    assert.equal((await hydrate({ platformGroups: [customCodex] })).platformGroups.length, 1);
+    assert.equal(usePlatformLayoutStore.getState().platformGroups[0].id, 'my-codex');
+    assert.ok(usePlatformLayoutStore.getState().orderedEntryIds.includes('platform:codex_api_service'));
+    usePlatformLayoutStore.getState().resetPlatformLayout();
+    assertDefaultGrouping(usePlatformLayoutStore.getState());
+    assertDefaultGrouping(await hydrate(JSON.parse(prefs.readPlatformLayout()!)));
+  } finally {
+    // Allow the sidebar store's deferred legacy-key cleanup to finish before
+    // restoring global storage, including when an assertion fails.
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    clearMocks();
+    if (previousWindow) Object.defineProperty(globalThis, 'window', previousWindow);
+    else Reflect.deleteProperty(globalThis, 'window');
+    if (previousStorage) Object.defineProperty(globalThis, 'localStorage', previousStorage);
+    else Reflect.deleteProperty(globalThis, 'localStorage');
+  }
+});

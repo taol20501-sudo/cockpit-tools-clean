@@ -4,12 +4,11 @@ const os = require('node:os');
 const path = require('node:path');
 
 const repoRoot = path.resolve(__dirname, '..');
-const goBinPath = 'C:\\Program Files\\Go\\bin';
 const cargoBinPath = path.join(os.homedir(), '.cargo', 'bin');
 
 function withToolchainPaths(options = {}) {
   const currentPath = process.env.PATH || '';
-  const extraPaths = [cargoBinPath, goBinPath].filter((dir) => fs.existsSync(dir));
+  const extraPaths = [cargoBinPath].filter((dir) => fs.existsSync(dir));
   const pathValue = extraPaths.length > 0
     ? `${extraPaths.join(path.delimiter)}${path.delimiter}${currentPath}`
     : currentPath;
@@ -42,12 +41,24 @@ function run(command, args, options = {}) {
 }
 
 function runFinal(command, args, options = {}) {
-  const result = spawnSync(command, args, {
-    cwd: repoRoot,
-    stdio: 'inherit',
-    shell: false,
-    ...withToolchainPaths(options),
-  });
+  const isMacBuild = process.platform === 'darwin' && ['build', 'bundle'].includes(process.argv[2]);
+  const mounts = isMacBuild ? require('./release/dmg-mounts.cjs').createDmgMounts() : null;
+  if (mounts) {
+    mounts.watchBuildImages(path.resolve(repoRoot, process.env.CARGO_TARGET_DIR || 'target'));
+    mounts.installExitHandlers();
+  }
+  let result;
+  try {
+    result = spawnSync(command, args, {
+      cwd: repoRoot,
+      stdio: 'inherit',
+      shell: false,
+      ...withToolchainPaths(options),
+    });
+  } finally {
+    // Also clean Tauri's writable scratch image when the bundler fails.
+    mounts?.cleanup();
+  }
 
   if (result.error) {
     throw result.error;
@@ -96,7 +107,7 @@ const quotedArgs = tauriArgs.map((arg) => {
 });
 const scriptBody = [
   '@echo off',
-  `set "PATH=${cargoBinPath};${goBinPath};%PATH%"`,
+  `set "PATH=${cargoBinPath};%PATH%"`,
   `call "${vcvars64Path}"`,
   'if errorlevel 1 exit /b %errorlevel%',
   'call npm.cmd run sync-version',

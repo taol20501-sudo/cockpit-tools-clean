@@ -556,6 +556,11 @@ fn resolve_upstream_target(target: &str) -> Result<String, String> {
 
 fn account_upstream_base_url(account: &CodexAccount) -> String {
     if !account.is_api_key_auth() {
+        // Test-only loopback target for the real account-scoped background path.
+        #[cfg(test)]
+        if let Ok(base) = std::env::var("CODEX_BACKGROUND_TEST_SERVER") {
+            return base;
+        }
         return UPSTREAM_CODEX_BASE_URL.to_string();
     }
 
@@ -2204,6 +2209,11 @@ fn build_account_scoped_upstream_body<'a>(
         .map_err(|e| format!("序列化账号级 responses 请求体失败: {}", e))
 }
 
+#[cfg(test)]
+tokio::task_local! {
+    pub(crate) static TEST_DIRECT_CODEX_ORIGIN: std::net::SocketAddr;
+}
+
 async fn send_upstream_request(
     method: &str,
     target: &str,
@@ -2217,6 +2227,10 @@ async fn send_upstream_request(
     request_kind: CodexLocalAccessRequestKind,
 ) -> Result<reqwest::Response, String> {
     let url = build_upstream_url(account, target)?;
+    #[cfg(test)]
+    let url = TEST_DIRECT_CODEX_ORIGIN
+        .try_with(|origin| format!("http://{origin}{target}"))
+        .unwrap_or(url);
     let upstream_token = account_upstream_token(account)?;
     let authorization = format!("Bearer {}", upstream_token);
     send_upstream_request_with_authorization_url(
@@ -2252,15 +2266,6 @@ async fn send_upstream_request_with_authorization_url(
 ) -> Result<reqwest::Response, String> {
     let method =
         Method::from_bytes(method.as_bytes()).map_err(|e| format!("不支持的请求方法: {}", e))?;
-    crate::modules::codex_proxy_runtime::ensure_account_proxy_state(account).await?;
-    let client = if (crate::modules::codex_account_proxy::eligible(account) && account.egress_proxy_disabled)
-        || crate::modules::codex_account_proxy::has_configured_url(account)? {
-        crate::modules::codex_proxy_runtime::client_builder(account,
-            Client::builder().connect_timeout(connect_timeout)).await?
-            .build().map_err(|_| "PROXY_CLIENT_FAILED")?
-    } else {
-        upstream_http_client(upstream_proxy_url, connect_timeout)?
-    };
     let upstream_body = build_account_scoped_upstream_body(
         target,
         body,
@@ -2268,13 +2273,23 @@ async fn send_upstream_request_with_authorization_url(
         image_generation_mode,
         request_kind,
     )?;
+    let (client, upstream_body, headers) = prepare_direct_account_transport(
+        account,
+        url,
+        headers,
+        upstream_body.as_ref(),
+        authorization,
+        upstream_proxy_url,
+        connect_timeout,
+    )
+    .await?;
     let max_send_retries = timeouts.upstream_send_retry_attempts as usize;
     for retry_attempt in 0..=max_send_retries {
         let mut request = client.request(method.clone(), url);
 
         let session_id =
-            header_value(headers, "session-id").or_else(|| header_value(headers, "session_id"));
-        for (name, value) in headers {
+            header_value(&headers, "session-id").or_else(|| header_value(&headers, "session_id"));
+        for (name, value) in &headers {
             if matches!(
                 name.as_str(),
                 "authorization"
@@ -2308,27 +2323,23 @@ async fn send_upstream_request_with_authorization_url(
         if let Some(session_id) = session_id {
             request = request.header("Session-Id", session_id);
         }
-        if !account.is_api_key_auth() {
-            if let Some(account_id) = resolve_upstream_account_id(account) {
-                request = request.header("ChatGPT-Account-Id", account_id);
-            }
-        }
         if !headers.contains_key("accept") {
             request = request.header(
                 ACCEPT,
-                if is_stream_request(headers, upstream_body.as_ref()) {
+                if is_stream_request(&headers, upstream_body.as_ref()) {
                     "text/event-stream"
                 } else {
                     "application/json"
                 },
             );
         }
-        request = request.header("Connection", "Keep-Alive");
+        // HTTP/1.1 pools keep connections alive by default; an explicit
+        // Connection header is forbidden when ALPN negotiates HTTP/2.
         if !headers.contains_key("content-type") && !upstream_body.is_empty() {
             request = request.header(CONTENT_TYPE, "application/json");
         }
         if !upstream_body.is_empty() {
-            request = request.body(upstream_body.as_ref().to_vec());
+            request = request.body(upstream_body.clone());
         }
 
         match request.send().await {

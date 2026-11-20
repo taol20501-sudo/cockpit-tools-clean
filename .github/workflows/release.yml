@@ -28,7 +28,7 @@ jobs:
       - name: ⚙️ Node.js setup
         uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 22
 
       - name: 📖 Read app version
         id: app_version
@@ -132,45 +132,6 @@ jobs:
 
           date -u +"%Y-%m-%dT%H:%M:%SZ" > published-at.txt
 
-      - name: Preserve previous legacy latest.json or bootstrap the Clean channel
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          CURRENT_TAG="v${{ steps.app_version.outputs.VERSION }}"
-          PREVIOUS_TAG="$(
-            gh release list \
-              --limit 100 \
-              --json tagName,isDraft,isPrerelease \
-              --jq "[.[] | select(.isDraft == false and .isPrerelease == false and .tagName != \"${CURRENT_TAG}\")][0].tagName // \"\""
-          )"
-          mkdir -p previous-release
-          if [ -n "${PREVIOUS_TAG}" ] && \
-             gh release download "${PREVIOUS_TAG}" --pattern "latest.json" --dir previous-release --clobber && \
-             test -s previous-release/latest.json; then
-            cp previous-release/latest.json legacy-latest.json
-            echo "Preserved legacy latest.json from ${PREVIOUS_TAG}"
-          else
-            VERSION="${{ steps.app_version.outputs.VERSION }}"
-            node -e '
-              const fs = require("node:fs");
-              const version = process.argv[1];
-              const manifest = {
-                version,
-                notes: "Cockpit Tools Clean updater channel bootstrap",
-                pub_date: new Date().toISOString(),
-                platforms: {},
-              };
-              fs.writeFileSync("legacy-latest.json", `${JSON.stringify(manifest, null, 2)}\n`);
-            ' "${VERSION}"
-            echo "No signed Clean updater manifest exists yet; created a temporary bootstrap manifest."
-          fi
-
-      # Publish the release early (with previous complete latest.json) so parallel
-      # platform jobs can verify assets via public tag download URLs without
-      # waiting for Windows, and without reading the previous release's
-      # same-named target manifests through /releases/latest/.
       - name: 🚀 Create or update staged release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -184,23 +145,10 @@ jobs:
               --title "${TITLE}" \
               --notes-file release-notes.md
           else
-            gh release create "${TAG}" \
-              --draft \
+            gh release create "${TAG}" --draft \
               --target "${GITHUB_SHA}" \
               --title "${TITLE}" \
               --notes-file release-notes.md
-          fi
-
-          IS_DRAFT="$(gh release view "${TAG}" --json isDraft --jq '.isDraft')"
-          if [ "${IS_DRAFT}" = "true" ]; then
-            cp legacy-latest.json latest.json
-            gh release upload "${TAG}" latest.json --clobber
-            gh release edit "${TAG}" --draft=false --prerelease=false --latest
-            echo "Published staged release ${TAG} with legacy latest.json"
-          else
-            # Re-run after a prior publish: do not clobber a finalized latest.json.
-            echo "Release ${TAG} is already published; leaving latest.json as-is"
-            gh release edit "${TAG}" --prerelease=false --latest
           fi
 
       - name: 📤 Upload release metadata artifact
@@ -212,7 +160,6 @@ jobs:
           path: |
             release-notes.md
             published-at.txt
-            legacy-latest.json
 
   build-windows:
     name: "🏗️ Build: Windows"
@@ -235,20 +182,14 @@ jobs:
         with:
           key: windows-release
 
-      - name: 🐹 Go setup
-        uses: actions/setup-go@v5
-        with:
-          go-version-file: sidecars/cockpit-cliproxy/go.mod
-          cache-dependency-path: sidecars/cockpit-cliproxy/go.sum
-
       - name: ⚙️ Node.js setup
         uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 22
           cache: "npm"
 
       - name: 📦 Install frontend dependencies
-        run: npm install
+        run: npm ci --no-audit --no-fund
 
       - name: 🔄 Sync versions
         run: npm run sync-version
@@ -296,7 +237,7 @@ jobs:
           shopt -s nullglob
           ASSETS=(release-assets/*)
           test "${#ASSETS[@]}" -gt 0
-          gh release upload "${TAG}" "${ASSETS[@]}" --clobber
+          node scripts/release/upload_release_assets.cjs "${TAG}" "${ASSETS[@]}"
           echo "Uploaded ${#ASSETS[@]} Windows assets"
 
       - name: 📤 Build and upload Windows updater manifests
@@ -313,38 +254,7 @@ jobs:
             --published-at "$(cat release-metadata/published-at.txt)" \
             --targets "windows-x86_64-msi,windows-x86_64-nsis" \
             --output-dir "target-manifests"
-          gh release upload "v${VERSION}" target-manifests/*.json --clobber
-
-      # Fallback only: prepare should already have published with legacy latest.json.
-      - name: 🚀 Ensure staged release is published
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          TAG="v${VERSION}"
-          IS_DRAFT="$(gh release view "${TAG}" --json isDraft --jq '.isDraft')"
-          if [ "${IS_DRAFT}" = "true" ]; then
-            cp release-metadata/legacy-latest.json latest.json
-            gh release upload "${TAG}" latest.json --clobber
-            gh release edit "${TAG}" --draft=false --prerelease=false --latest
-            echo "Published staged release from Windows fallback with legacy latest.json"
-          else
-            echo "Release is already published; keeping its current latest.json"
-          fi
-
-      # Mid-stage verify uses the tag download URL so parallel jobs do not race
-      # on /releases/latest/ before this release is marked latest (or before
-      # other platforms finish). Public /latest/ is checked in finalize.
-      - name: 🔍 Verify published Windows updater manifests
-        shell: bash
-        run: |
-          set -euo pipefail
-          node scripts/release/verify_published_updater_manifests.cjs \
-            --version "${VERSION}" \
-            --repo "${GITHUB_REPOSITORY}" \
-            --targets "windows-x86_64-msi,windows-x86_64-nsis" \
-            --latest-base-url "https://github.com/${GITHUB_REPOSITORY}/releases/download/v${VERSION}"
+          node scripts/release/upload_release_assets.cjs "v${VERSION}" target-manifests/*.json
 
   build-macos-aarch64:
     name: "🏗️ Build: macOS Apple Silicon"
@@ -371,20 +281,14 @@ jobs:
         with:
           key: macos-aarch64-release
 
-      - name: 🐹 Go setup
-        uses: actions/setup-go@v5
-        with:
-          go-version-file: sidecars/cockpit-cliproxy/go.mod
-          cache-dependency-path: sidecars/cockpit-cliproxy/go.sum
-
       - name: ⚙️ Node.js setup
         uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 22
           cache: "npm"
 
       - name: 📦 Install frontend dependencies
-        run: npm install
+        run: npm ci --no-audit --no-fund
 
       - name: 🔄 Sync versions
         run: npm run sync-version
@@ -405,7 +309,7 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         run: |
           set -euo pipefail
-          npx tauri build --ci --target aarch64-apple-darwin
+          node scripts/tauri.cjs build --ci --target aarch64-apple-darwin
 
       - name: 📥 Download release metadata
         uses: actions/download-artifact@v4
@@ -433,7 +337,7 @@ jobs:
           shopt -s nullglob
           ASSETS=(release-assets/*)
           test "${#ASSETS[@]}" -gt 0
-          gh release upload "${TAG}" "${ASSETS[@]}" --clobber
+          node scripts/release/upload_release_assets.cjs "${TAG}" "${ASSETS[@]}"
           echo "Uploaded ${#ASSETS[@]} macOS Apple Silicon assets"
 
       - name: 📤 Build and upload macOS Apple Silicon updater manifest
@@ -450,18 +354,7 @@ jobs:
             --published-at "$(cat release-metadata/published-at.txt)" \
             --targets "darwin-aarch64-app" \
             --output-dir "target-manifests"
-          gh release upload "v${VERSION}" target-manifests/*.json --clobber
-
-      # Tag URL (not /releases/latest/) — see Windows verify comment.
-      - name: 🔍 Verify published macOS Apple Silicon updater manifest
-        shell: bash
-        run: |
-          set -euo pipefail
-          node scripts/release/verify_published_updater_manifests.cjs \
-            --version "${VERSION}" \
-            --repo "${GITHUB_REPOSITORY}" \
-            --targets "darwin-aarch64-app" \
-            --latest-base-url "https://github.com/${GITHUB_REPOSITORY}/releases/download/v${VERSION}"
+          node scripts/release/upload_release_assets.cjs "v${VERSION}" target-manifests/*.json
 
   build-macos-x86_64:
     name: "🏗️ Build: macOS Intel"
@@ -488,20 +381,14 @@ jobs:
         with:
           key: macos-x86_64-release
 
-      - name: 🐹 Go setup
-        uses: actions/setup-go@v5
-        with:
-          go-version-file: sidecars/cockpit-cliproxy/go.mod
-          cache-dependency-path: sidecars/cockpit-cliproxy/go.sum
-
       - name: ⚙️ Node.js setup
         uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 22
           cache: "npm"
 
       - name: 📦 Install frontend dependencies
-        run: npm install
+        run: npm ci --no-audit --no-fund
 
       - name: 🔄 Sync versions
         run: npm run sync-version
@@ -522,7 +409,7 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         run: |
           set -euo pipefail
-          npx tauri build --ci --target x86_64-apple-darwin
+          node scripts/tauri.cjs build --ci --target x86_64-apple-darwin
 
       - name: 📥 Download release metadata
         uses: actions/download-artifact@v4
@@ -550,7 +437,7 @@ jobs:
           shopt -s nullglob
           ASSETS=(release-assets/*)
           test "${#ASSETS[@]}" -gt 0
-          gh release upload "${TAG}" "${ASSETS[@]}" --clobber
+          node scripts/release/upload_release_assets.cjs "${TAG}" "${ASSETS[@]}"
           echo "Uploaded ${#ASSETS[@]} macOS Intel assets"
 
       - name: 📤 Build and upload macOS Intel updater manifest
@@ -567,18 +454,7 @@ jobs:
             --published-at "$(cat release-metadata/published-at.txt)" \
             --targets "darwin-x86_64-app" \
             --output-dir "target-manifests"
-          gh release upload "v${VERSION}" target-manifests/*.json --clobber
-
-      # Tag URL (not /releases/latest/) — see Windows verify comment.
-      - name: 🔍 Verify published macOS Intel updater manifest
-        shell: bash
-        run: |
-          set -euo pipefail
-          node scripts/release/verify_published_updater_manifests.cjs \
-            --version "${VERSION}" \
-            --repo "${GITHUB_REPOSITORY}" \
-            --targets "darwin-x86_64-app" \
-            --latest-base-url "https://github.com/${GITHUB_REPOSITORY}/releases/download/v${VERSION}"
+          node scripts/release/upload_release_assets.cjs "v${VERSION}" target-manifests/*.json
 
   build-macos-universal:
     name: "🏗️ Build: macOS Universal"
@@ -605,20 +481,14 @@ jobs:
         with:
           key: macos-universal-release
 
-      - name: 🐹 Go setup
-        uses: actions/setup-go@v5
-        with:
-          go-version-file: sidecars/cockpit-cliproxy/go.mod
-          cache-dependency-path: sidecars/cockpit-cliproxy/go.sum
-
       - name: ⚙️ Node.js setup
         uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 22
           cache: "npm"
 
       - name: 📦 Install frontend dependencies
-        run: npm install
+        run: npm ci --no-audit --no-fund
 
       - name: 🔄 Sync versions
         run: npm run sync-version
@@ -639,7 +509,7 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         run: |
           set -euo pipefail
-          npx tauri build --ci --target universal-apple-darwin
+          node scripts/tauri.cjs build --ci --target universal-apple-darwin
 
       - name: 📦 Stage macOS Universal assets
         shell: bash
@@ -661,7 +531,7 @@ jobs:
           shopt -s nullglob
           ASSETS=(release-assets/*)
           test "${#ASSETS[@]}" -gt 0
-          gh release upload "${TAG}" "${ASSETS[@]}" --clobber
+          node scripts/release/upload_release_assets.cjs "${TAG}" "${ASSETS[@]}"
           echo "Uploaded ${#ASSETS[@]} macOS Universal assets"
 
   finalize-legacy-latest:
@@ -686,7 +556,7 @@ jobs:
       - name: ⚙️ Node.js setup
         uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 22
 
       - name: 📥 Download release metadata
         uses: actions/download-artifact@v4
@@ -747,20 +617,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          gh release upload "v${VERSION}" latest.json --clobber
-          gh release edit "v${VERSION}" --draft=false --prerelease=false --latest
-
-      # End-to-end: user-facing /releases/latest/download (do not use tag URL here).
-      - name: 🔍 Verify complete published updater state
-        shell: bash
-        run: |
-          set -euo pipefail
-          node scripts/release/verify_published_updater_manifests.cjs \
-            --version "${VERSION}" \
-            --repo "${GITHUB_REPOSITORY}" \
-            --targets "darwin-aarch64-app,darwin-x86_64-app,windows-x86_64-msi,windows-x86_64-nsis" \
-            --legacy
-
+          node scripts/release/upload_release_assets.cjs "v${VERSION}" latest.json
   upload-checksums:
     name: 🔗 Publish SHA256SUMS
     needs:
@@ -773,6 +630,11 @@ jobs:
       GH_REPO: ${{ github.repository }}
       VERSION: ${{ needs.prepare-release.outputs.version }}
     steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
       - name: 📥 Download release assets
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -805,7 +667,49 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          gh release upload "v${VERSION}" SHA256SUMS.txt --clobber
+          node scripts/release/upload_release_assets.cjs "v${VERSION}" SHA256SUMS.txt
+
+  publish-release:
+    name: 🚀 Publish verified Clean release
+    needs:
+      - prepare-release
+      - finalize-legacy-latest
+      - upload-checksums
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      GH_REPO: ${{ github.repository }}
+      VERSION: ${{ needs.prepare-release.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Publish complete release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG="v${VERSION}"
+          IS_DRAFT="$(gh release view "${TAG}" --json isDraft --jq '.isDraft')"
+          case "${IS_DRAFT}" in
+            true) gh release edit "${TAG}" --draft=false --prerelease=false --latest ;;
+            false) echo "${TAG} is already published" ;;
+            *) echo "Unexpected draft state: ${IS_DRAFT}"; exit 1 ;;
+          esac
+
+      - name: 🔍 Verify complete published updater state
+        shell: bash
+        run: |
+          set -euo pipefail
+          node scripts/release/verify_published_updater_manifests.cjs \
+            --version "${VERSION}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --targets "darwin-aarch64-app,darwin-x86_64-app,windows-x86_64-msi,windows-x86_64-nsis" \
+            --legacy
 
   update-homebrew-cask:
     name: 🍺 Update Homebrew Cask
@@ -814,6 +718,7 @@ jobs:
       - prepare-release
       - finalize-legacy-latest
       - upload-checksums
+      - publish-release
     runs-on: ubuntu-latest
     permissions:
       contents: write

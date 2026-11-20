@@ -1,21 +1,10 @@
 #!/usr/bin/env node
-/**
- * Rebuilds the macOS DMG produced by `tauri build` so that it also ships a
- * plain-text note (install steps plus the "app is damaged" / Gatekeeper fix)
- * and gives that note a stable position in the DMG window layout: the app icon
- * and the Applications link stay paired on the top row so the drag-and-drop
- * affordance is unchanged, and the note sits on a second row below them.
- *
- * Tauri does not expose a bundler hook for extra DMG files, so the image is
- * rebuilt from the app bundle inside the original DMG: same volume icon, same
- * Applications drop link, same window geometry, plus the note.
- */
-
 const { spawnSync } = require('node:child_process');
 const crypto = require('node:crypto');
 const fs = require('node:fs');
-const os = require('node:os');
 const path = require('node:path');
+const { createDmgMounts } = require('./dmg-mounts.cjs');
+const mounts = createDmgMounts();
 
 const REPO_ROOT = path.resolve(__dirname, '..', '..');
 const README_SOURCE = path.join(__dirname, 'assets', 'dmg-readme.txt');
@@ -96,74 +85,20 @@ function sleep(ms) {
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 }
 
-function findTauriDmg(bundleDir) {
-  const dmgDir = path.join(bundleDir, 'dmg');
-  if (!fs.existsSync(dmgDir)) {
-    return null;
+function resolveDmgPaths({ bundleDir, productName, version, macArch }) {
+  if (!['aarch64', 'x64', 'universal'].includes(macArch) || !productName || !version) {
+    throw new Error('Require the product name, version and --mac-arch (aarch64, x64 or universal)');
   }
-  const entries = fs.readdirSync(dmgDir);
-
-  // Clean up leftovers from an interrupted previous run.
-  for (const name of entries.filter((entry) => entry.endsWith('.inject.dmg'))) {
-    log(`removing stale temporary image: ${name}`);
-    fs.rmSync(path.join(dmgDir, name), { force: true });
+  const appName = `${productName}.app`;
+  const appBundlePath = path.join(bundleDir, 'macos', appName);
+  if (!fs.statSync(appBundlePath, { throwIfNoEntry: false })?.isDirectory()) {
+    throw new Error(`Missing built .app bundle: ${appBundlePath}`);
   }
-
-  const candidates = entries.filter(
-    (name) => name.toLowerCase().endsWith('.dmg') && !name.endsWith('.inject.dmg')
-  );
-  if (candidates.length === 0) {
-    return null;
-  }
-  if (candidates.length > 1) {
-    throw new Error(
-      `expected one DMG in ${dmgDir}, found: ${candidates.join(', ')}`
-    );
-  }
-  return path.join(dmgDir, candidates[0]);
-}
-
-function attachDiskImage(mountPoint, imagePath, { readOnly = false } = {}) {
-  const args = ['attach', '-nobrowse', '-mountpoint', mountPoint];
-  if (readOnly) {
-    args.push('-readonly');
-  } else {
-    args.push('-readwrite', '-noverify', '-noautoopen');
-  }
-  args.push(imagePath);
-
-  const output = run('hdiutil', args, { capture: true });
-
-  const device = output
-    .split('\n')
-    .map((line) => line.trim().split(/\s+/)[0])
-    .find((token) => /^\/dev\/disk\d+s\d+$/.test(token));
-  if (!device) {
-    throw new Error(`unable to resolve the mounted device for ${imagePath}`);
-  }
-  return { device, mountPoint };
-}
-
-function detachMountedVolume(target) {
-  for (const attempt of [0, 1, 2]) {
-    const result = spawnSync('hdiutil', ['detach', target], {
-      stdio: 'pipe',
-      encoding: 'utf8',
-    });
-    if (result.status === 0) {
-      return true;
-    }
-    sleep(1000 * (attempt + 1));
-  }
-
-  const force = spawnSync('hdiutil', ['detach', target, '-force'], {
-    stdio: 'pipe',
-    encoding: 'utf8',
-  });
-  if (force.status !== 0) {
-    log(`warning: unable to unmount ${target}; unmount it manually before retrying`);
-  }
-  return force.status === 0;
+  return {
+    appName,
+    appBundlePath,
+    outputPath: path.join(bundleDir, 'dmg', `${productName}_${version}_${macArch}.dmg`),
+  };
 }
 
 function copyAppBundle(sourceAppPath, destinationAppPath) {
@@ -287,7 +222,7 @@ function buildDmg({
     tempImagePath,
   ]);
 
-  const mounted = attachDiskImage(preferredMountPoint, tempImagePath);
+  const mounted = mounts.attach(preferredMountPoint, tempImagePath);
   const { mountPoint } = mounted;
   let layoutSignature = '';
 
@@ -316,7 +251,7 @@ function buildDmg({
     fs.rmSync(path.join(mountPoint, '.fseventsd'), { recursive: true, force: true });
     run('chmod', ['-Rf', 'go-w', mountPoint]);
   } finally {
-    detachMountedVolume(mounted.mountPoint) || detachMountedVolume(mounted.device);
+    mounts.detach(mounted);
   }
 
   run('hdiutil', ['convert', tempImagePath, '-format', 'UDZO', '-o', outputPath]);
@@ -351,7 +286,7 @@ function verifyDmg({ dmgPath, readmeName, workDir, expectedLayout }) {
   const mountPoint = path.join(workDir, 'verify-mount');
   fs.mkdirSync(mountPoint, { recursive: true });
 
-  const attached = attachDiskImage(mountPoint, dmgPath, { readOnly: true });
+  const attached = mounts.attach(mountPoint, dmgPath, { readOnly: true });
 
   try {
     const readmePath = path.join(mountPoint, readmeName);
@@ -379,7 +314,7 @@ function verifyDmg({ dmgPath, readmeName, workDir, expectedLayout }) {
       throw new Error('rebuilt DMG has no volume name');
     }
   } finally {
-    detachMountedVolume(attached.mountPoint) || detachMountedVolume(attached.device);
+    mounts.detach(attached);
   }
 }
 
@@ -390,75 +325,42 @@ function main() {
     args['bundle-dir'] || path.join(REPO_ROOT, 'target', 'release', 'bundle')
   );
 
-  if (process.platform !== 'darwin') {
-    log('skipped: DMG bundling is macOS only');
-    return;
-  }
-
-  const sourceDmg = findTauriDmg(bundleDir);
-  if (!sourceDmg) {
-    log('skipped: no DMG found in the bundle output directory');
-    return;
-  }
+  if (process.platform !== 'darwin') throw new Error('DMG bundling requires macOS');
 
   if (!fs.existsSync(README_SOURCE)) {
     fail(`missing troubleshooting note template: ${README_SOURCE}`);
   }
 
-  const productName = readTauriProductName() || 'Cockpit Tools';
+  const productName = readTauriProductName();
   const version = readAppVersion();
-  const volumeIconPath = path.join(path.dirname(sourceDmg), 'icon.icns');
+  const { appName, appBundlePath, outputPath } = resolveDmgPaths({
+    bundleDir, productName, version, macArch: args['mac-arch'],
+  });
+  const volumeIconPath = path.join(REPO_ROOT, 'src-tauri', 'icons', 'icon.icns');
   if (!fs.existsSync(volumeIconPath)) {
     fail(`missing volume icon: ${volumeIconPath}`);
   }
 
   const readmeName = '安装与常见问题.txt';
-  const volumeName = version ? `${productName} ${version}` : productName;
-  // Keep Tauri's artifact file name: release staging and the Homebrew cask
-  // job both derive the published asset name from it.
-  const outputPath = sourceDmg;
-  const tempOutputPath = path.join(path.dirname(sourceDmg), `${volumeName}.inject.dmg`);
-  const workDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cockpit-dmg-readme-'));
-  const injectMountPoint = path.join(workDir, 'inject-mount');
-  fs.mkdirSync(injectMountPoint, { recursive: true });
-  let sourceMount = null;
+  const volumeName = `${productName} ${version}`;
+  const dmgDir = path.dirname(outputPath);
+  fs.mkdirSync(dmgDir, { recursive: true });
+  const workDir = fs.mkdtempSync(path.join(path.dirname(bundleDir), '.cockpit-dmg-'));
+  const tempOutputPath = path.join(workDir, 'final.dmg');
 
-  log(`source DMG: ${sourceDmg}`);
+  log(`source app: ${appBundlePath}`);
   log(`target DMG: ${outputPath}`);
 
   try {
-    sourceMount = attachDiskImage(injectMountPoint, sourceDmg, { readOnly: true });
-
-    let appName;
-    let appBundlePath;
-    let layoutSignature = '';
-    try {
-      const appBundles = fs
-        .readdirSync(injectMountPoint)
-        .filter((name) => name.endsWith('.app'));
-      if (appBundles.length !== 1) {
-        throw new Error(
-          `expected one .app in ${injectMountPoint}, found: ${appBundles.join(', ') || 'none'}`
-        );
-      }
-      appName = appBundles[0];
-      appBundlePath = path.join(injectMountPoint, appName);
-
-      fs.rmSync(tempOutputPath, { force: true });
-      layoutSignature = buildDmg({
-        workDir,
-        appName,
-        appBundlePath,
-        volumeIconPath,
-        readmeName,
-        volumeName,
-        outputPath: tempOutputPath,
-      });
-    } finally {
-      if (sourceMount) {
-        detachMountedVolume(sourceMount.mountPoint) || detachMountedVolume(sourceMount.device);
-      }
-    }
+    const layoutSignature = buildDmg({
+      workDir,
+      appName,
+      appBundlePath,
+      volumeIconPath,
+      readmeName,
+      volumeName,
+      outputPath: tempOutputPath,
+    });
 
     verifyDmg({
       dmgPath: tempOutputPath,
@@ -467,10 +369,13 @@ function main() {
       expectedLayout: layoutSignature,
     });
 
-    // Only replace the Tauri artifact once the rebuilt image passed verification.
+    mounts.assertImageUnmounted(outputPath);
     fs.renameSync(tempOutputPath, outputPath);
     log(`done: ${outputPath}`);
   } finally {
+    // Never delete the backing image or mount directory after a failed detach.
+    mounts.cleanup();
+    mounts.assertImageUnmounted(tempOutputPath);
     fs.rmSync(tempOutputPath, { force: true });
     if (keepWorkDir) {
       log(`keeping work directory: ${workDir}`);
@@ -481,6 +386,7 @@ function main() {
 }
 
 if (require.main === module) {
+  mounts.installExitHandlers();
   try {
     main();
   } catch (error) {
@@ -491,6 +397,7 @@ if (require.main === module) {
 module.exports = {
   buildFinderScript,
   describeFinderLayout,
-  findTauriDmg,
+  resolveDmgPaths,
   parseArgs,
+  verifyDmg,
 };

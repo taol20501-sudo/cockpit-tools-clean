@@ -440,11 +440,50 @@ mod canonical_path_comparison_tests {
 }
 
 #[cfg(target_os = "macos")]
-fn is_legacy_antigravity_macos_path(path: &str) -> bool {
-    let lower = path.trim().to_ascii_lowercase();
-    lower.contains("/applications/antigravity.app")
-        || lower.ends_with("/antigravity.app")
-        || lower.contains("/antigravity.app/contents/")
+pub(crate) fn antigravity_macos_bundle_target(
+    bundle: &Path,
+    metadata: Option<&plist::Dictionary>,
+) -> Option<&'static str> {
+    let bundle_id = metadata
+        .and_then(|info| info.get("CFBundleIdentifier"))
+        .and_then(plist::Value::as_string);
+    match bundle_id {
+        Some("com.google.antigravity") => Some("antigravity"),
+        Some("com.google.antigravity-ide") => Some("antigravity_ide"),
+        _ => match bundle.file_name()?.to_str()?.to_ascii_lowercase().as_str() {
+            "antigravity.app" => Some("antigravity"),
+            "antigravity ide.app" => Some("antigravity_ide"),
+            _ => None,
+        },
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn resolve_macos_antigravity_custom_path(path: &Path, desktop: bool) -> Option<PathBuf> {
+    let Some(bundle) = path.ancestors().find(|path| {
+        path.extension().and_then(|value| value.to_str())
+            .is_some_and(|value| value.eq_ignore_ascii_case("app"))
+    }) else {
+        return (!desktop && path.is_file()).then(|| path.to_path_buf());
+    };
+    let info = plist::Value::from_file(bundle.join("Contents/Info.plist")).ok();
+    let metadata = info.as_ref().and_then(plist::Value::as_dictionary);
+    let is_desktop = antigravity_macos_bundle_target(bundle, metadata) == Some("antigravity");
+    if is_desktop != desktop {
+        return None;
+    }
+
+    let binaries = bundle.join("Contents/MacOS");
+    let declared = metadata
+        .and_then(|info| info.get("CFBundleExecutable"))
+        .and_then(plist::Value::as_string)
+        .filter(|name| Path::new(name).file_name().is_some_and(|file| file == *name));
+    let conventional: &[&str] = if desktop { &["Antigravity", "Electron"] } else { &["Electron"] };
+    declared
+        .into_iter()
+        .chain(conventional.iter().copied())
+        .map(|name| binaries.join(name))
+        .find(|path| path.is_file())
 }
 
 #[cfg(target_os = "macos")]
@@ -458,6 +497,7 @@ fn resolve_macos_app_root_from_config(app: &str) -> Option<String> {
         "codebuddy" => current.codebuddy_app_path,
         "codebuddy_cn" => current.codebuddy_cn_app_path,
         "zcode" => current.zcode_app_path,
+        "minimaxcode" | "minimax_code" => current.minimax_code_app_path,
         _ => String::new(),
     };
     let trimmed = raw.trim();
@@ -514,13 +554,20 @@ fn spawn_open_app_with_options_and_env_and_egress(
     args: &[String],
     force_new_instance: bool,
     env_pairs: &[(&str, &str)],
-    egress_proxy_url: Option<&str>,
+    launch_proxy: Option<&CodexLaunchProxy>,
 ) -> Result<u32, String> {
     let mut cmd = Command::new("open");
     sanitize_macos_gui_launch_env(&mut cmd);
-    append_effective_proxy_env_to_open_args(&mut cmd, egress_proxy_url);
+    match launch_proxy {
+        None => append_managed_proxy_env_to_open_args(&mut cmd),
+        Some(CodexLaunchProxy::Direct) => {}
+        Some(proxy) => append_effective_proxy_env_to_open_args(&mut cmd, proxy),
+    }
     for (key, value) in env_pairs {
         cmd.arg("--env").arg(format!("{}={}", key, value));
+    }
+    if let Some(proxy @ CodexLaunchProxy::Direct) = launch_proxy {
+        append_effective_proxy_env_to_open_args(&mut cmd, proxy);
     }
     if force_new_instance {
         cmd.arg("-n");
@@ -534,8 +581,8 @@ fn spawn_open_app_with_options_and_env_and_egress(
             }
         }
     }
-    let child = spawn_detached_unix(&mut cmd).map_err(|e| format!("启动失败: {}", e))?;
-    Ok(child.id())
+    let pid = spawn_detached_unix(&mut cmd).map_err(|e| format!("启动失败: {}", e))?;
+    Ok(pid)
 }
 
 fn find_antigravity_process_exe() -> Option<std::path::PathBuf> {
@@ -652,15 +699,8 @@ fn find_vscode_process_exe() -> Option<std::path::PathBuf> {
             let mut parts = line.splitn(2, |ch: char| ch.is_whitespace());
             let _pid_str = parts.next().unwrap_or("").trim();
             let cmdline = parts.next().unwrap_or("").trim();
-            let lower = cmdline.to_lowercase();
-            if !lower.contains("visual studio code.app/contents/macos/") {
-                continue;
-            }
-            if lower.contains("--type=") || lower.contains("crashpad_handler") {
-                continue;
-            }
-            if let Some(exe) = extract_macos_exe_from_cmdline(cmdline) {
-                return Some(std::path::PathBuf::from(exe));
+            if let Some(executable) = vscode_macos_running_executable(cmdline) {
+                return Some(executable);
             }
         }
         return None;
@@ -1123,7 +1163,7 @@ pub fn detect_antigravity_legacy_exec_path() -> Option<std::path::PathBuf> {
             }
         }
         if let Some(path) = detect_windows_exec_path_by_signatures(
-            "antigravity",
+            "antigravity_legacy",
             &["Antigravity.exe", "antigravity.exe", "Electron.exe"],
             &["antigravity"],
             &["antigravity"],
@@ -1149,6 +1189,66 @@ pub fn detect_antigravity_legacy_exec_path() -> Option<std::path::PathBuf> {
     None
 }
 
+#[cfg(target_os = "macos")]
+fn resolve_vscode_macos_bundle_executable(path: &Path) -> Option<PathBuf> {
+    let bundle = path.ancestors().find(|path| {
+        path.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("app"))
+    })?;
+    let contents = bundle.join("Contents");
+    let binaries = contents.join("MacOS");
+    let metadata = plist::Value::from_file(contents.join("Info.plist")).ok();
+    if let Some(executable) = metadata.as_ref()
+        .and_then(plist::Value::as_dictionary)
+        .and_then(|info| info.get("CFBundleExecutable"))
+        .and_then(plist::Value::as_string)
+    {
+        let name = Path::new(executable);
+        if name.file_name()? != executable {
+            return None;
+        }
+        let binary = binaries.join(name);
+        return binary.is_file().then_some(binary);
+    }
+    ["Code", "Electron"].into_iter()
+        .map(|name| binaries.join(name))
+        .find(|binary| binary.is_file())
+}
+
+#[cfg(target_os = "macos")]
+fn vscode_macos_running_executable(command: &str) -> Option<PathBuf> {
+    let lower = command.to_ascii_lowercase();
+    if lower.contains("--type=") || lower.contains("crashpad_handler") {
+        return None;
+    }
+    let bundle_end = lower.find(".app/contents/macos/")? + ".app".len();
+    let bundle = Path::new(&command[..bundle_end]);
+    if !bundle.is_absolute() {
+        return None;
+    }
+    let name = bundle.file_name()?.to_str()?.to_ascii_lowercase();
+    if !matches!(name.as_str(), "visual studio code.app" | "visual studio code - insiders.app") {
+        return None;
+    }
+    let executable = resolve_vscode_macos_bundle_executable(bundle)?;
+    let tail = command.strip_prefix(executable.to_str()?)?;
+    (tail.is_empty() || tail.starts_with(char::is_whitespace)).then_some(executable)
+}
+
+#[cfg(target_os = "macos")]
+fn detect_vscode_macos_application(
+    system_applications: &Path,
+    user_applications: Option<&Path>,
+) -> Option<PathBuf> {
+    ["Visual Studio Code.app", "Visual Studio Code - Insiders.app"]
+        .into_iter()
+        .flat_map(|name| {
+            std::iter::once(system_applications)
+                .chain(user_applications)
+                .map(move |directory| directory.join(name))
+        })
+        .find_map(|bundle| resolve_vscode_macos_bundle_executable(&bundle))
+}
+
 fn detect_vscode_exec_path() -> Option<std::path::PathBuf> {
     if let Some(path) = find_vscode_process_exe() {
         return Some(path);
@@ -1156,10 +1256,8 @@ fn detect_vscode_exec_path() -> Option<std::path::PathBuf> {
 
     #[cfg(target_os = "macos")]
     {
-        let path = std::path::PathBuf::from(VSCODE_APP_PATH);
-        if path.exists() {
-            return Some(path);
-        }
+        let user_applications = dirs::home_dir().map(|home| home.join("Applications"));
+        return detect_vscode_macos_application(Path::new("/Applications"), user_applications.as_deref());
     }
 
     #[cfg(target_os = "windows")]
@@ -1234,6 +1332,7 @@ fn detect_vscode_exec_path() -> Option<std::path::PathBuf> {
         }
     }
 
+    #[cfg(not(target_os = "macos"))]
     None
 }
 
@@ -1370,55 +1469,38 @@ fn detect_codebuddy_cn_exec_path() -> Option<std::path::PathBuf> {
 fn detect_qoder_exec_path() -> Option<std::path::PathBuf> {
     #[cfg(target_os = "macos")]
     {
-        let candidates = [
-            "/Applications/Qoder.app/Contents/MacOS/Qoder",
-            "/Applications/Qoder.app/Contents/MacOS/Electron",
-            "/Applications/Qoder.app",
-        ];
-        for candidate in candidates {
-            let path = std::path::PathBuf::from(candidate);
-            if path.exists() {
-                return Some(path);
-            }
+        let mut roots = vec![std::path::PathBuf::from("/Applications")];
+        if let Some(home) = dirs::home_dir() {
+            roots.push(home.join("Applications"));
         }
+        return ["Qoder IDE.app", "Qoder.app"]
+            .into_iter()
+            .flat_map(|name| roots.iter().map(move |root| root.join(name)))
+            .find_map(|path| resolve_qoder_macos_exec_path(&path.to_string_lossy()));
     }
 
     #[cfg(target_os = "windows")]
     {
-        let mut candidates: Vec<std::path::PathBuf> = Vec::new();
-        if let Ok(local_appdata) = std::env::var("LOCALAPPDATA") {
-            candidates.push(
-                std::path::PathBuf::from(&local_appdata)
-                    .join("Programs")
-                    .join("Qoder")
-                    .join("Qoder.exe"),
-            );
-        }
-        if let Ok(program_files) = std::env::var("PROGRAMFILES") {
-            candidates.push(
-                std::path::PathBuf::from(program_files)
-                    .join("Qoder")
-                    .join("Qoder.exe"),
-            );
-        }
-        for candidate in candidates {
-            if can_probe_passive_windows_path(&candidate.to_string_lossy()) && candidate.exists() {
-                return Some(candidate);
-            }
-        }
+        let roots = [
+            std::env::var_os("LOCALAPPDATA").map(|dir| std::path::PathBuf::from(dir).join("Programs")),
+            std::env::var_os("PROGRAMFILES").map(std::path::PathBuf::from),
+            std::env::var_os("PROGRAMFILES(X86)").map(std::path::PathBuf::from),
+        ];
+        return [r"Qoder IDE\Qoder IDE.exe", r"Qoder\Qoder.exe"]
+            .into_iter()
+            .flat_map(|name| roots.iter().flatten().map(move |root| root.join(name)))
+            .find(|path| can_probe_passive_windows_path(&path.to_string_lossy()) && path.is_file());
     }
 
     #[cfg(target_os = "linux")]
     {
-        let candidates = ["/usr/bin/qoder", "/usr/local/bin/qoder", "/opt/qoder/qoder"];
-        for candidate in candidates {
-            let path = std::path::PathBuf::from(candidate);
-            if path.exists() {
-                return Some(path);
-            }
-        }
+        return ["/usr/share/qoder-ide/qoder-ide", "/usr/bin/qoder-ide", "/usr/bin/qoder", "/usr/local/bin/qoder", "/opt/qoder/qoder"]
+            .into_iter()
+            .map(std::path::PathBuf::from)
+            .find(|path| path.is_file());
     }
 
+    #[allow(unreachable_code)]
     None
 }
 
@@ -1449,9 +1531,10 @@ fn detect_zcode_exec_path() -> Option<std::path::PathBuf> {
                 candidates.push(std::path::PathBuf::from(root).join("ZCode/ZCode.exe"));
             }
         }
-        if let Some(path) = candidates.into_iter().find(|path| {
-            can_probe_passive_windows_path(&path.to_string_lossy()) && path.is_file()
-        }) {
+        if let Some(path) = candidates
+            .into_iter()
+            .find(|path| can_probe_passive_windows_path(&path.to_string_lossy()) && path.is_file())
+        {
             return Some(path);
         }
         if let Some(path) = detect_windows_exec_path_by_signatures(
@@ -1677,15 +1760,13 @@ fn detect_trae_exec_path_for_platform(
 fn detect_workbuddy_exec_path() -> Option<std::path::PathBuf> {
     #[cfg(target_os = "macos")]
     {
-        let candidates = [
-            "/Applications/WorkBuddy.app/Contents/MacOS/WorkBuddy",
-            "/Applications/WorkBuddy.app/Contents/MacOS/Electron",
-            "/Applications/WorkBuddy.app",
-        ];
-        for candidate in candidates {
-            let path = std::path::PathBuf::from(candidate);
-            if path.exists() {
-                return Some(path);
+        let system = PathBuf::from("/Applications/WorkBuddy.app");
+        let user = dirs::home_dir().map(|home| home.join("Applications/WorkBuddy.app"));
+        for bundle in std::iter::once(system).chain(user) {
+            if let Some(executable) = resolve_workbuddy_macos_exec_path(&bundle.to_string_lossy()) {
+                if !workbuddy_install_is_international(&executable) {
+                    return Some(executable);
+                }
             }
         }
     }
@@ -1709,7 +1790,10 @@ fn detect_workbuddy_exec_path() -> Option<std::path::PathBuf> {
             );
         }
         for candidate in candidates {
-            if can_probe_passive_windows_path(&candidate.to_string_lossy()) && candidate.exists() {
+            if can_probe_passive_windows_path(&candidate.to_string_lossy())
+                && candidate.is_file()
+                && !workbuddy_install_is_international(&candidate)
+            {
                 return Some(candidate);
             }
         }
@@ -2070,7 +2154,38 @@ fn is_chatgpt_store_gui_exe(path: &std::path::Path) -> bool {
         .is_some_and(|value| value.eq_ignore_ascii_case("ChatGPT.exe"))
 }
 
-/// 读取 `AppxManifest.xml` 里 `Application Id="App"` 的 `Executable`。
+/// Read only the PE headers. A desktop path must not resolve to a console CLI,
+/// DLL or script merely because its filename exists.
+#[cfg(any(test, target_os = "windows"))]
+pub(crate) fn windows_executable_has_gui_subsystem(path: &Path) -> bool {
+    use std::io::{Read, Seek, SeekFrom};
+    let check = || -> std::io::Result<bool> {
+        let mut file = std::fs::File::open(path)?;
+        let mut dos = [0u8; 64];
+        file.read_exact(&mut dos)?;
+        if &dos[..2] != b"MZ" {
+            return Ok(false);
+        }
+        let offset = u32::from_le_bytes(dos[60..64].try_into().unwrap());
+        file.seek(SeekFrom::Start(u64::from(offset)))?;
+        let mut pe = [0u8; 94];
+        file.read_exact(&mut pe)?;
+        let magic = u16::from_le_bytes([pe[24], pe[25]]);
+        let characteristics = u16::from_le_bytes([pe[22], pe[23]]);
+        Ok(&pe[..4] == b"PE\0\0"
+            && matches!(magic, 0x10b | 0x20b)
+            && u16::from_le_bytes([pe[92], pe[93]]) == 2
+            && characteristics & 0x2000 == 0)
+    };
+    check().unwrap_or(false)
+}
+
+#[cfg(any(test, target_os = "windows"))]
+fn is_usable_codex_windows_gui_path(path: &Path) -> bool {
+    is_chatgpt_store_gui_exe(path) && windows_executable_has_gui_subsystem(path)
+}
+
+/// 读取 `AppxManifest.xml` 中桌面主程序的 `Executable`，不假定 Application Id。
 #[cfg(any(test, target_os = "windows"))]
 fn appx_manifest_gui_executable(install_location: &std::path::Path) -> Option<String> {
     let bytes = std::fs::read(install_location.join("AppxManifest.xml")).ok()?;
@@ -2079,33 +2194,43 @@ fn appx_manifest_gui_executable(install_location: &std::path::Path) -> Option<St
 
 #[cfg(any(test, target_os = "windows"))]
 fn appx_manifest_gui_executable_from_text(text: &str) -> Option<String> {
-    for element in text.split('<') {
-        let element = element.trim_start();
-        if !element.starts_with("Application") {
-            continue;
-        }
-        match xml_attribute(element, "Id") {
-            Some(id) if id.eq_ignore_ascii_case("App") => {}
-            _ => continue,
-        }
-        if let Some(executable) = xml_attribute(element, "Executable") {
-            return Some(executable);
+    use quick_xml::{events::Event, Reader};
+    let mut reader = Reader::from_str(text);
+    let mut matched = None;
+    loop {
+        match reader.read_event().ok()? {
+            Event::Start(element) | Event::Empty(element)
+                if element.local_name().as_ref() == b"Application" =>
+            {
+                let mut id = None;
+                let mut executable = None;
+                for attribute in element.attributes() {
+                    let attribute = attribute.ok()?;
+                    let value = attribute.decode_and_unescape_value(reader.decoder()).ok()?;
+                    match attribute.key.as_ref() {
+                        b"Id" => id = Some(value.into_owned()),
+                        b"Executable" => executable = Some(value.into_owned()),
+                        _ => {}
+                    }
+                }
+                if let (Some(id), Some(executable)) = (id, executable) {
+                    if !id.trim().is_empty()
+                        && is_chatgpt_store_gui_exe(Path::new(&executable))
+                        && !executable.contains(':')
+                        && !executable.starts_with(['/', '\\'])
+                        && !executable.split(['/', '\\']).any(|part| part == "..")
+                    {
+                        if matched.is_some() {
+                            return None;
+                        }
+                        matched = Some(executable);
+                    }
+                }
+            }
+            Event::Eof => return matched,
+            _ => {}
         }
     }
-    None
-}
-
-#[cfg(any(test, target_os = "windows"))]
-fn xml_attribute(element: &str, name: &str) -> Option<String> {
-    let needle = format!("{}=\"", name);
-    let start = element.find(&needle)? + needle.len();
-    let rest = &element[start..];
-    let end = rest.find('"')?;
-    let value = rest[..end].trim();
-    if value.is_empty() {
-        return None;
-    }
-    Some(value.to_string())
 }
 
 /// 在给定 `InstallLocation` 下解析商店版桌面端主程序，只返回 `ChatGPT.exe`。
@@ -2132,13 +2257,13 @@ struct CodexStorePackage {
     install_location: std::path::PathBuf,
 }
 
-/// 列出当前用户已注册的商店版 Codex 包（新版本优先）。
+/// 列出当前用户已注册的商店版 Codex 包（稳定版优先，同渠道按版本排序）。
 ///
 /// 只读包注册信息：不扫描 WindowsApps 目录（普通用户会被拒，且带 `-Filter` 时可能
 /// 静默返回空），也不依赖客户端是否正在运行。PFN 一并输出，便于日志和后续匹配。
 #[cfg(target_os = "windows")]
 fn codex_store_packages() -> Vec<CodexStorePackage> {
-    let script = r#"$names = @('OpenAI.Codex', 'OpenAI.ChatGPT', 'OpenAI.ChatGPT-Desktop')
+    let script = r#"$names = @('OpenAI.Codex', 'OpenAI.ChatGPT', 'OpenAI.ChatGPT-Desktop', 'OpenAI.CodexBeta')
 $pkgs = @()
 foreach ($name in $names) {
   $pkgs += @(Get-AppxPackage -Name $name -ErrorAction SilentlyContinue)
@@ -2152,7 +2277,8 @@ if ($pkgs.Count -eq 0) {
 }
 $pkgs |
   Where-Object { $_.InstallLocation -and $_.PackageFamilyName } |
-  Sort-Object -Property @{ Expression = { $_.Version }; Descending = $true } |
+  Sort-Object -Property @{ Expression = { if ($_.Name -ieq 'OpenAI.CodexBeta') { 1 } else { 0 } } },
+                        @{ Expression = { $_.Version }; Descending = $true } |
   ForEach-Object { Write-Output ([string]$_.PackageFamilyName + '|' + [string]$_.InstallLocation.Trim()) }"#;
 
     let mut packages = Vec::new();
@@ -2199,7 +2325,9 @@ $pkgs |
 #[cfg(target_os = "windows")]
 fn detect_codex_store_gui_exe() -> Option<std::path::PathBuf> {
     for package in codex_store_packages() {
-        if let Some(exe) = codex_store_gui_exe_in(&package.install_location) {
+        if let Some(exe) = codex_store_gui_exe_in(&package.install_location)
+            .filter(|path| is_usable_codex_windows_gui_path(path))
+        {
             crate::modules::logger::log_info(&format!(
                 "[Path Detect] codex store hit: pfn={} install_location={} exe={}",
                 package.family_name,
@@ -2209,185 +2337,12 @@ fn detect_codex_store_gui_exe() -> Option<std::path::PathBuf> {
             return Some(exe);
         }
         crate::modules::logger::log_warn(&format!(
-            "[Path Detect] 商店包 {} 的安装目录里没有 ChatGPT.exe: {}",
+            "[Path Detect] 商店包 {} 的安装目录里没有可用的 ChatGPT.exe: {}",
             package.family_name,
             package.install_location.to_string_lossy()
         ));
     }
     None
-}
-
-#[cfg(target_os = "windows")]
-fn detect_codex_store_app_user_model_id_by_startapps() -> Option<String> {
-    let script = r#"$entry = Get-StartApps |
-  Where-Object {
-    $_.AppID -like 'OpenAI.ChatGPT*' -or
-    $_.AppID -like 'OpenAI.Codex_*' -or
-    $_.Name -like 'ChatGPT*' -or
-    $_.Name -like 'Codex*'
-  } |
-  Sort-Object @{ Expression = { if ($_.AppID -like 'OpenAI.ChatGPT*' -or $_.Name -like 'ChatGPT*') { 0 } else { 1 } } }, Name |
-  Select-Object -First 1
-if ($entry -and -not [string]::IsNullOrWhiteSpace($entry.AppID)) {
-  Write-Output ([string]$entry.AppID.Trim())
-}"#;
-
-    let output = powershell_output(&["-Command", script]).ok()?;
-    if !output.status.success() {
-        return None;
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    for line in stdout.lines() {
-        let app_user_model_id = line.trim().trim_matches('"');
-        if !app_user_model_id.is_empty() {
-            return Some(app_user_model_id.to_string());
-        }
-    }
-    None
-}
-
-#[cfg(target_os = "windows")]
-fn detect_codex_store_app_user_model_id_by_appx_fallback() -> Option<String> {
-    let script = r#"$names = @('OpenAI.ChatGPT', 'OpenAI.ChatGPT-Desktop', 'OpenAI.Codex')
-$pkg = $names |
-  ForEach-Object { Get-AppxPackage -Name $_ -ErrorAction SilentlyContinue } |
-  Sort-Object @{ Expression = { if ($_.Name -like 'OpenAI.ChatGPT*') { 0 } else { 1 } } }, @{ Expression = { $_.Version }; Descending = $true } |
-  Select-Object -First 1
-if (-not $pkg) {
-  $pkg = Get-AppxPackage |
-    Where-Object {
-      $_.Name -like 'OpenAI.ChatGPT*' -or
-      $_.Name -like 'OpenAI.Codex*' -or
-      $_.PackageFamilyName -like 'OpenAI.ChatGPT*' -or
-      $_.PackageFamilyName -like 'OpenAI.Codex*'
-    } |
-  Sort-Object @{ Expression = { if ($_.Name -like 'OpenAI.ChatGPT*' -or $_.PackageFamilyName -like 'OpenAI.ChatGPT*') { 0 } else { 1 } } }, @{ Expression = { $_.Version }; Descending = $true } |
-  Select-Object -First 1
-}
-if ($pkg -and -not [string]::IsNullOrWhiteSpace($pkg.PackageFamilyName)) {
-  Write-Output ([string]($pkg.PackageFamilyName.Trim() + '!App'))
-}"#;
-
-    let output = powershell_output(&["-Command", script]).ok()?;
-    if !output.status.success() {
-        return None;
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    for line in stdout.lines() {
-        let app_user_model_id = line.trim().trim_matches('"');
-        if !app_user_model_id.is_empty() {
-            return Some(app_user_model_id.to_string());
-        }
-    }
-    None
-}
-
-#[cfg(target_os = "windows")]
-fn detect_codex_store_app_user_model_id_uncached() -> Option<String> {
-    if let Some(app_user_model_id) = detect_codex_store_app_user_model_id_by_startapps() {
-        crate::modules::logger::log_info(&format!(
-            "[Codex Store] StartApps 命中 AppUserModelId: {}",
-            app_user_model_id
-        ));
-        return Some(app_user_model_id);
-    }
-    if let Some(app_user_model_id) = detect_codex_store_app_user_model_id_by_appx_fallback() {
-        crate::modules::logger::log_info(&format!(
-            "[Codex Store] Appx fallback 命中 AppUserModelId: {}",
-            app_user_model_id
-        ));
-        return Some(app_user_model_id);
-    }
-    None
-}
-
-#[cfg(target_os = "windows")]
-fn detect_codex_store_app_user_model_id() -> Option<String> {
-    if let Some(app_user_model_id) = CODEX_STORE_APP_USER_MODEL_ID_CACHE.get() {
-        return Some(app_user_model_id.clone());
-    }
-
-    let detected = detect_codex_store_app_user_model_id_uncached();
-    if let Some(ref app_user_model_id) = detected {
-        let _ = CODEX_STORE_APP_USER_MODEL_ID_CACHE.set(app_user_model_id.clone());
-    }
-    detected
-}
-
-#[cfg(target_os = "windows")]
-fn powershell_argument_list_clause(values: &[String]) -> String {
-    let arguments = values
-        .iter()
-        .filter(|value| !value.trim().is_empty())
-        .map(|value| format!("'{}'", escape_powershell_single_quoted(value)))
-        .collect::<Vec<_>>();
-    if arguments.is_empty() {
-        return String::new();
-    }
-    format!(" -ArgumentList @({})", arguments.join(", "))
-}
-
-#[cfg(target_os = "windows")]
-fn launch_codex_via_store_app_user_model_id(
-    app_user_model_id: &str,
-    codex_home: Option<&str>,
-    app_user_data_dir: Option<&str>,
-    extra_args: &[String],
-    extra_env: &[(String, String)],
-) -> Result<(), String> {
-    let app_user_model_id = app_user_model_id.trim();
-    if app_user_model_id.is_empty() {
-        return Err("Codex AppUserModelId 为空".to_string());
-    }
-
-    let escaped = escape_powershell_single_quoted(app_user_model_id);
-    let mut env_pairs: Vec<(&str, String)> = managed_proxy_env_pairs();
-    if let Some(codex_home) = codex_home.map(str::trim).filter(|value| !value.is_empty()) {
-        env_pairs.push(("CODEX_HOME", codex_home.to_string()));
-    }
-    if let Some(app_user_data_dir) = app_user_data_dir
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    {
-        env_pairs.push((
-            "CODEX_ELECTRON_USER_DATA_PATH",
-            app_user_data_dir.to_string(),
-        ));
-    }
-    for (key, value) in extra_env {
-        env_pairs.push((key.as_str(), value.clone()));
-    }
-    let env_lines = env_pairs
-        .into_iter()
-        .map(|(key, value)| format!("$env:{}='{}'", key, escape_powershell_single_quoted(&value)))
-        .collect::<Vec<_>>()
-        .join("\n");
-    let argument_list = powershell_argument_list_clause(extra_args);
-    let script = format!(
-        r#"{env_lines}
-$appId='{escaped}';
-$target='shell:AppsFolder\' + $appId
-Start-Process -FilePath $target{argument_list} -ErrorAction Stop | Out-Null"#
-    );
-
-    let output = powershell_output(&["-Command", &script])
-        .map_err(|e| format!("系统入口启动调用失败: {}", e))?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let stderr_head = stderr.trim().chars().take(400).collect::<String>();
-        return Err(format!(
-            "系统入口启动失败: status={}, stderr={}",
-            output.status,
-            if stderr_head.is_empty() {
-                "<empty>".to_string()
-            } else {
-                stderr_head
-            }
-        ));
-    }
-    Ok(())
 }
 
 const CODEX_MANAGED_STORE_LAUNCH_UNSAFE_PREFIX: &str = "CODEX_MANAGED_STORE_LAUNCH_UNSAFE:";
@@ -2601,6 +2556,21 @@ fn migrate_legacy_codex_launch_path(custom_path: &str) -> Option<std::path::Path
     Some(detected)
 }
 
+#[cfg(windows)]
+pub(crate) fn windows_opencode_install_candidates() -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    if let Some(local_appdata) = std::env::var_os("LOCALAPPDATA") {
+        let programs = PathBuf::from(local_appdata).join("Programs");
+        for folder in ["@opencodedesktop", "OpenCode"] {
+            candidates.push(programs.join(folder).join("OpenCode.exe"));
+        }
+    }
+    if let Some(program_files) = std::env::var_os("PROGRAMFILES") {
+        candidates.push(PathBuf::from(program_files).join("OpenCode/OpenCode.exe"));
+    }
+    candidates
+}
+
 fn detect_opencode_exec_path() -> Option<std::path::PathBuf> {
     #[cfg(target_os = "macos")]
     {
@@ -2612,23 +2582,7 @@ fn detect_opencode_exec_path() -> Option<std::path::PathBuf> {
 
     #[cfg(target_os = "windows")]
     {
-        let mut candidates: Vec<std::path::PathBuf> = Vec::new();
-        if let Ok(local_appdata) = std::env::var("LOCALAPPDATA") {
-            candidates.push(
-                std::path::PathBuf::from(local_appdata)
-                    .join("Programs")
-                    .join("OpenCode")
-                    .join("OpenCode.exe"),
-            );
-        }
-        if let Ok(program_files) = std::env::var("PROGRAMFILES") {
-            candidates.push(
-                std::path::PathBuf::from(program_files)
-                    .join("OpenCode")
-                    .join("OpenCode.exe"),
-            );
-        }
-        for candidate in candidates {
+        for candidate in windows_opencode_install_candidates() {
             if can_probe_passive_windows_path(&candidate.to_string_lossy()) && candidate.exists() {
                 return Some(candidate);
             }
@@ -2658,59 +2612,89 @@ fn detect_opencode_exec_path() -> Option<std::path::PathBuf> {
     None
 }
 
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct AntigravityLaunchPath {
+    pub configured_path: Option<String>,
+    pub resolved_path: Option<std::path::PathBuf>,
+    pub uses_configured_path: bool,
+}
+
+pub(crate) fn inspect_antigravity_desktop_launch_path(legacy: bool) -> AntigravityLaunchPath {
+    let current = config::get_user_config();
+    let configured_path = normalize_custom_path(Some(if legacy {
+        &current.antigravity_legacy_app_path
+    } else {
+        &current.antigravity_app_path
+    }));
+    let configured_executable = configured_path
+        .as_deref()
+        .and_then(|path| resolve_antigravity_configured_path(path, legacy));
+    let uses_configured_path = configured_executable.is_some();
+    let resolved_path = configured_executable.or_else(|| {
+        if legacy {
+            detect_antigravity_legacy_exec_path()
+        } else {
+            detect_antigravity_exec_path()
+        }
+    });
+    AntigravityLaunchPath {
+        configured_path,
+        resolved_path,
+        uses_configured_path,
+    }
+}
+
+fn resolve_antigravity_configured_path(custom: &str, legacy: bool) -> Option<std::path::PathBuf> {
+    #[cfg(target_os = "macos")]
+    {
+        resolve_macos_antigravity_custom_path(Path::new(custom), legacy)
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let executable = resolve_linux_antigravity_exec_path(Path::new(custom)).ok()?;
+        if legacy {
+            let actual = executable.canonicalize().unwrap_or_else(|_| executable.clone());
+            if linux_antigravity_install_root_for_match(&executable).is_some()
+                || linux_antigravity_install_root_for_match(&actual).is_some()
+            {
+                return None;
+            }
+        }
+        Some(executable)
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        if !legacy {
+            return resolve_windows_antigravity_ide_custom_path(custom);
+        }
+        let path = std::path::PathBuf::from(custom);
+        let lower = custom.to_ascii_lowercase().replace(['-', '_'], " ");
+        if lower.contains("antigravity ide") {
+            return None;
+        }
+        let names = ["Antigravity.exe", "Electron.exe"];
+        if path.is_file() {
+            let known_name = path.file_name().is_some_and(|name| {
+                names.iter().any(|exe| name.to_string_lossy().eq_ignore_ascii_case(exe))
+            });
+            return (known_name || lower.contains("antigravity")).then_some(path);
+        }
+        names.into_iter().map(|name| path.join(name)).find(|candidate| candidate.is_file())
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
+    {
+        if legacy { None } else { resolve_macos_exec_path(custom, "Electron") }
+    }
+}
+
 fn resolve_antigravity_launch_path() -> Result<std::path::PathBuf, String> {
-    let configured_path = config::get_user_config().antigravity_app_path;
-    if let Some(custom) = normalize_custom_path(Some(&configured_path)) {
-        #[cfg(target_os = "macos")]
-        if is_legacy_antigravity_macos_path(&custom) {
-            if let Some(detected) = detect_antigravity_exec_path() {
-                update_app_path_in_config("antigravity", &detected, &configured_path);
-                return Ok(detected);
-            }
-        }
-
-        #[cfg(target_os = "windows")]
-        {
-            if let Some(exec) = resolve_windows_antigravity_ide_custom_path(&custom) {
-                return Ok(exec);
-            }
-        }
-
-        #[cfg(target_os = "macos")]
-        {
-            if let Some(exec) = resolve_macos_exec_path(&custom, "Electron") {
-                return Ok(exec);
-            }
-        }
-
-        #[cfg(target_os = "linux")]
-        {
-            let custom_path = Path::new(&custom);
-            if custom_path.exists() {
-                return resolve_linux_antigravity_exec_path(custom_path);
-            }
-        }
-
-        #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
-        {
-            if let Some(exec) = resolve_macos_exec_path(&custom, "Electron") {
-                return Ok(exec);
-            }
-        }
-
-        if let Some(detected) = detect_antigravity_exec_path() {
-            update_app_path_in_config("antigravity", &detected, &configured_path);
-            return Ok(detected);
-        }
-        return Err(app_path_missing_error("antigravity"));
-    }
-
-    if let Some(detected) = detect_antigravity_exec_path() {
-        update_app_path_in_config("antigravity", &detected, &configured_path);
-        return Ok(detected);
-    }
-
-    Err(app_path_missing_error("antigravity"))
+    inspect_antigravity_desktop_launch_path(false)
+        .resolved_path
+        .ok_or_else(|| app_path_missing_error("antigravity"))
 }
 
 pub fn ensure_antigravity_launch_path_configured() -> Result<(), String> {
@@ -2718,49 +2702,9 @@ pub fn ensure_antigravity_launch_path_configured() -> Result<(), String> {
 }
 
 fn resolve_antigravity_legacy_launch_path() -> Result<std::path::PathBuf, String> {
-    if let Some(custom) =
-        normalize_custom_path(Some(&config::get_user_config().antigravity_app_path))
-    {
-        #[cfg(target_os = "macos")]
-        if is_legacy_antigravity_macos_path(&custom) {
-            if let Some(exec) = resolve_macos_exec_path(&custom, "Antigravity")
-                .or_else(|| resolve_macos_exec_path(&custom, "Electron"))
-            {
-                return Ok(exec);
-            }
-        }
-
-        #[cfg(target_os = "linux")]
-        {
-            let custom_path = Path::new(&custom);
-            if custom_path.exists() {
-                return resolve_linux_antigravity_exec_path(custom_path);
-            }
-        }
-
-        #[cfg(all(not(target_os = "macos"), not(target_os = "linux")))]
-        {
-            let custom_path = std::path::PathBuf::from(&custom);
-            let lower = custom.to_ascii_lowercase();
-            if lower.contains("antigravity") && !lower.contains("antigravity ide") {
-                if custom_path.is_file() {
-                    return Ok(custom_path);
-                }
-                for exe_name in ["Antigravity.exe", "antigravity.exe", "Electron.exe"] {
-                    let candidate = custom_path.join(exe_name);
-                    if candidate.exists() {
-                        return Ok(candidate);
-                    }
-                }
-            }
-        }
-    }
-
-    if let Some(detected) = detect_antigravity_legacy_exec_path() {
-        return Ok(detected);
-    }
-
-    Err(app_path_missing_error("antigravity"))
+    inspect_antigravity_desktop_launch_path(true)
+        .resolved_path
+        .ok_or_else(|| app_path_missing_error("antigravity_legacy"))
 }
 
 pub fn ensure_antigravity_legacy_launch_path_configured() -> Result<(), String> {
@@ -2768,19 +2712,18 @@ pub fn ensure_antigravity_legacy_launch_path_configured() -> Result<(), String> 
 }
 
 pub fn ensure_vscode_launch_path_configured() -> Result<(), String> {
+    if config::get_user_config().vscode_app_path.trim().is_empty() {
+        detect_and_save_app_path("vscode", false);
+    }
     resolve_vscode_launch_path().map(|_| ())
 }
 
 pub fn ensure_codex_launch_path_configured() -> Result<(), String> {
     #[cfg(target_os = "windows")]
     {
-        if detect_codex_store_app_user_model_id().is_some() {
-            return Ok(());
-        }
-        if resolve_codex_launch_path().is_ok() {
-            return Ok(());
-        }
-        return Err("未检测到 Codex 商店安装，请先在 Microsoft Store 安装 Codex".to_string());
+        // A StartApps alias alone is not a usable desktop executable. Use the
+        // same configured-path/registered-package resolver as the launch flow.
+        return resolve_codex_launch_path().map(|_| ());
     }
 
     #[cfg(not(target_os = "windows"))]
@@ -2803,10 +2746,6 @@ pub fn ensure_codebuddy_cn_launch_path_configured() -> Result<(), String> {
     resolve_codebuddy_cn_launch_path().map(|_| ())
 }
 
-pub fn ensure_qoder_launch_path_configured() -> Result<(), String> {
-    resolve_qoder_launch_path().map(|_| ())
-}
-
 pub fn ensure_trae_launch_path_configured() -> Result<(), String> {
     resolve_trae_launch_path().map(|_| ())
 }
@@ -2815,11 +2754,30 @@ pub fn ensure_workbuddy_launch_path_configured() -> Result<(), String> {
     resolve_workbuddy_launch_path().map(|_| ())
 }
 
+/// MiniMax Code 客户端 exe 解析。
+///
+/// 直接复用账号模块里的解析器（配置覆盖 → 常见安装路径），避免两份候选逻辑漂移。
+/// 解析失败时回填用户配置，保持与其它平台一致的行为。
+pub(crate) fn resolve_minimax_code_launch_path() -> Result<std::path::PathBuf, String> {
+    crate::modules::minimax_code_account::resolve_minimax_code_launch_path()
+}
+
+pub fn ensure_minimax_code_launch_path_configured() -> Result<(), String> {
+    resolve_minimax_code_launch_path().map(|_| ())
+}
+
+#[cfg(target_os = "macos")]
+fn resolve_macos_vscode_executable(path: &str) -> Option<PathBuf> {
+    ["Code", "Electron"]
+        .into_iter()
+        .find_map(|binary| resolve_macos_exec_path(path, binary).filter(|path| path.is_file()))
+}
+
 fn resolve_vscode_launch_path() -> Result<std::path::PathBuf, String> {
     if let Some(custom) = normalize_custom_path(Some(&config::get_user_config().vscode_app_path)) {
         #[cfg(target_os = "macos")]
         {
-            if let Some(exec) = resolve_macos_exec_path(&custom, "Electron") {
+            if let Some(exec) = resolve_macos_vscode_executable(&custom) {
                 return Ok(exec);
             }
         }
@@ -2890,7 +2848,7 @@ fn resolve_codebuddy_cn_launch_path() -> Result<std::path::PathBuf, String> {
     Err(app_path_missing_error("codebuddy_cn"))
 }
 
-fn resolve_qoder_launch_path() -> Result<std::path::PathBuf, String> {
+pub(crate) fn resolve_qoder_launch_path() -> Result<std::path::PathBuf, String> {
     if let Some(custom) = normalize_custom_path(Some(&config::get_user_config().qoder_app_path)) {
         if let Some(exec) = resolve_qoder_macos_exec_path(&custom) {
             return Ok(exec);
@@ -3037,30 +2995,8 @@ fn resolve_trae_launch_path_for_platform(
 }
 
 pub(crate) fn resolve_workbuddy_launch_path() -> Result<std::path::PathBuf, String> {
-    if let Some(custom) = normalize_custom_path(Some(&config::get_user_config().workbuddy_app_path))
-    {
-        if let Some(exec) = resolve_workbuddy_macos_exec_path(&custom) {
-            return Ok(exec);
-        }
-        return Err(app_path_missing_error("workbuddy"));
-    }
-
-    if let Some(detected) = detect_workbuddy_exec_path() {
-        let detected_str = detected.to_string_lossy();
-        if let Some(exec) = resolve_workbuddy_macos_exec_path(&detected_str) {
-            return Ok(exec);
-        }
-        #[cfg(target_os = "macos")]
-        if detected.is_file() {
-            return Ok(detected);
-        }
-        #[cfg(not(target_os = "macos"))]
-        if detected.exists() {
-            return Ok(detected);
-        }
-    }
-
-    Err(app_path_missing_error("workbuddy"))
+    let custom = normalize_custom_path(Some(&config::get_user_config().workbuddy_app_path));
+    select_workbuddy_launch_path(custom.as_deref(), detect_workbuddy_exec_path)
 }
 
 #[cfg(target_os = "macos")]
@@ -3088,7 +3024,7 @@ fn resolve_codex_launch_path() -> Result<std::path::PathBuf, String> {
 /// Windows：解析 Codex 桌面端启动路径。
 ///
 /// 规则（按优先级）：
-/// 1. 配置里的启动路径存在 → 直接使用（含用户手填的 npm 版 CLI）。
+/// 1. 配置里的路径存在且是桌面主程序 → 直接使用；CLI 与辅助程序不能作为桌面入口。
 /// 2. 未配置或路径已经不可用 → 按当前用户已注册的商店包解析
 ///    （PFN → InstallLocation → 清单里的 `Executable`），解析成功即**写回配置**作为新的启动路径。
 ///    商店更新换目录后旧目录若还在但已不能执行，由启动失败后的重新解析兜底。
@@ -3102,11 +3038,11 @@ fn resolve_codex_launch_path() -> Result<std::path::PathBuf, String> {
     let configured_path = normalize_custom_path(Some(&configured)).map(std::path::PathBuf::from);
 
     if let Some(path) = configured_path.as_deref() {
-        if path.is_file() {
+        if is_usable_codex_windows_gui_path(path) {
             return Ok(path.to_path_buf());
         }
         crate::modules::logger::log_warn(&format!(
-            "[Codex Start] 配置的启动路径已失效，准备重新探测: {}",
+            "[Codex Start] 配置路径已失效或不是桌面主程序，准备重新探测: {}",
             path.to_string_lossy()
         ));
     }
@@ -3163,12 +3099,12 @@ fn detect_and_save_app_path_raw(app: &str, force: bool) -> Option<String> {
             }
         }
         "antigravity_legacy" => {
-            if !force && !current.antigravity_app_path.trim().is_empty() {
-                return Some(current.antigravity_app_path);
+            if !force && !current.antigravity_legacy_app_path.trim().is_empty() {
+                return Some(current.antigravity_legacy_app_path);
             }
             if let Some(detected) = detect_antigravity_legacy_exec_path() {
-                update_app_path_in_config("antigravity", &detected, &current.antigravity_app_path);
-                return Some(config::get_user_config().antigravity_app_path);
+                update_app_path_in_config("antigravity_legacy", &detected, &current.antigravity_legacy_app_path);
+                return Some(config::get_user_config().antigravity_legacy_app_path);
             }
         }
         "codex" => {
@@ -3271,12 +3207,28 @@ fn detect_and_save_app_path_raw(app: &str, force: bool) -> Option<String> {
             }
         }
         "workbuddy" => {
-            if !force && !current.workbuddy_app_path.trim().is_empty() {
-                return Some(current.workbuddy_app_path);
+            if !force {
+                if let Some(custom) = normalize_custom_path(Some(&current.workbuddy_app_path)) {
+                    if !workbuddy_install_is_international(Path::new(&custom)) {
+                        return Some(current.workbuddy_app_path);
+                    }
+                }
             }
             if let Some(detected) = detect_workbuddy_exec_path() {
                 update_app_path_in_config("workbuddy", &detected, &current.workbuddy_app_path);
                 return Some(config::get_user_config().workbuddy_app_path);
+            }
+        }
+        "minimaxcode" | "minimax_code" => {
+            // `force` only skips the cached-config short-circuit below; the
+            // resolver still prefers an already-configured path, so a re-detect
+            // returns the configured path rather than re-scanning candidates.
+            if !force && !current.minimax_code_app_path.trim().is_empty() {
+                return Some(current.minimax_code_app_path);
+            }
+            if let Ok(detected) = resolve_minimax_code_launch_path() {
+                update_app_path_in_config("minimaxcode", &detected, &current.minimax_code_app_path);
+                return Some(config::get_user_config().minimax_code_app_path);
             }
         }
         _ => {}
@@ -3320,8 +3272,18 @@ pub fn is_pid_running(pid: u32) -> bool {
                 .with_exe(UpdateKind::OnlyIfNotSet)
                 .with_cmd(UpdateKind::OnlyIfNotSet),
         );
-        system.process(Pid::from(pid as usize)).is_some()
+        let process = system.process(Pid::from(pid as usize));
+        #[cfg(target_os = "linux")]
+        return process.is_some_and(|process| linux_process_status_is_running(process.status()));
+        #[cfg(not(target_os = "linux"))]
+        process.is_some()
     }
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn linux_process_status_is_running(status: sysinfo::ProcessStatus) -> bool {
+    // Exited children may still have /proc entries until their parent reaps them.
+    !matches!(status, sysinfo::ProcessStatus::Zombie | sysinfo::ProcessStatus::Dead)
 }
 
 #[cfg(not(target_os = "macos"))]

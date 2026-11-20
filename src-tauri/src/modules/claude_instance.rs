@@ -146,27 +146,7 @@ pub fn get_default_claude_cli_config_dir() -> Result<PathBuf, String> {
 }
 
 pub fn get_default_instances_root_dir() -> Result<PathBuf, String> {
-    #[cfg(target_os = "macos")]
-    {
-        let home = dirs::home_dir().ok_or("无法获取用户主目录")?;
-        return Ok(home.join(".antigravity_cockpit/instances/claude"));
-    }
-
-    #[cfg(target_os = "windows")]
-    {
-        let appdata =
-            std::env::var("APPDATA").map_err(|_| "无法获取 APPDATA 环境变量".to_string())?;
-        return Ok(PathBuf::from(appdata).join(".antigravity_cockpit\\instances\\claude"));
-    }
-
-    #[cfg(target_os = "linux")]
-    {
-        let home = dirs::home_dir().ok_or("无法获取用户主目录")?;
-        return Ok(home.join(".antigravity_cockpit/instances/claude"));
-    }
-
-    #[allow(unreachable_code)]
-    Err("Claude 应用多开仅支持 macOS、Windows 和 Linux".to_string())
+    crate::modules::data_paths::managed_instances_root_dir("claude")
 }
 
 pub fn get_instance_defaults() -> Result<InstanceDefaults, String> {
@@ -222,6 +202,8 @@ fn resolve_copy_source_config_dir(
 }
 
 pub fn create_instance(params: CreateInstanceParams) -> Result<InstanceProfile, String> {
+    let directory_preexisted = std::path::Path::new(params.user_data_dir.trim()).exists();
+    let creation_mode = params.init_mode.clone().unwrap_or_else(|| "copy".to_string());
     let _creation_guard = crate::modules::instance_storage_cleanup::protect_instance_creation()?;
     let _lock = CLAUDE_INSTANCE_STORE_LOCK
         .lock()
@@ -295,6 +277,9 @@ pub fn create_instance(params: CreateInstanceParams) -> Result<InstanceProfile, 
         last_pid: None,
     };
 
+    crate::modules::instance_directory_ownership::record_creation(
+        std::path::Path::new(&instance.user_data_dir), &instance.id, &creation_mode, directory_preexisted,
+    )?;
     store.instances.push(instance.clone());
     save_instance_store(&store)?;
     Ok(instance)
@@ -677,7 +662,7 @@ fn format_command_preview(command: &Command) -> String {
     modules::process::summarize_text_for_process_log(&preview, 600)
 }
 
-fn spawn_command_with_trace(cmd: &mut Command) -> std::io::Result<std::process::Child> {
+fn spawn_command_with_trace(cmd: &mut Command) -> std::io::Result<u32> {
     let preview = format_command_preview(cmd);
     if command_trace_enabled() {
         modules::logger::log_info(&format!("[CmdTrace][Claude] EXEC {}", preview));
@@ -700,7 +685,7 @@ fn spawn_command_with_trace(cmd: &mut Command) -> std::io::Result<std::process::
             )),
         }
     }
-    result
+    result.map(modules::process::background_child_pid)
 }
 
 fn normalize_custom_path(value: &str) -> Option<String> {
@@ -1083,9 +1068,10 @@ fn scan_claude_exe_under_root(
 }
 
 #[cfg(target_os = "windows")]
-fn scan_windows_start_apps_for_claude(
+pub(super) fn scan_windows_start_apps_for_claude(
     candidates: &mut Vec<ClaudeDesktopLaunchCandidate>,
     seen: &mut HashSet<String>,
+    timeout: std::time::Duration,
 ) {
     use std::os::windows::process::CommandExt;
 
@@ -1101,8 +1087,7 @@ fn scan_windows_start_apps_for_claude(
         ])
         .creation_flags(0x08000000)
         .stdin(Stdio::null());
-    let output =
-        modules::process_timeout::output_with_timeout(&mut command, WINDOWS_CLAUDE_PROBE_TIMEOUT);
+    let output = modules::process_timeout::output_with_timeout(&mut command, timeout);
     let Ok(output) = output else {
         return;
     };
@@ -1228,7 +1213,7 @@ pub fn scan_claude_desktop_launch_targets(
         }
     }
 
-    scan_windows_start_apps_for_claude(&mut candidates, &mut seen);
+    scan_windows_start_apps_for_claude(&mut candidates, &mut seen, WINDOWS_CLAUDE_PROBE_TIMEOUT);
 
     candidates
 }
@@ -1474,6 +1459,54 @@ fn resolve_expected_claude_launch_path_for_match() -> Option<String> {
             None
         }
     }
+}
+
+#[cfg(target_os = "windows")]
+pub(super) fn windows_store_desktop_profile_dir() -> Option<PathBuf> {
+    let root = dirs::data_local_dir()?.join("Claude-Data");
+    if !root.is_dir() {
+        return None;
+    }
+    let profile_name = match resolve_claude_windows_launch_target() {
+        Ok(ClaudeWindowsLaunchTarget::ShellApp(target)) => {
+            let family = target.rsplit('\\').next()?.split_once('!')?.0;
+            Some(family.to_ascii_lowercase())
+        }
+        Ok(ClaudeWindowsLaunchTarget::Executable(path)) => path.ancestors().find_map(|ancestor| {
+            let name = ancestor.file_name()?.to_str()?.to_ascii_lowercase();
+            let (product, publisher) = name.rsplit_once("__")?;
+            product.starts_with("claude_").then(|| format!("claude_{publisher}"))
+        }),
+        Err(_) => Some("claude_pzs8sxrjxfjjc".to_string()),
+    };
+    if let Some(profile_name) = profile_name {
+        let publisher = profile_name.strip_prefix("claude_")?;
+        if publisher.is_empty() || !publisher.bytes().all(|byte| byte.is_ascii_alphanumeric()) {
+            return None;
+        }
+        // The Store family identifies the same profile before and after
+        // shutdown. Do not choose another publisher's profile by timestamps.
+        let profile = root.join(profile_name);
+        return profile.is_dir().then_some(profile);
+    }
+    // A configured executable can also be the running Store program itself.
+    // Accept only the actual command line for the matched desktop process.
+    let root = PathBuf::from(normalize_path_for_compare(root.to_str()?));
+    let mut profiles = collect_claude_process_entries()
+        .into_iter()
+        .filter_map(|(_, dir)| dir.map(PathBuf::from))
+        .filter(|dir| {
+            dir.parent() == Some(root.as_path())
+                && dir.file_name().and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with("claude_"))
+        })
+        .collect::<Vec<_>>();
+    profiles.sort_unstable();
+    profiles.dedup();
+    if profiles.len() == 1 {
+        return profiles.pop();
+    }
+    None
 }
 
 pub fn collect_claude_process_entries() -> Vec<(u32, Option<String>)> {
@@ -1758,7 +1791,7 @@ fn spawn_claude_windows(
         .stderr(Stdio::null());
     if let Some(target) = target {
         cmd.env(CLAUDE_USER_DATA_DIR_ENV, target);
-        cmd.arg("--user-data-dir").arg(target);
+        cmd.arg(format!("--user-data-dir={}", target));
     }
     if use_new_window {
         cmd.arg("--new-window");
@@ -1768,7 +1801,7 @@ fn spawn_claude_windows(
             cmd.arg(arg.trim());
         }
     }
-    let child =
+    let pid =
         spawn_command_with_trace(&mut cmd).map_err(|e| format!("启动 Claude 失败: {}", e))?;
     if matches!(launch_target, ClaudeWindowsLaunchTarget::ShellApp(_)) {
         let probe_started = std::time::Instant::now();
@@ -1781,11 +1814,11 @@ fn spawn_claude_windows(
         }
         modules::logger::log_warn(&format!(
             "[Claude Start] Windows shell app target launched but no Claude.exe PID matched in 6s; explorer pid={}",
-            child.id()
+            pid
         ));
         return Err("Claude Desktop 已发起启动，但 6 秒内未匹配到真实 Claude.exe 进程".to_string());
     }
-    Ok(child.id())
+    Ok(pid)
 }
 
 #[cfg(target_os = "macos")]
@@ -1810,7 +1843,7 @@ fn spawn_claude_macos_open(
     cmd.arg("-n").arg("-a").arg(&app_root);
     cmd.arg("--args");
     if let Some(target) = target {
-        cmd.arg("--user-data-dir").arg(target);
+        cmd.arg(format!("--user-data-dir={}", target));
     }
     if use_new_window {
         cmd.arg("--new-window");
@@ -1821,7 +1854,7 @@ fn spawn_claude_macos_open(
         }
     }
 
-    let child =
+    let pid =
         spawn_command_with_trace(&mut cmd).map_err(|e| format!("启动 Claude 失败: {}", e))?;
     modules::logger::log_info("Claude 启动命令已发送（open -n -a）");
     let probe_started = std::time::Instant::now();
@@ -1834,9 +1867,9 @@ fn spawn_claude_macos_open(
     }
     modules::logger::log_warn(&format!(
         "[Claude Start] 启动后 6s 内未匹配到实例 PID，回退 open pid={}",
-        child.id()
+        pid
     ));
-    Ok(child.id())
+    Ok(pid)
 }
 
 #[cfg(target_os = "linux")]
@@ -1857,7 +1890,7 @@ fn spawn_claude_unix(
         .filter(|value| !value.is_empty())
     {
         cmd.env(CLAUDE_USER_DATA_DIR_ENV, target);
-        cmd.arg("--user-data-dir").arg(target);
+        cmd.arg(format!("--user-data-dir={}", target));
     }
     if use_new_window {
         cmd.arg("--new-window");
@@ -1867,9 +1900,7 @@ fn spawn_claude_unix(
             cmd.arg(arg.trim());
         }
     }
-    let child =
-        spawn_command_with_trace(&mut cmd).map_err(|e| format!("启动 Claude 失败: {}", e))?;
-    Ok(child.id())
+    spawn_command_with_trace(&mut cmd).map_err(|e| format!("启动 Claude 失败: {}", e))
 }
 
 pub fn start_claude_with_args_with_new_window(

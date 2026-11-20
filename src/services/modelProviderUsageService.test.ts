@@ -3,7 +3,9 @@ import test from "node:test";
 import {
   buildUsageBaseUrlCandidates,
   formatModelProviderUsageMoney,
+  presentNewApiQuota,
   resolveNewApiQuotaSnapshot,
+  resolveModelProviderUsageMode,
   type ModelProviderUsageSummary,
 } from "./modelProviderUsageService.ts";
 
@@ -94,8 +96,56 @@ test("new_api quota ignores malformed numeric details", () => {
   });
 });
 
+test("new_api quota recovers legacy billing values ahead of the unlimited key flag", () => {
+  const usage = summary({
+    mode: "new_api",
+    quotaUnlimited: true,
+    details: [
+      { key: "hardLimitUsd", label: "Hard limit", value: "100" },
+      { key: "totalUsage", label: "Total usage", value: "750" },
+    ],
+  });
+  assert.deepEqual(presentNewApiQuota(usage, "Unlimited", "Unknown"), {
+    text: "92.50 / 100", percent: 93, expiresAt: null,
+  });
+});
+
+test("new_api quota never displays the legacy unlimited sentinel as an amount", () => {
+  const usage = summary({
+    mode: "new_api",
+    quotaUnlimited: true,
+    details: [
+      { key: "hardLimitUsd", label: "Hard limit", value: "100000000" },
+      { key: "totalUsage", label: "Total usage", value: "750" },
+    ],
+  });
+  assert.deepEqual(presentNewApiQuota(usage, "Unlimited", "Unknown"), {
+    text: "Unlimited", percent: 100, expiresAt: null,
+  });
+});
+
+test("new_api quota distinguishes missing balance from an explicit zero", () => {
+  const usage = summary({ mode: "new_api", quotaUnlimited: true, quotaLimit: 60, unit: "%" });
+  assert.deepEqual(presentNewApiQuota(usage, "Unlimited", "Unknown"), {
+    text: "Unknown / 60%", percent: null, expiresAt: null,
+  });
+  assert.deepEqual(presentNewApiQuota({ ...usage, remaining: 0 }, "Unlimited", "Unknown"), {
+    text: "0% / 60%", percent: 0, expiresAt: null,
+  });
+  assert.deepEqual(presentNewApiQuota(summary({ balance: 4, unit: "CNY" }), "Unlimited", "Unknown"), {
+    text: "¥4.00", percent: null, expiresAt: null,
+  });
+});
+
 test("token plan percentages render without currency decimals", () => {
   assert.equal(formatModelProviderUsageMoney(72, "%"), "72%");
+});
+
+test("official usage stays a spend summary instead of falling back to a relay balance", () => {
+  const usage = summary({ mode: 'openai_official', totalCost: 2, todayRequests: 4 });
+  assert.equal(resolveModelProviderUsageMode(usage), 'openai_official');
+  assert.equal(usage.balance, undefined);
+  assert.equal(usage.quotaRemaining, undefined);
 });
 
 test("new-api amounts without a reported unit do not acquire a dollar sign", () => {

@@ -5,9 +5,61 @@ use std::sync::{
     Arc, LazyLock, Mutex, Weak,
 };
 use tokio::{io::AsyncReadExt, process::Child};
+
+/// Only retain provider identities and completion flags, never remote errors or URLs.
+pub(crate) struct ProviderProgress {
+    patterns: Vec<(String, String, Vec<String>)>,
+    failed: Mutex<std::collections::HashSet<(String, String)>>,
+}
+impl ProviderProgress {
+    pub(crate) fn new(config: &serde_json::Value) -> Self {
+        let mut patterns = Vec::new();
+        for kind in ["proxy", "rule"] {
+            if let Some(entries) = config[format!("{kind}-providers")].as_object() {
+                for name in entries.keys() {
+                    let pattern = format!("initial {kind} provider {name} error:");
+                    let escaped = serde_json::to_string(&pattern).expect("string serialization");
+                    patterns.push((
+                        kind.to_owned(),
+                        name.clone(),
+                        vec![pattern, escaped[1..escaped.len() - 1].to_owned()],
+                    ));
+                }
+            }
+        }
+        Self {
+            patterns,
+            failed: Mutex::new(Default::default()),
+        }
+    }
+    fn observe(&self, line: &[u8]) {
+        let line = String::from_utf8_lossy(line);
+        if !line.contains("initial ") || !line.contains(" error:") {
+            return;
+        }
+        if let Ok(mut failed) = self.failed.lock() {
+            for (kind, name, patterns) in &self.patterns {
+                if patterns.iter().any(|pattern| line.contains(pattern)) {
+                    failed.insert((kind.clone(), name.clone()));
+                }
+            }
+        }
+    }
+    pub(crate) fn failed(&self, kind: &str, name: &str) -> bool {
+        self.failed
+            .lock()
+            .is_ok_and(|failed| failed.contains(&(kind.to_owned(), name.to_owned())))
+    }
+}
 pub fn classify(line: &[u8]) -> u8 {
     let s = String::from_utf8_lossy(line).to_ascii_lowercase();
-    if s.contains("no ech config") {
+    if s.contains("parse config error")
+        && (s.contains("unsupport proxy type") || s.contains("unsupported proxy type"))
+    {
+        7
+    } else if s.contains("parse config error") {
+        8
+    } else if s.contains("no ech config") {
         1
     } else if s.contains("certificate") || s.contains("x509:") {
         2
@@ -36,6 +88,8 @@ pub fn code(value: u8) -> Option<&'static str> {
         4 => Some("PROXY_DNS_FAILED"),
         5 => Some("PROXY_HANDSHAKE_FAILED"),
         6 => Some("PROXY_CONNECTION_REFUSED"),
+        7 => Some("PROXY_UNSUPPORTED_PROTOCOL"),
+        8 => Some("PROXY_ENGINE_CONFIG_INVALID"),
         _ => None,
     }
 }
@@ -84,11 +138,22 @@ fn record(line: &[u8], status: &AtomicU8, tunnel_id: uuid::Uuid, source: &'stati
 }
 
 pub fn read(
+    stderr: impl tokio::io::AsyncRead + Unpin + Send + 'static,
+    status: Arc<AtomicU8>,
+    tunnel_id: uuid::Uuid,
+    source: &'static str,
+    process: Option<Weak<Mutex<Child>>>,
+) -> tokio::task::JoinHandle<()> {
+    read_with_providers(stderr, status, tunnel_id, source, process, None)
+}
+
+pub(crate) fn read_with_providers(
     mut stderr: impl tokio::io::AsyncRead + Unpin + Send + 'static,
     status: Arc<AtomicU8>,
     tunnel_id: uuid::Uuid,
     source: &'static str,
     process: Option<Weak<Mutex<Child>>>,
+    providers: Option<Arc<ProviderProgress>>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut buffer = [0u8; 512];
@@ -107,6 +172,9 @@ pub fn read(
                     super::logger::log_warn(&format!("[ProxyEngine] log_line_discarded: tunnel_id={tunnel_id}, source={source}, reason=over_4096_bytes"));
                 }
                 if !overflow && !line.is_empty() {
+                    if let Some(providers) = &providers {
+                        providers.observe(&line);
+                    }
                     record(&line, &status, tunnel_id, source);
                 }
                 super::logger::log_info(&format!("[ProxyEngine] log_reader_end: tunnel_id={tunnel_id}, source={source}, outcome=eof"));
@@ -116,6 +184,9 @@ pub fn read(
             for byte in &buffer[..n] {
                 if *byte == b'\n' {
                     if !overflow {
+                        if let Some(providers) = &providers {
+                            providers.observe(&line);
+                        }
                         record(&line, &status, tunnel_id, source);
                     }
                     if overflow {
@@ -186,6 +257,9 @@ mod tests {
             .with_ansi(false)
             .with_writer(move || writer.clone())
             .finish();
+        // Avoid caching a thread-local capture's callsite interest from a
+        // different thread that has no subscriber (tracing's single-dispatcher path).
+        let _interest_guard = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
         let _guard = tracing::subscriber::set_default(subscriber);
         let mut child = tokio::process::Command::new("/bin/sh")
             .args([
@@ -295,6 +369,8 @@ mod tests {
             ("x509: certificate expired secret", 2),
             ("lookup DNS failed", 4),
             ("handshake failed private-host", 5),
+            ("level=fatal msg=\"Parse config error: proxy 0: unsupport proxy type: private-secret\"", 7),
+            ("level=fatal msg=\"Parse config error: invalid certificate private-secret\"", 8),
             ("unknown secret", 0),
         ] {
             assert_eq!(classify(raw.as_bytes()), expected);

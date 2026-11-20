@@ -29,7 +29,6 @@ const HISTORY_DB_STEM: &str = "thread_history";
 const HISTORY_DB_EXTENSION: &str = "sqlite";
 const SQLITE_DIR_NAME: &str = "sqlite";
 const BACKUP_DIR_NAME: &str = "cockpit-history-sanitize-backup";
-const MAX_BACKUP_FILES: usize = 3;
 const BUSY_TIMEOUT_SECONDS: u64 = 5;
 /// 单批写库的行数与字节上限：命中行按批扫描与提交，避免整库 reasoning 行同时驻留内存。
 const HISTORY_SANITIZE_BATCH_ROWS: usize = 200;
@@ -198,9 +197,7 @@ fn codex_profile_dirs() -> Vec<PathBuf> {
 fn one_time_sanitize_state_path() -> PathBuf {
     modules::account::get_data_dir()
         .unwrap_or_else(|_| {
-            dirs::home_dir()
-                .unwrap_or_else(|| PathBuf::from("."))
-                .join(".antigravity_cockpit")
+            crate::modules::data_paths::fallback_data_dir()
         })
         .join(ONE_TIME_MIGRATION_STATE_FILE)
 }
@@ -229,7 +226,7 @@ fn write_rollout_signature_backup(
         .duration_since(std::time::UNIX_EPOCH)
         .map(|duration| duration.as_millis())
         .unwrap_or_default();
-    let backup_file = backup_root.join(format!("rollout-signatures-{timestamp}.json"));
+    let backup_file = backup_root.join(format!("rollout-signatures-{timestamp}-{}.json", uuid::Uuid::new_v4()));
     let serialized = serde_json::to_vec_pretty(backups)
         .map_err(|error| format!("序列化会话日志签名备份失败: {}", error))?;
     let temp_path = backup_file.with_extension("json.tmp");
@@ -242,7 +239,6 @@ fn write_rollout_signature_backup(
             error
         )
     })?;
-    prune_backup_files(&backup_root);
     modules::logger::log_info(&format!(
         "[Codex Rollout Sanitize] 已记录签名回滚备份: file={}, entries={}",
         backup_file.display(),
@@ -425,7 +421,7 @@ fn sanitize_history_database(
         last_rowid = *batch_last_rowid;
 
         // 备份逐行落盘，内存里只保留这一批的改写结果。
-        let mut updates: Vec<(i64, String)> = Vec::new();
+        let mut updates = Vec::new();
         for (rowid, thread_id, turn_id, item_id, original_item_json) in batch {
             let Some(sanitized) = sanitize_history_item_json(&original_item_json) else {
                 continue;
@@ -438,8 +434,7 @@ fn sanitize_history_database(
                 &item_id,
                 &original_item_json,
             )?;
-            changed_threads.insert(thread_id);
-            updates.push((rowid, sanitized));
+            updates.push((rowid, thread_id, turn_id, item_id, original_item_json, sanitized));
         }
         if updates.is_empty() {
             continue;
@@ -448,25 +443,19 @@ fn sanitize_history_database(
         let transaction = connection.unchecked_transaction().map_err(|error| {
             format!("开启会话历史库事务失败 ({}): {}", database.display(), error)
         })?;
-        for (rowid, item_json) in &updates {
-            transaction
-                .execute(
-                    "UPDATE thread_items SET item_json = ?1 WHERE rowid = ?2",
-                    rusqlite::params![item_json, rowid],
-                )
-                .map_err(|error| {
-                    format!(
-                        "写入会话历史项失败 ({} rowid={}): {}",
-                        database.display(),
-                        rowid,
-                        error
-                    )
-                })?;
+        let mut applied = 0usize;
+        for (rowid, thread_id, turn_id, item_id, original, sanitized) in &updates {
+            if update_history_item_if_unchanged(&transaction, *rowid, thread_id, turn_id, item_id, original, sanitized)
+                .map_err(|error| format!("写入会话历史项失败 ({} rowid={}): {}", database.display(), rowid, error))?
+            {
+                applied += 1;
+                changed_threads.insert(thread_id.clone());
+            }
         }
         transaction.commit().map_err(|error| {
             format!("提交会话历史库事务失败 ({}): {}", database.display(), error)
         })?;
-        updated_items += updates.len();
+        updated_items += applied;
     }
 
     // 收尾：关闭当前库在备份文件里的 rows 数组，下一个库会另起一项。
@@ -481,6 +470,18 @@ fn sanitize_history_database(
         ));
     }
     Ok((updated_items, changed_threads.len()))
+}
+
+// Projection rebuilds may reuse rowids between the scan and write transaction.
+// Match both logical identity and the original bytes, never just the physical row.
+fn update_history_item_if_unchanged(
+    connection: &Connection, rowid: i64, thread_id: &str, turn_id: &str,
+    item_id: &str, original: &str, sanitized: &str,
+) -> rusqlite::Result<bool> {
+    connection.execute(
+        "UPDATE thread_items SET item_json = ?1 WHERE rowid = ?2 AND thread_id = ?3 AND turn_id = ?4 AND item_id = ?5 AND item_json = ?6",
+        rusqlite::params![sanitized, rowid, thread_id, turn_id, item_id, original],
+    ).map(|count| count == 1)
 }
 
 /// 被改动行的原始内容备份（用于手动回滚）。只记录被改动的 reasoning 行，
@@ -517,7 +518,7 @@ impl HistoryBackupWriter {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|duration| duration.as_millis())
             .unwrap_or_default();
-        let backup_file = backup_root.join(format!("sanitize-{timestamp_ms}.json"));
+        let backup_file = backup_root.join(format!("sanitize-{timestamp_ms}-{}.json", uuid::Uuid::new_v4()));
         let temp_path = backup_file.with_extension("json.tmp");
         Self {
             backup_root,
@@ -652,7 +653,6 @@ impl HistoryBackupWriter {
             )
         })?;
         self.finished = true;
-        prune_backup_files(&self.backup_root);
         Ok(Some((
             self.backup_file.clone(),
             self.rows_written,
@@ -717,29 +717,32 @@ fn table_has_column(connection: &Connection, table: &str, column: &str) -> Resul
     Ok(false)
 }
 
-fn prune_backup_files(backup_root: &Path) {
-    let Ok(entries) = fs::read_dir(backup_root) else {
-        return;
-    };
-    let mut files = entries
-        .flatten()
-        .map(|entry| entry.path())
-        .filter(|path| path.is_file())
-        .collect::<Vec<_>>();
-    if files.len() <= MAX_BACKUP_FILES {
-        return;
-    }
-    files.sort();
-    let remove_count = files.len() - MAX_BACKUP_FILES;
-    for path in files.into_iter().take(remove_count) {
-        let _ = fs::remove_file(path);
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn sanitize_compare_and_swap_preserves_reused_rowid_and_new_content() {
+        let dir = make_temp_dir("codex-history-sanitize-cas");
+        let path = create_history_db(&dir);
+        let connection = Connection::open(&path).unwrap();
+        let concurrent = Connection::open(&path).unwrap();
+        let original = r#"{"type":"reasoning","content":["old"]}"#;
+        let sanitized = r#"{"type":"reasoning","content":[]}"#;
+        insert_item(&connection, "thread-1", "item-1", original);
+        let rowid: i64 = connection.query_row("SELECT rowid FROM thread_items", [], |row| row.get(0)).unwrap();
+        concurrent.execute("DELETE FROM thread_items", []).unwrap();
+        insert_item(&concurrent, "new-thread", "new-item", original);
+        assert!(!update_history_item_if_unchanged(&connection, rowid, "thread-1", "turn-1", "item-1", original, sanitized).unwrap());
+        concurrent.execute("UPDATE thread_items SET thread_id='thread-1',item_id='item-1',item_json='new client content'", []).unwrap();
+        assert!(!update_history_item_if_unchanged(&connection, rowid, "thread-1", "turn-1", "item-1", original, sanitized).unwrap());
+        let actual: String = connection.query_row("SELECT item_json FROM thread_items", [], |row| row.get(0)).unwrap();
+        assert_eq!(actual, "new client content");
+        assert!(update_history_item_if_unchanged(&connection, rowid, "thread-1", "turn-1", "item-1", &actual, sanitized).unwrap());
+        drop(concurrent); drop(connection);
+        fs::remove_dir_all(dir).unwrap();
+    }
 
     fn make_temp_dir(prefix: &str) -> PathBuf {
         let unique = SystemTime::now()
@@ -812,6 +815,12 @@ mod tests {
     #[test]
     fn clears_third_party_reasoning_content_and_is_idempotent() {
         let dir = make_temp_dir("codex-history-sanitize-test");
+        let backup_root = dir.join(BACKUP_DIR_NAME);
+        fs::create_dir_all(&backup_root).unwrap();
+        let previous = ["rollout-signatures-1.json", "sanitize-1.json", "sanitize-2.json"];
+        for name in previous {
+            fs::write(backup_root.join(name), name).unwrap();
+        }
         let db = create_history_db(&dir);
         let connection = Connection::open(&db).expect("open db");
         insert_item(
@@ -866,10 +875,22 @@ mod tests {
         assert!(!second.changed_anything());
 
         let backups = backup_files(&dir);
-        assert_eq!(backups.len(), 1, "应生成一份可回滚备份");
+        assert_eq!(backups.len(), previous.len() + 1);
+        for name in previous {
+            assert_eq!(fs::read_to_string(backup_root.join(name)).unwrap(), name);
+        }
+        let fresh = backups.iter()
+            .find(|path| !previous.contains(&path.file_name().unwrap().to_str().unwrap()))
+            .unwrap();
         let payload: serde_json::Value =
-            serde_json::from_str(&fs::read_to_string(&backups[0]).expect("read backup"))
+            serde_json::from_str(&fs::read_to_string(fresh).expect("read backup"))
                 .expect("parse backup");
+        write_rollout_signature_backup(&dir, &[]).unwrap();
+        assert_eq!(backup_files(&dir).len(), previous.len() + 2);
+        for name in previous {
+            assert_eq!(fs::read_to_string(backup_root.join(name)).unwrap(), name);
+        }
+        assert!(fresh.is_file());
         assert_eq!(
             payload["databases"][0]["rows"][0]["item_json"].as_str(),
             Some(r#"{"type":"reasoning","id":"r1","summary":[],"content":["thinking text"]}"#),
@@ -1043,7 +1064,7 @@ mod tests {
     }
 
     #[test]
-    fn one_time_migration_cleans_idle_rollouts_and_defers_active_ones() {
+    fn one_time_migration_preserves_idle_and_active_rollout_bytes() {
         let dir = make_temp_dir("codex-rollout-migration");
         let state_path = dir.join(ONE_TIME_MIGRATION_STATE_FILE);
         let profile_dir = dir.join("default");
@@ -1075,11 +1096,11 @@ mod tests {
         let outcome =
             run_one_time_sanitize_with(&state_path, vec![profile_dir.clone()]).expect("migration");
 
-        assert_eq!(outcome.rollout.files_changed, 1);
-        assert_eq!(outcome.rollout.removed_signatures, 1);
+        assert_eq!(outcome.rollout.files_changed, 0);
+        assert_eq!(outcome.rollout.removed_signatures, 0);
         assert_eq!(outcome.rollout.pending_files.len(), 1);
         let cleaned = fs::read_to_string(&idle_rollout).expect("read cleaned rollout");
-        assert!(!cleaned.contains("encrypted_content"));
+        assert!(cleaned.contains("encrypted_content"));
         let deferred = fs::read_to_string(&active_rollout).expect("read active rollout");
         assert!(
             deferred.contains("encrypted_content"),

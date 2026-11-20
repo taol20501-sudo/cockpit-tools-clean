@@ -18,6 +18,7 @@ export interface Account {
     protected_models?: string[];
     created_at: number;
     last_used: number;
+  last_switched_at?: number | null;
 }
 
 export interface AccountNoteUpdate {
@@ -72,6 +73,7 @@ export interface ModelQuota {
     display_name?: string;
     percentage: number;
     reset_time: string;
+    summary_exhausted?: boolean;
 }
 
 export interface RefreshStats {

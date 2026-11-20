@@ -1,4 +1,5 @@
-import { useMemo, useState } from "react";
+import { resolveCodexAccountDisplayName } from "../../utils/codexAccountDisplayName";
+import { useEffect, useMemo, useState } from "react";
 import { ArrowRight, ImagePlus, KeyRound, Play, X } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import { useEscClose } from "../../hooks/useEscClose";
@@ -14,23 +15,26 @@ import {
   DEEPSEEK_ACCESS_MODE_DIRECT,
   DEEPSEEK_ACCESS_MODE_GATEWAY,
   isDeepSeekAccount,
-  isDeepSeekResponsesAccount,
-  resolveDeepSeekAccessMode,
+  codexProviderAccessModes,
+  resolveCodexProviderAccessMode,
   resolveDeepSeekModelOptions,
   resolveDeepSeekStartupModel,
   shouldUseDeepSeekProviderGateway,
   type DeepSeekAccessMode,
   type DeepSeekStartTarget,
 } from "../../utils/codexDeepSeekAccess";
+import { useCodexImageModelConfig } from "./useCodexImageModelConfig";
+import { eligibleImageAccountIds, configuredImageAccountIds, isImageGenerationEligibleAccount, resolveImageAccountModel } from "../../utils/codexImageAccounts";
 import { CodexImageAccountPickerModal } from "./CodexImageAccountPickerModal";
 import "./CodexLaunchPreviewModal.css";
 import "./CodexApiKeyLaunchSection.css";
 
 export interface CodexApiKeyLaunchOptions {
-  accessMode: DeepSeekAccessMode;
+  accessMode?: DeepSeekAccessMode;
   startupModel: string;
   imageGenEnabled: boolean;
   imageGenAccountIds: string[];
+  imageGenAccountModels: Record<string, string>;
 }
 
 /** 启动预览与模型供应商弹框共用：后者传入的是表单草稿，字段可能不全。 */
@@ -42,6 +46,7 @@ export type CodexApiKeyLaunchAccount = DeepSeekStartTarget & {
   api_provider_name?: string | null;
   api_model_context_windows?: Record<string, number> | null;
   api_image_generation_account_ids?: string[] | null;
+  api_image_generation_account_models?: Record<string, string> | null;
 };
 
 export function createCodexApiKeyLaunchOptions(
@@ -53,10 +58,11 @@ export function createCodexApiKeyLaunchOptions(
       )
     : [];
   return {
-    accessMode: resolveDeepSeekAccessMode(account ?? undefined),
+    accessMode: resolveCodexProviderAccessMode(account),
     startupModel: resolveDeepSeekStartupModel(account ?? undefined),
     imageGenEnabled: imageAccountIds.length > 0,
     imageGenAccountIds: imageAccountIds,
+    imageGenAccountModels: account?.api_image_generation_account_models ?? {},
   };
 }
 
@@ -92,6 +98,7 @@ export interface CodexApiKeyLaunchSectionProps {
   options: CodexApiKeyLaunchOptions;
   onChange: (options: CodexApiKeyLaunchOptions) => void;
   disabled?: boolean;
+  onImageConfigReadyChange?: (ready: boolean) => void;
 }
 
 export function CodexApiKeyLaunchSection({
@@ -99,12 +106,32 @@ export function CodexApiKeyLaunchSection({
   options,
   onChange,
   disabled = false,
+  onImageConfigReadyChange,
 }: CodexApiKeyLaunchSectionProps) {
   const { t } = useTranslation();
   const [pickerOpen, setPickerOpen] = useState(false);
   const accounts = useCodexAccountStore((state) => state.accounts);
+  const accountsLoaded = useCodexAccountStore((state) => state.accountsLoaded);
+  const imageModelConfig = useCodexImageModelConfig(disabled, pickerOpen || options.imageGenEnabled);
+  const imageConfigReady = !options.imageGenEnabled || options.imageGenAccountIds.every((id) => {
+    const item = accounts.find((candidate) => candidate.id === id);
+    return Boolean(item && imageModelConfig.loaded && isImageGenerationEligibleAccount(item, imageModelConfig.model, imageModelConfig.deletedModels) && (!isCodexApiKeyAccount(item) || resolveImageAccountModel(item, imageModelConfig.model, options.imageGenAccountModels, imageModelConfig.deletedModels)));
+  });
+  useEffect(() => { onImageConfigReadyChange?.(imageConfigReady); }, [imageConfigReady, onImageConfigReadyChange]);
 
-  const canChooseAccessMode = isDeepSeekResponsesAccount(account);
+  useEffect(() => {
+    if (!imageModelConfig.loaded || !accountsLoaded) return;
+    const ids = options.imageGenAccountIds.filter((id) => {
+      const item = accounts.find((candidate) => candidate.id === id);
+      return item ? eligibleImageAccountIds([id], [item], imageModelConfig.model, imageModelConfig.deletedModels).length > 0 : !accountsLoaded;
+    });
+    const models = Object.fromEntries(Object.entries(options.imageGenAccountModels).filter(([id]) => ids.includes(id)));
+    if (ids.length !== options.imageGenAccountIds.length || JSON.stringify(models) !== JSON.stringify(options.imageGenAccountModels)) {
+      onChange({ ...options, imageGenAccountIds: ids, imageGenAccountModels: models });
+    }
+  }, [accounts, accountsLoaded, imageModelConfig.loaded, imageModelConfig.model, imageModelConfig.deletedModels, onChange, options]);
+
+  const supportedAccessModes = codexProviderAccessModes(account);
   const isDeepSeek = isDeepSeekAccount(account);
   const models = useMemo(() => {
     if (isDeepSeek) return resolveDeepSeekModelOptions(account);
@@ -127,7 +154,7 @@ export function CodexApiKeyLaunchSection({
   );
   const hasContextData = contextFacts.some((fact) => fact.context.length > 0);
   const usesLocalGateway = accountUsesInstanceLocalGateway(account);
-  const wireApiLabel =
+  const wireApiLabel = account.api_wire_api === "anthropic" ? "Anthropic Messages" :
     (account.api_wire_api ?? "responses").trim().toLowerCase() === "chat_completions"
       ? "Chat Completions"
       : "Responses";
@@ -140,15 +167,15 @@ export function CodexApiKeyLaunchSection({
     {
       id: DEEPSEEK_ACCESS_MODE_GATEWAY,
       title: t("codex.deepSeek.start.gatewayMode", "网关列出"),
-      description: t(
+      description: !isDeepSeek ? t("codex.launchPreview.providerAccessGatewayHint") : t(
         "codex.deepSeek.start.gatewayDesc",
         "需要本地网关。支持绑定 OAuth 的 GPT 账号并使用 OAuth 的全部能力（浏览器操作等），支持在 Codex 内切换模型，可把生图交给 GPT 账号。",
       ),
     },
     {
       id: DEEPSEEK_ACCESS_MODE_DIRECT,
-      title: t("codex.deepSeek.start.directMode", "直连官方"),
-      description: t(
+      title: t(isDeepSeek ? "codex.deepSeek.start.directMode" : "codex.launchPreview.providerAccessDirect"),
+      description: !isDeepSeek ? t("codex.deepSeek.start.directUpstreamHint") : t(
         "codex.deepSeek.start.directDesc",
         "不走网关，速度更快。不能在 Codex 内切换模型，也没有 OAuth 能力与生图转发。",
       ),
@@ -156,14 +183,14 @@ export function CodexApiKeyLaunchSection({
     {
       id: DEEPSEEK_ACCESS_MODE_CDP,
       title: t("codex.deepSeek.start.cdpMode", "CDP 注入"),
-      description: t(
+      description: !isDeepSeek ? t("codex.launchPreview.providerAccessCdpHint") : t(
         "codex.deepSeek.start.cdpDesc",
         "通过注入接管 Codex 官方模型列表，速度与直连一致。需要注入官方客户端，不支持绑定 OAuth。",
       ),
     },
   ];
 
-  const selectedImageAccounts = options.imageGenAccountIds
+  const selectedImageAccounts = configuredImageAccountIds(options.imageGenAccountIds, accounts, imageModelConfig.model, options.imageGenAccountModels, imageModelConfig.deletedModels)
     .map((id) => accounts.find((item) => item.id === id))
     .filter((item): item is CodexAccount => Boolean(item));
 
@@ -185,60 +212,25 @@ export function CodexApiKeyLaunchSection({
         </div>
       )}
 
-      {canChooseAccessMode ? (
-        <div className="form-group">
-          <label>{t("codex.deepSeek.start.accessMode", "接入方式")}</label>
-          <div className="codex-api-key-launch-mode-list">
-            {modes.map((mode) => (
-              <button
-                key={mode.id}
-                type="button"
-                className={`codex-api-key-launch-mode ${
-                  options.accessMode === mode.id ? "active" : ""
-                }`}
-                onClick={() => onChange({ ...options, accessMode: mode.id })}
-                disabled={disabled}
-              >
-                <span className="codex-api-key-launch-mode-title">{mode.title}</span>
-                <span className="codex-api-key-launch-mode-desc">{mode.description}</span>
-              </button>
-            ))}
-          </div>
+      <div className="form-group">
+        <label>{t("codex.deepSeek.start.accessMode", "接入方式")} · {wireApiLabel}</label>
+        <div className="codex-api-key-launch-mode-list">
+          {modes.filter((mode) => supportedAccessModes.includes(mode.id)).map((mode) => (
+            <button
+              key={mode.id}
+              type="button"
+              className={`codex-api-key-launch-mode ${
+                options.accessMode === mode.id ? "active" : ""
+              }`}
+              onClick={() => onChange({ ...options, accessMode: mode.id })}
+              disabled={disabled}
+            >
+              <span className="codex-api-key-launch-mode-title">{mode.title}</span>
+              <span className="codex-api-key-launch-mode-desc">{mode.description}</span>
+            </button>
+          ))}
         </div>
-      ) : (
-        <div className="form-group">
-          <label>{t("codex.deepSeek.start.accessMode", "接入方式")}</label>
-          <div className="codex-api-key-launch-context-list">
-            <span className="codex-api-key-launch-context-item">
-              <span className="codex-api-key-launch-context-model">
-                {t("codex.deepSeek.start.protocol", "协议")}
-              </span>
-              <span className="codex-api-key-launch-context-value">{wireApiLabel}</span>
-            </span>
-            <span className="codex-api-key-launch-context-item">
-              <span className="codex-api-key-launch-context-model">
-                {t("codex.deepSeek.start.accessRoute", "接入")}
-              </span>
-              <span className="codex-api-key-launch-context-value">
-                {usesLocalGateway
-                  ? t("codex.deepSeek.start.gatewayRequired", "走实例本地网关")
-                  : t("codex.deepSeek.start.directUpstream", "直连上游，不经网关")}
-              </span>
-            </span>
-          </div>
-          <p className="form-hint">
-            {usesLocalGateway
-              ? t(
-                  "codex.deepSeek.start.gatewayHint",
-                  "该协议需要本地网关转换，可在 Codex 内切换模型；网关还能承接生图转发。",
-                )
-              : t(
-                  "codex.deepSeek.start.directUpstreamHint",
-                  "该账号直接访问上游，不经过本地网关，因此不支持生图转发。",
-                )}
-          </p>
-        </div>
-      )}
+      </div>
 
       {isDeepSeek && (
         <div className="form-group">
@@ -261,7 +253,7 @@ export function CodexApiKeyLaunchSection({
         </div>
       )}
 
-      {(canChooseAccessMode ? options.accessMode === DEEPSEEK_ACCESS_MODE_GATEWAY : usesLocalGateway) && (
+      {(options.accessMode ? options.accessMode === DEEPSEEK_ACCESS_MODE_GATEWAY : usesLocalGateway) && (
         <div className="form-group codex-api-key-launch-imagegen">
           <label className="codex-api-key-launch-imagegen-head">
             <input
@@ -274,20 +266,23 @@ export function CodexApiKeyLaunchSection({
                   ...options,
                   imageGenEnabled: enabled,
                   imageGenAccountIds: enabled ? options.imageGenAccountIds : [],
+                  imageGenAccountModels: enabled ? options.imageGenAccountModels : {},
                 });
               }}
             />
             <span>
               <ImagePlus size={15} />
-              {t("codex.deepSeek.start.imageGen", "支持 GPT 生图")}
+              {t("codex.deepSeek.start.imageGen", "支持生图")}
             </span>
           </label>
           <p className="form-hint">
             {t(
               "codex.deepSeek.start.imageGenHint",
-              "对话仍由 DeepSeek 处理；生图走 gpt-image 原链路，由所选 GPT 账号执行并消耗其额度。",
+              "仅网关模式支持。对话使用当前供应商；OAuth 使用原生 GPT 生图，API Key 来源需兼容 Images API 且包含所选完整型号。",
             )}
           </p>
+          {!imageConfigReady && imageModelConfig.loading && <p role="status">{t("common.loading")}</p>}
+          {!imageConfigReady && <ModalErrorMessage message={imageModelConfig.error || (imageModelConfig.loaded ? t("codex.localAccess.imageAccounts.modelRequired") : null)} />}
           <div className="codex-api-key-launch-imagegen-row">
             <button
               type="button"
@@ -295,7 +290,7 @@ export function CodexApiKeyLaunchSection({
               disabled={disabled || !options.imageGenEnabled}
               onClick={() => setPickerOpen(true)}
             >
-              {t("codex.deepSeek.start.imageGenPick", "选择 GPT 账号")}
+              {t("codex.deepSeek.start.imageGenPick", "选择生图来源")}
             </button>
             <span className="codex-api-key-launch-imagegen-status">
               {!options.imageGenEnabled
@@ -312,7 +307,7 @@ export function CodexApiKeyLaunchSection({
             <div className="codex-api-key-launch-imagegen-tags">
               {selectedImageAccounts.map((item) => (
                 <span key={item.id} className="codex-api-key-launch-imagegen-tag">
-                  {item.email || item.account_name || item.id}
+                  {resolveCodexAccountDisplayName(item, t("common.apiKeyAccount"))}
                 </span>
               ))}
             </div>
@@ -324,10 +319,13 @@ export function CodexApiKeyLaunchSection({
         <CodexImageAccountPickerModal
           accounts={accounts}
           selectedIds={options.imageGenAccountIds}
+          selectedModels={options.imageGenAccountModels}
+          imageGenerationModel={imageModelConfig.model}
+          imageModelControl={imageModelConfig.control}
           onCancel={() => setPickerOpen(false)}
-          onConfirm={(ids) => {
+          onConfirm={(ids, models) => {
             setPickerOpen(false);
-            onChange({ ...options, imageGenEnabled: ids.length > 0, imageGenAccountIds: ids });
+            onChange({ ...options, imageGenEnabled: ids.length > 0, imageGenAccountIds: ids, imageGenAccountModels: models });
           }}
         />
       )}
@@ -372,6 +370,7 @@ export function CodexApiKeyLaunchDialog({
   onConfirm,
 }: CodexApiKeyLaunchDialogProps) {
   const { t } = useTranslation();
+  const [imageConfigReady, setImageConfigReady] = useState(true);
   useEscClose(!submitting, onCancel);
   const providerLabel =
     subjectLabel?.trim() ||
@@ -481,6 +480,7 @@ export function CodexApiKeyLaunchDialog({
                 options={options}
                 onChange={onChange}
                 disabled={submitting}
+                onImageConfigReadyChange={setImageConfigReady}
               />
             </section>
           </div>
@@ -497,8 +497,8 @@ export function CodexApiKeyLaunchDialog({
           <button
             type="button"
             className="btn btn-primary"
-            onClick={() => onConfirm(options)}
-            disabled={submitting}
+            onClick={() => { if (imageConfigReady) onConfirm(options); }}
+            disabled={submitting || !imageConfigReady}
           >
             {!submitting && <Play size={15} />}
             {submitting

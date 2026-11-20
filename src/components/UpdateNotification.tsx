@@ -1,6 +1,7 @@
 import { useState, useMemo, useCallback } from 'react';
 import { X, Download, Sparkles, RefreshCw, Check, XCircle } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
+import { invoke } from '@tauri-apps/api/core';
 import { openUrl } from '@tauri-apps/plugin-opener';
 import { useEscClose } from '../hooks/useEscClose';
 import { prependUpdaterReleaseHighlights } from '../utils/updaterReleaseNotes';
@@ -27,6 +28,7 @@ export interface UpdateCheckResult {
 }
 
 interface UpdateNotificationProps {
+  visible?: boolean;
   updateInfo?: UpdateInfo | null;
   checking?: boolean;
   onClose: () => void;
@@ -45,6 +47,7 @@ interface UpdateNotificationProps {
 
 export const UpdateNotification: React.FC<UpdateNotificationProps> = ({
   updateInfo = null,
+  visible = true,
   checking = false,
   onClose,
   onRestartUpdate,
@@ -61,7 +64,7 @@ export const UpdateNotification: React.FC<UpdateNotificationProps> = ({
 }) => {
   const { t, i18n } = useTranslation();
 
-  useEscClose(true, onClose);
+  useEscClose(visible, onClose);
 
   const [showErrorDetails, setShowErrorDetails] = useState(false);
   const [isRestarting, setIsRestarting] = useState(false);
@@ -80,8 +83,7 @@ export const UpdateNotification: React.FC<UpdateNotificationProps> = ({
       if (onRestartUpdate) {
         await onRestartUpdate();
       } else {
-        const { relaunch } = await import('@tauri-apps/plugin-process');
-        await relaunch();
+        await invoke('relaunch_after_update');
       }
     } catch (error) {
       console.error('Failed to relaunch after update:', error);

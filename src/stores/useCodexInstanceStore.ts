@@ -55,6 +55,7 @@ type CodexInstanceStoreState = InstanceStoreState & {
     importFilePath: string,
     targetInstanceId: string,
     sessionIds: string[],
+    cwdMappings: Record<string, string>,
     transferId?: string | null,
   ) => Promise<CodexSessionImportSummary>;
   openSessionLocation: (
@@ -74,7 +75,10 @@ type CodexInstanceStoreHook = {
   setState: (partial: Partial<CodexInstanceStoreState>) => void;
 };
 
-const baseStore = createInstanceStore(codexInstanceService, 'agtools.codex.instances.cache');
+const baseStore = createInstanceStore({
+  ...codexInstanceService,
+  startInstance: (instanceId) => codexInstanceService.startInstance(instanceId),
+}, 'agtools.codex.instances.cache');
 const typedBaseStore = baseStore as unknown as CodexInstanceStoreHook;
 
 const syncThreadsAcrossInstances = async (): Promise<CodexInstanceThreadSyncSummary> => {
@@ -176,12 +180,14 @@ const importSessions = async (
   importFilePath: string,
   targetInstanceId: string,
   sessionIds: string[],
+  cwdMappings: Record<string, string>,
   transferId?: string | null,
 ): Promise<CodexSessionImportSummary> => {
   const summary = await codexInstanceService.importSessions(
     importFilePath,
     targetInstanceId,
     sessionIds,
+    cwdMappings,
     transferId,
   );
   await typedBaseStore.getState().fetchInstances();

@@ -23,6 +23,8 @@ pub fn save_tray_platform_layout(
     tray_platform_ids: Vec<String>,
     ordered_entry_ids: Option<Vec<String>>,
     platform_groups: Option<Vec<modules::tray_layout::TrayLayoutGroup>>,
+    hidden_platform_ids: Option<Vec<String>>,
+    disabled_platform_ids: Option<Vec<String>>,
 ) -> Result<(), String> {
     modules::tray_layout::save_tray_layout(
         sort_mode,
@@ -30,41 +32,102 @@ pub fn save_tray_platform_layout(
         tray_platform_ids,
         ordered_entry_ids,
         platform_groups,
+        hidden_platform_ids,
+        disabled_platform_ids,
     )?;
     modules::tray::update_tray_menu(&app)?;
     Ok(())
 }
 
+/// Explicit launch validation; settings may still save an unfinished or empty path.
 #[tauri::command]
-pub fn set_app_path(app: String, path: String) -> Result<(), String> {
-    let normalized_path = modules::process::normalize_windows_user_facing_path(&path);
-    config::patch_user_config(move |current| {
-        match app.as_str() {
-            "antigravity" | "antigravity_ide" | "antigravity_legacy" => {
-                current.antigravity_app_path = normalized_path
-            }
-            "codex" => current.codex_app_path = normalized_path,
-            "claude" => current.claude_app_path = normalized_path,
-            "zed" => current.zed_app_path = normalized_path,
-            "vscode" => current.vscode_app_path = normalized_path,
-            "windsurf" => current.windsurf_app_path = normalized_path,
-            "kiro" => current.kiro_app_path = normalized_path,
-            "cursor" => current.cursor_app_path = normalized_path,
-            "codebuddy" => current.codebuddy_app_path = normalized_path,
-            "codebuddy_cn" => current.codebuddy_cn_app_path = normalized_path,
-            "qoder" => current.qoder_app_path = normalized_path,
-            "zcode" => current.zcode_app_path = normalized_path,
-            "trae" => current.trae_app_path = normalized_path,
-            "trae_solo" => current.trae_solo_app_path = normalized_path,
-            "trae_cn" => current.trae_cn_app_path = normalized_path,
-            "trae_solo_cn" => current.trae_solo_cn_app_path = normalized_path,
-            "workbuddy" => current.workbuddy_app_path = normalized_path,
-            "opencode" => current.opencode_app_path = normalized_path,
-            _ => return Err("未知应用类型".to_string()),
+pub async fn validate_codex_app_path(path: String) -> Result<(), String> {
+    static VALIDATION_SLOT: std::sync::LazyLock<std::sync::Arc<tokio::sync::Semaphore>> =
+        std::sync::LazyLock::new(|| std::sync::Arc::new(tokio::sync::Semaphore::new(1)));
+    let selected = modules::process::normalize_windows_user_facing_path(&path);
+    // A network-mounted selection can block metadata/PE reads. The timed
+    // worker is read-only and can never save a stale path after timeout.
+    run_codex_path_validation(
+        VALIDATION_SLOT.clone(),
+        move || modules::process::validate_codex_app_path(&selected),
+        Duration::from_secs(5),
+    )
+    .await
+}
+
+async fn run_codex_path_validation(
+    slot: std::sync::Arc<tokio::sync::Semaphore>,
+    validate: impl FnOnce() -> Result<(), String> + Send + 'static,
+    timeout: Duration,
+) -> Result<(), String> {
+    let permit = slot
+        .try_acquire_owned()
+        .map_err(|_| "CODEX_APP_PATH_VALIDATION_BUSY".to_string())?;
+    let validation = tauri::async_runtime::spawn_blocking(move || {
+        // Cancellation or timeout ends only the caller's wait. Retain the slot
+        // until the OS file read really returns, so retries cannot pile up workers.
+        let _permit = permit;
+        validate()
+    });
+    tokio::time::timeout(timeout, validation)
+        .await
+        .map_err(|_| "CODEX_APP_PATH_VALIDATION_TIMEOUT".to_string())?
+        .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+pub async fn set_app_path(app: String, path: String, validate: Option<bool>) -> Result<(), String> {
+    let normalized_path = modules::process::normalize_windows_user_facing_path(path.trim());
+    tauri::async_runtime::spawn_blocking(move || {
+        if app == "workbuddy_ai" && !normalized_path.is_empty()
+            && modules::workbuddy_ai_account::executable_at(std::path::Path::new(&normalized_path)).is_none()
+        {
+            return Err(modules::workbuddy_ai_account::MISSING_APP_PATH.to_string());
         }
+        if validate.unwrap_or(false) && !normalized_path.is_empty()
+            && !(cfg!(windows) && app == "claude" && normalized_path.starts_with("shell:AppsFolder\\"))
+        {
+            let selected = std::path::Path::new(&normalized_path);
+            let usable = selected.is_file()
+                || cfg!(target_os = "macos") && selected.is_dir()
+                    && selected.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("app"));
+            if !usable {
+                return Err(format!("APP_PATH_NOT_FOUND:{app}"));
+            }
+        }
+        config::patch_user_config(move |current| {
+            match app.as_str() {
+                "antigravity" | "antigravity_ide" => {
+                    current.antigravity_app_path = normalized_path
+                }
+                "antigravity_legacy" => current.antigravity_legacy_app_path = normalized_path,
+                "codex" => current.codex_app_path = normalized_path,
+                "claude" => current.claude_app_path = normalized_path,
+                "zed" => current.zed_app_path = normalized_path,
+                "vscode" => current.vscode_app_path = normalized_path,
+                "windsurf" => current.windsurf_app_path = normalized_path,
+                "kiro" => current.kiro_app_path = normalized_path,
+                "cursor" => current.cursor_app_path = normalized_path,
+                "codebuddy" => current.codebuddy_app_path = normalized_path,
+                "codebuddy_cn" => current.codebuddy_cn_app_path = normalized_path,
+                "qoder" => current.qoder_app_path = normalized_path,
+                "zcode" => current.zcode_app_path = normalized_path,
+                "trae" => current.trae_app_path = normalized_path,
+                "trae_solo" => current.trae_solo_app_path = normalized_path,
+                "trae_cn" => current.trae_cn_app_path = normalized_path,
+                "trae_solo_cn" => current.trae_solo_cn_app_path = normalized_path,
+                "workbuddy" => current.workbuddy_app_path = normalized_path,
+                "workbuddy_ai" => current.workbuddy_ai_app_path = normalized_path,
+                "minimaxcode" | "minimax_code" => current.minimax_code_app_path = normalized_path,
+                "opencode" => current.opencode_app_path = normalized_path,
+                _ => return Err("未知应用类型".to_string()),
+            }
+            Ok(())
+        })?;
         Ok(())
-    })?;
-    Ok(())
+    })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 #[tauri::command]
@@ -121,6 +184,8 @@ pub fn set_codex_local_access_entry_visible(enabled: bool) -> Result<(), String>
 pub fn detect_app_path(app: String, force: Option<bool>) -> Result<Option<String>, String> {
     let force = force.unwrap_or(false);
     match app.as_str() {
+        "workbuddy_ai" => Ok(modules::workbuddy_ai_account::detect_executable()
+            .map(|path| path.to_string_lossy().into_owned())),
         "windsurf" => Ok(modules::windsurf_instance::detect_and_save_windsurf_launch_path(force)),
         "kiro" => Ok(modules::kiro_instance::detect_and_save_kiro_launch_path(
             force,
@@ -129,11 +194,21 @@ pub fn detect_app_path(app: String, force: Option<bool>) -> Result<Option<String
         "claude" => Ok(modules::claude_instance::detect_and_save_claude_launch_path(force)),
         "antigravity" | "antigravity_ide" | "antigravity_legacy" | "codex" | "zed" | "vscode"
         | "codebuddy" | "codebuddy_cn" | "qoder" | "zcode" | "trae" | "trae_solo" | "trae_cn"
-        | "trae_solo_cn" | "opencode" | "workbuddy" => Ok(
+        | "trae_solo_cn" | "opencode" | "workbuddy" | "minimaxcode" | "minimax_code" => Ok(
             modules::process::detect_and_save_app_path(app.as_str(), force),
         ),
         _ => Err("未知应用类型".to_string()),
     }
+}
+
+#[tauri::command]
+pub async fn launch_opencode_current() -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(|| {
+        let config = config::get_user_config();
+        modules::process::start_opencode_with_path(Some(&config.opencode_app_path))
+    })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 #[tauri::command]
@@ -184,7 +259,7 @@ pub async fn scan_app_launch_targets(
         "antigravity" | "antigravity_ide" | "antigravity_legacy" | "codex" | "claude"
         | "vscode" | "windsurf" | "kiro" | "cursor" | "codebuddy" | "codebuddy_cn" | "qoder"
         | "zcode" | "trae" | "trae_solo" | "trae_cn" | "trae_solo_cn" | "workbuddy" | "zed"
-        | "opencode" => {}
+        | "opencode" | "minimaxcode" | "minimax_code" | "workbuddy_ai" => {}
         _ => return Err("未知应用类型".to_string()),
     }
     let _ = scan_roots;
@@ -265,6 +340,9 @@ pub fn handle_window_close(
     // 执行操作
     match action.as_str() {
         "minimize" => {
+            if !config::get_user_config().show_tray_icon {
+                return window.minimize().map_err(|err| err.to_string());
+            }
             if let Err(err) = modules::floating_card_window::destroy_main_window_to_tray(&window) {
                 modules::logger::log_warn(&format!("[Window] 销毁主窗口失败，回退隐藏: {}", err));
                 let _ = window.hide();
@@ -351,6 +429,46 @@ pub fn set_floating_card_confirm_on_close(confirm_on_close: bool) -> Result<(), 
 }
 
 #[tauri::command]
+pub async fn update_floating_card_appearance(
+    app: tauri::AppHandle,
+    minimal: Option<bool>,
+    background_opacity: Option<f64>,
+) -> Result<modules::floating_card_window::FloatingCardAppearance, String> {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static SAVING: AtomicBool = AtomicBool::new(false);
+    if SAVING.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire).is_err() {
+        return Err("common.configSaveTimeout".into());
+    }
+    struct SaveGuard;
+    impl Drop for SaveGuard { fn drop(&mut self) { SAVING.store(false, Ordering::Release); } }
+    let task = tauri::async_runtime::spawn_blocking(move || {
+        let _save_guard = SaveGuard;
+        let updated = config::patch_user_config(|current| {
+            if let Some(value) = minimal { current.floating_card_minimal = value; }
+            if let Some(value) = background_opacity {
+                current.floating_card_background_opacity = config::normalize_floating_card_background_opacity(value);
+            }
+            Ok(())
+        })?;
+        let appearance = modules::floating_card_window::FloatingCardAppearance::from(&updated);
+        use tauri::Emitter;
+        // Notify even if a slow disk completes after the caller's timeout.
+        if let Err(err) = app.emit(modules::floating_card_window::FLOATING_CARD_APPEARANCE_CHANGED_EVENT, &appearance) {
+            modules::logger::log_warn(&format!("[FloatingCard] 外观更新通知失败: {}", err));
+        }
+        Ok::<_, String>(appearance)
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(5), task).await
+        .map_err(|_| "common.configSaveTimeout".to_string())?
+        .map_err(|err| err.to_string())?
+}
+
+#[tauri::command]
+pub fn resize_current_floating_card_window(window: tauri::Window, height: f64) -> Result<(), String> {
+    modules::floating_card_window::resize_floating_card_window(&window, height)
+}
+
+#[tauri::command]
 pub fn save_floating_card_position(x: i32, y: i32) -> Result<(), String> {
     config::patch_user_config(|current| {
         current.floating_card_position_x = Some(x);
@@ -431,6 +549,7 @@ pub async fn open_folder(path: String) -> Result<(), String> {
         std::process::Command::new("open")
             .arg(&path)
             .spawn()
+            .map(crate::modules::process::background_child_pid)
             .map_err(|e| format!("打开文件夹失败: {}", e))?;
     }
 
@@ -439,6 +558,7 @@ pub async fn open_folder(path: String) -> Result<(), String> {
         std::process::Command::new("explorer")
             .arg(&path)
             .spawn()
+            .map(crate::modules::process::background_child_pid)
             .map_err(|e| format!("打开文件夹失败: {}", e))?;
     }
 
@@ -447,6 +567,7 @@ pub async fn open_folder(path: String) -> Result<(), String> {
         std::process::Command::new("xdg-open")
             .arg(&path)
             .spawn()
+            .map(crate::modules::process::background_child_pid)
             .map_err(|e| format!("打开文件夹失败: {}", e))?;
     }
 
@@ -479,19 +600,40 @@ pub async fn delete_corrupted_file(path: String) -> Result<(), String> {
 }
 
 #[tauri::command]
-pub fn load_user_memory() -> Result<modules::user_memory::UserMemory, String> {
-    modules::user_memory::load_user_memory()
+pub async fn load_user_memory(
+    legacy: Option<modules::user_memory::UserMemory>,
+) -> Result<modules::user_memory::UserMemory, String> {
+    tauri::async_runtime::spawn_blocking(move || modules::user_memory::load_user_memory(legacy))
+        .await
+        .map_err(|error| error.to_string())?
 }
 
 #[tauri::command]
-pub fn mark_user_memory_dismissed(id: String) -> Result<modules::user_memory::UserMemory, String> {
-    modules::user_memory::mark_user_memory_dismissed(&id)
+pub async fn mark_user_memory_dismissed(id: String) -> Result<modules::user_memory::UserMemory, String> {
+    tauri::async_runtime::spawn_blocking(move || modules::user_memory::mark_user_memory_dismissed(&id))
+        .await
+        .map_err(|error| error.to_string())?
 }
 
 #[tauri::command]
-pub fn save_user_memory_list(
+pub async fn save_user_memory_list(
     id: String,
     items: Vec<String>,
 ) -> Result<modules::user_memory::UserMemory, String> {
-    modules::user_memory::save_user_memory_list(&id, items)
+    tauri::async_runtime::spawn_blocking(move || modules::user_memory::save_user_memory_list(&id, items))
+        .await
+        .map_err(|error| error.to_string())?
+}
+
+/// 返回操作系统真实时区相对 UTC 的偏移（分钟），如 `+08:00` -> `480`。
+///
+/// WebView 的 `Intl` 默认时区在部分环境会解析成 `UTC`，且部分 webview 的 ICU
+/// 时区库无法解析 IANA 名称（如 `Asia/Shanghai`）而再次静默回退 UTC，导致时间
+/// 偏移 N 小时。因此直接由 Rust 侧用 `chrono::Local` 读取 OS 真实偏移（与日志
+/// 本地时间一致），前端以 `UTC + offset` 方式渲染，彻底绕开 webview 时区库。
+/// ponytail: 仅在启动时取一次并缓存到前端，单一事实源；DST 边界的极旧时间戳
+/// 可能偏差 1 小时（用“当前”偏移近似），对“最近切换时间”无影响。
+#[tauri::command]
+pub fn get_local_timezone() -> i64 {
+    chrono::Local::now().offset().local_minus_utc() as i64 / 60
 }

@@ -54,6 +54,25 @@ pub struct StrategyNode {
     pub name: String,
     pub protocol: String,
     pub outbound: Value,
+    pub dependencies: Option<ParsedCatalog>,
+}
+
+pub fn copy_node(node: &ParsedNode, catalog: &ParsedCatalog, rescope: bool) -> Result<StrategyNode, String> {
+    if let Some(profile) = &catalog.native {
+        let (target, selections) = parser::native::binding_target(catalog, &node.id, &Default::default())?;
+        return Ok(StrategyNode { name:node.name.clone(),protocol:node.protocol.clone(),
+            outbound:parser::native::envelope(profile,target,selections),dependencies:None });
+    }
+    let mut copy = StrategyNode {
+        name: node.name.clone(), protocol: node.protocol.clone(),
+        outbound: node.outbound.clone().ok_or(INVALID)?, dependencies: None,
+    };
+    if parser::dialer(node).is_some_and(|d| d != "DIRECT") {
+        let (outbound, nodes, groups) = copy_dependencies(&copy, catalog, rescope)?;
+        copy.outbound = outbound;
+        copy.dependencies = Some(ParsedCatalog { native: None, nodes, groups });
+    }
+    Ok(copy)
 }
 
 /// 校验后的参数：数值已收敛到编码与内核都接受的区间。
@@ -62,17 +81,11 @@ struct Resolved {
     interval: Option<u64>,
     timeout_ms: Option<u64>,
     tolerance: Option<u16>,
-    lazy: Option<bool>,
 }
 
-/// 策略来源的四种分组类型都按 Mihomo 原生策略执行；订阅自带分组保持原有的 select/url-test 限制，
-/// 因为订阅里 fallback / load-balance 的成员协议组合无法在来源导入时逐条核实。
-pub fn group_supported(source_kind: &str, group_kind: &str) -> bool {
-    if source_kind == KIND {
-        KINDS.contains(&group_kind)
-    } else {
-        matches!(group_kind, "select" | "url-test")
-    }
+/// All sources execute the same native Mihomo group strategies.
+pub fn group_supported(_source_kind: &str, group_kind: &str) -> bool {
+    KINDS.contains(&group_kind)
 }
 
 /// 与订阅解析器一致的稳定 ID 方案：同一个名称始终得到同一个 ID。
@@ -148,7 +161,6 @@ fn resolved(options: &StrategyOptions) -> Result<Resolved, String> {
                 u16::try_from(value).map_err(|_| INVALID.to_string())
             })
             .transpose()?,
-        lazy: options.lazy,
     })
 }
 
@@ -209,11 +221,8 @@ pub fn options_view(catalog: &ParsedCatalog) -> Option<Value> {
     {
         object.insert("timeout".into(), json!(timeout_ms / 1000));
     }
-    if let Some(lazy) = native
-        .and_then(|value| value.get("lazy"))
-        .and_then(Value::as_bool)
-    {
-        object.insert("lazy".into(), json!(lazy));
+    if group.kind != "select" {
+        object.insert("lazy".into(), json!(true));
     }
     Some(value)
 }
@@ -236,9 +245,7 @@ fn native(kind: &str, resolved: &Resolved) -> Value {
             native["timeout"] = json!(timeout);
         }
     }
-    if let Some(lazy) = resolved.lazy {
-        native["lazy"] = json!(lazy);
-    }
+    native["lazy"] = json!(true);
     native
 }
 
@@ -257,12 +264,18 @@ pub fn build(
     let mut seen = HashSet::with_capacity(copies.len());
     let mut nodes = Vec::with_capacity(copies.len());
     let mut members = Vec::with_capacity(copies.len());
-    for copy in copies {
+    let mut dependencies = Vec::new();
+    let mut dependency_groups = Vec::new();
+    for mut copy in copies {
         // 同名节点只保留首次勾选的定义，避免内核配置里出现重复的代理名。
         if !seen.insert(copy.name.clone()) {
             continue;
         }
         members.push(copy.name.clone());
+        if let Some(mut catalog) = copy.dependencies.take() {
+            dependencies.append(&mut catalog.nodes);
+            dependency_groups.append(&mut catalog.groups);
+        }
         nodes.push(ParsedNode {
             id: node_id(&copy.name),
             name: copy.name,
@@ -296,10 +309,11 @@ pub fn build(
         error: None,
         native: Some(native(kind, &resolved)),
     };
-    let mut catalog = ParsedCatalog {
-        nodes,
-        groups: vec![group],
-    };
+    nodes.extend(dependencies);
+    let mut groups = vec![group];
+    groups.extend(dependency_groups);
+    if nodes.len() + groups.len() > 512 { return Err(INVALID.into()); }
+    let mut catalog = ParsedCatalog { native: None, nodes, groups };
     // 用解析器同一套规则确认成员可解析，避免落盘一个当前就无法执行的分组。
     parser::validate(&mut catalog).map_err(|_| INVALID.to_string())?;
     if catalog
@@ -310,6 +324,49 @@ pub fn build(
         return Err(INVALID.into());
     }
     Ok(catalog)
+}
+
+/// A strategy copies the complete chain, keeping dependencies scoped to that
+/// member so identically named relays in two subscriptions cannot be mixed.
+fn copy_dependencies(copy: &StrategyNode, catalog: &ParsedCatalog, rescope: bool) -> Result<(Value, Vec<ParsedNode>, Vec<ParsedGroup>), String> {
+    use crate::modules::codex_proxy_catalog_binding as binding;
+    let node_index: std::collections::HashMap<_, _> = catalog.nodes.iter().map(|n| (n.name.as_str(), n)).collect();
+    let group_index: std::collections::HashMap<_, _> = catalog.groups.iter().map(|g| (g.name.as_str(), g)).collect();
+    let scoped = |name: &str| if !rescope || name == copy.name || binding::is_builtin_name(name) {
+        name.to_owned()
+    } else { format!("{} · {}", name.chars().take(40).collect::<String>(), &stable_id(&copy.name, name)[..12]) };
+    let mut pending = vec![copy.name.clone()];
+    let mut seen = HashSet::new();
+    let mut nodes = Vec::new();
+    let mut groups = Vec::new();
+    let mut root = copy.outbound.clone();
+    while let Some(name) = pending.pop() {
+        if !seen.insert(name.clone()) || binding::is_builtin_name(&name) { continue; }
+        if seen.len() > 512 { return Err(INVALID.into()); }
+        if let Some(node) = node_index.get(name.as_str()) {
+            let mut node = (*node).clone();
+            if let Some(dialer) = parser::dialer(&node).map(str::to_owned) {
+                pending.push(dialer.clone());
+                node.outbound.as_mut().ok_or(INVALID)?["proxy"]["dialer-proxy"] = json!(scoped(&dialer));
+            }
+            if name == copy.name { root = node.outbound.ok_or(INVALID)?; } else {
+                node.name = scoped(&name); node.id = node_id(&node.name); nodes.push(node);
+            }
+        } else if let Some(group) = group_index.get(name.as_str()) {
+            let mut group = (*group).clone();
+            pending.extend(group.members.clone());
+            group.name = scoped(&name); group.id = stable_id("group", &group.name);
+            group.members = group.members.iter().map(|m| scoped(m)).collect();
+            if let Some(native) = &mut group.native {
+                native["name"] = json!(group.name); native["proxies"] = json!(group.members);
+                if let Some(selected) = native.get("default-selected").and_then(Value::as_str).map(str::to_owned) {
+                    native["default-selected"] = json!(scoped(&selected));
+                }
+            }
+            groups.push(group);
+        } else { return Err(INVALID.into()); }
+    }
+    Ok((root, nodes, groups))
 }
 
 #[cfg(test)]
@@ -323,6 +380,7 @@ mod tests {
             .nodes
             .into_iter()
             .map(|node| StrategyNode {
+                dependencies: None,
                 name: node.name,
                 protocol: node.protocol,
                 outbound: node.outbound.unwrap(),
@@ -447,7 +505,7 @@ mod tests {
         assert_eq!(group["interval"], 30);
         assert_eq!(group["tolerance"], DEFAULT_TOLERANCE);
         assert!(group.get("timeout").is_none());
-        assert!(group.get("lazy").is_none());
+        assert_eq!(group["lazy"], true);
         assert_eq!(catalog.groups[0].tolerance, Some(DEFAULT_TOLERANCE));
     }
 
@@ -470,7 +528,7 @@ mod tests {
         assert_eq!(view["interval"], 90);
         assert_eq!(view["timeout"], 7);
         assert_eq!(view["tolerance"], 120);
-        assert_eq!(view["lazy"], false, "lazy 为 false 时同样要回读");
+        assert_eq!(view["lazy"], true, "旧 lazy false 也必须启用惰性探测");
         // 回读只含类型与已保存的选项字段。
         assert_eq!(view.as_object().unwrap().len(), 6);
 
@@ -487,7 +545,7 @@ mod tests {
         assert_eq!(view["interval"], 30);
         assert_eq!(view["tolerance"], DEFAULT_TOLERANCE);
         assert!(view.get("timeout").is_none(), "未设置的 timeout 回读为空");
-        assert!(view.get("lazy").is_none(), "未设置的 lazy 回读为空");
+        assert_eq!(view["lazy"], true, "缺少旧字段时也固定启用");
     }
 
     #[test]
@@ -495,6 +553,7 @@ mod tests {
         let mut list = nodes();
         list.swap(0, 2);
         list.push(StrategyNode {
+            dependencies: None,
             name: "Alpha".into(),
             protocol: "trojan".into(),
             outbound: json!({"type": "mihomo", "proxy": {"name": "other", "type": "trojan"}}),
@@ -638,15 +697,16 @@ mod tests {
 
     /// 策略来源能引用全部四种分组类型；订阅来源维持原有 select/url-test 限制。
     #[test]
-    fn strategy_sources_support_every_group_kind_without_relaxing_subscriptions() {
+    fn all_sources_support_the_same_native_group_kinds() {
         for kind in KINDS {
             assert!(group_supported(KIND, kind), "{kind}");
         }
         assert!(!group_supported(KIND, "relay"));
-        for kind in ["select", "url-test"] {
+        for kind in KINDS {
             assert!(group_supported("subscription", kind), "{kind}");
+            assert!(group_supported("manual", kind), "{kind}");
         }
-        for kind in ["fallback", "load-balance", "relay"] {
+        for kind in ["relay"] {
             assert!(!group_supported("subscription", kind), "{kind}");
             assert!(!group_supported("manual", kind), "{kind}");
         }

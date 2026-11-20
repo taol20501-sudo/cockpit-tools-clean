@@ -7,37 +7,59 @@ fn new_local_access_collection() -> Result<CodexLocalAccessCollection, String> {
         port: allocate_initial_local_port(CODEX_LOCAL_ACCESS_LOCALHOST_BIND_HOST)?,
         api_key: generate_local_api_key(),
         api_keys: Vec::new(),
+        account_pools: Vec::new(),
+        account_pool_revision: 0,
         access_scope: CodexLocalAccessScope::Localhost,
         client_base_url_host: CodexLocalAccessClientBaseUrlHost::default(),
         image_generation_mode: CodexLocalAccessImageGenerationMode::default(),
         image_generation_model: DEFAULT_CODEX_IMAGE_GENERATION_MODEL.to_string(),
+        image_generation_models: crate::models::codex_local_access::default_image_generation_models(
+        ),
+        image_generation_deleted_models: Vec::new(),
+        image_generation_model_catalog_revision: 0,
+        image_generation_main_model: None,
         image_generation_account_policies: HashMap::new(),
+        chatgpt_plan_codex_image_policies: HashMap::new(),
+        chatgpt_plan_service_revision: 0,
+        paused_account_ids: Vec::new(),
+        official_account_source_ids: HashMap::new(),
+            official_account_bindings: HashMap::new(),
+        service_account_identity_fingerprints: HashMap::new(),
         image_generation_account_ids: Vec::new(),
+        image_generation_account_models: HashMap::new(),
         gateway_mode: CodexLocalAccessGatewayMode::default(),
+        capability_fallback: Default::default(),
+        multi_agent: Default::default(),
+        native_gateway_default_migrated: true,
         upstream_proxy_url: None,
         routing_strategy: CodexLocalAccessRoutingStrategy::default(),
         custom_routing_rules: Vec::new(),
         account_model_rules: Vec::new(),
+        account_quota_floors: HashMap::new(),
         model_aliases: Vec::new(),
         suppress_oauth_model_alias: false,
         model_pricing_version: DEFAULT_MODEL_PRICING_VERSION,
         model_pricings: Vec::new(),
         excluded_models: Vec::new(),
         session_affinity: true,
+        session_identity_mapping_enabled: true,
         session_affinity_ttl_ms: DEFAULT_SESSION_AFFINITY_TTL_MS,
         session_affinity_default_enabled_migrated: true,
         responses_websockets_enabled: false,
         max_retry_credentials: 0,
         max_retry_interval_ms: DEFAULT_MAX_RETRY_INTERVAL_MS,
+        continuous_overload_retry: false,
         timeouts: CodexLocalAccessTimeouts::default(),
         active_timeout_preset_id: BUILTIN_TIMEOUT_PRESET_LONG_WAIT_ID.to_string(),
         timeout_presets: Vec::new(),
         disable_cooling: false,
         restrict_free_accounts: true,
         debug_logs: true,
+        request_payload_logging: false,
         immediate_sse_response: false,
         max_concurrent_image_requests: 1,
-        max_account_concurrency: 0,
+        max_account_concurrency: DEFAULT_MAX_ACCOUNT_CONCURRENCY,
+        account_concurrency_default_migrated: true,
         account_concurrency_wait_ms: DEFAULT_ACCOUNT_CONCURRENCY_WAIT_MS,
         bound_oauth_account_id: None,
         bound_oauth_quota_reserve: None,
@@ -51,7 +73,6 @@ fn append_eligible_local_access_account_ids(
     current_account_ids: &[String],
     requested_account_ids: Vec<String>,
     accounts: &[CodexAccount],
-    restrict_free_accounts: bool,
 ) -> (
     Vec<String>,
     Vec<String>,
@@ -81,7 +102,7 @@ fn append_eligible_local_access_account_ids(
             });
             continue;
         };
-        if let Some(reason) = local_access_ineligible_reason(account, restrict_free_accounts) {
+        if let Some(reason) = local_access_ineligible_reason(account) {
             skipped_accounts.push(CodexLocalAccessAppendAccountSkipped {
                 account_id,
                 reason: reason.to_string(),
@@ -199,8 +220,9 @@ pub async fn save_local_access_accounts(
     preferred_account_ids: Option<Vec<String>>,
     session_affinity: Option<bool>,
     session_affinity_ttl_ms: Option<i64>,
-    image_generation_account_policies:
-        Option<HashMap<String, CodexLocalAccessImageGenerationPolicy>>,
+    image_generation_account_policies: Option<
+        HashMap<String, CodexLocalAccessImageGenerationPolicy>,
+    >,
 ) -> Result<CodexLocalAccessState, String> {
     save_local_access_accounts_with_reload(
         account_ids,
@@ -222,10 +244,12 @@ async fn save_local_access_accounts_with_reload(
     preferred_account_ids: Option<Vec<String>>,
     session_affinity: Option<bool>,
     session_affinity_ttl_ms: Option<i64>,
-    image_generation_account_policies:
-        Option<HashMap<String, CodexLocalAccessImageGenerationPolicy>>,
+    image_generation_account_policies: Option<
+        HashMap<String, CodexLocalAccessImageGenerationPolicy>,
+    >,
     reload: LocalAccessGatewayReload,
 ) -> Result<CodexLocalAccessState, String> {
+    let _image_update_guard = image_configuration_update_lock().lock().await;
     ensure_runtime_loaded_without_start().await?;
 
     let mut collection = {
@@ -236,17 +260,18 @@ async fn save_local_access_accounts_with_reload(
         }
     };
 
-    let accounts = codex_account::list_accounts_checked()?;
+    let accounts = tokio::task::spawn_blocking(codex_account::list_accounts_checked)
+        .await.map_err(|_| "CODEX_ACCOUNT_LOAD_FAILED".to_string())??;
     let valid_account_ids: HashSet<String> = accounts
         .iter()
-        .filter(|account| is_local_access_eligible_account(account, restrict_free_accounts))
+        .filter(|account| is_local_access_eligible_account(account))
         .map(|account| account.id.clone())
         .collect();
 
     let mut next_account_ids = Vec::new();
     let mut seen = HashSet::new();
     for account_id in account_ids {
-        if !valid_account_ids.contains(&account_id) {
+        if !valid_account_ids.contains(&account_id) && !(collection.account_ids.contains(&account_id) && service_account_paused(&collection, &account_id)) {
             continue;
         }
         if seen.insert(account_id.clone()) {
@@ -259,6 +284,7 @@ async fn save_local_access_accounts_with_reload(
         .filter(|account_id| !next_account_ids.iter().any(|next| next == *account_id))
         .cloned()
         .collect::<Vec<_>>();
+    crate::modules::chatgpt_plan_service::remember_modes_before_removal(&collection.account_ids, &removed_account_ids).await?;
     if !removed_account_ids.is_empty() {
         restore_removed_local_access_accounts(&removed_account_ids).await;
     }
@@ -271,6 +297,7 @@ async fn save_local_access_accounts_with_reload(
             .map(|(account_id, policy)| (account_id.trim().to_string(), policy))
             .filter(|(account_id, _)| collection.account_ids.iter().any(|id| id == account_id))
             .collect();
+        remove_disabled_image_generation_sources(&mut collection);
     } else {
         collection
             .image_generation_account_policies
@@ -325,17 +352,16 @@ async fn save_local_access_accounts_with_reload(
 pub async fn append_local_access_accounts(
     account_ids: Vec<String>,
 ) -> Result<CodexLocalAccessAppendAccountsResult, String> {
+    // Pool edits share this lock, including the member picker and its image settings.
+    let update_guard = image_configuration_update_lock().lock().await;
     ensure_runtime_loaded_without_start().await?;
 
     let existing_collection = {
         let runtime = gateway_runtime().lock().await;
         runtime.collection.clone()
     };
-    let restrict_free_accounts = existing_collection
-        .as_ref()
-        .map(|collection| collection.restrict_free_accounts)
-        .unwrap_or(true);
-    let accounts = codex_account::list_accounts_checked()?;
+    let accounts = tokio::task::spawn_blocking(codex_account::list_accounts_checked)
+        .await.map_err(|_| "CODEX_ACCOUNT_LOAD_FAILED".to_string())??;
     let current_account_ids = existing_collection
         .as_ref()
         .map(|collection| collection.account_ids.as_slice())
@@ -345,7 +371,6 @@ pub async fn append_local_access_accounts(
             current_account_ids,
             account_ids,
             &accounts,
-            restrict_free_accounts,
         );
 
     if !added_account_ids.is_empty() {
@@ -354,6 +379,10 @@ pub async fn append_local_access_accounts(
             None => new_local_access_collection()?,
         };
         collection.account_ids = next_account_ids;
+        collection.chatgpt_plan_service_revision = collection
+            .chatgpt_plan_service_revision
+            .checked_add(1)
+            .ok_or("CHATGPT_PLAN_SERVICE_CHANGED")?;
         collection.updated_at = now_ms();
         let (changed, _) = sanitize_collection_with_accounts(&mut collection, &accounts)?;
         if changed {
@@ -372,6 +401,7 @@ pub async fn append_local_access_accounts(
         }
     }
 
+    drop(update_guard);
     Ok(CodexLocalAccessAppendAccountsResult {
         state: snapshot_state_without_gateway_reload().await?,
         synced_account_ids,
@@ -468,6 +498,43 @@ pub async fn update_local_access_account_model_rules(
 
     ensure_gateway_matches_runtime().await?;
     snapshot_state().await
+}
+
+pub async fn update_local_access_account_quota_floor(
+    account_id: String,
+    minimum_remaining_percent: Option<i32>,
+) -> Result<CodexLocalAccessState, String> {
+    if minimum_remaining_percent.is_some_and(|floor| !(1..=100).contains(&floor)) {
+        return Err("CODEX_LOCAL_ACCESS_INVALID_QUOTA_FLOOR".into());
+    }
+    ensure_runtime_loaded_without_start().await?;
+    let _update = image_configuration_update_lock().lock().await;
+    {
+        let mut runtime = gateway_runtime().lock().await;
+        let collection = runtime.collection.as_ref().ok_or("本地接入集合尚未创建")?;
+        if !collection.account_ids.contains(&account_id) {
+            return Err("CODEX_LOCAL_ACCESS_QUOTA_FLOOR_ACCOUNT_UNAVAILABLE".into());
+        }
+        let account = codex_account::load_account(&account_id);
+        if minimum_remaining_percent.is_some() && account.as_ref().is_none_or(|account| {
+            account.is_api_key_auth() || account.is_agent_identity_auth() || account.is_web_session_auth()
+        }) {
+            return Err("CODEX_LOCAL_ACCESS_QUOTA_FLOOR_ACCOUNT_UNAVAILABLE".into());
+        }
+        let published = persist_account_quota_floor(
+            &local_access_file_path()?, &account_id, minimum_remaining_percent,
+        )?;
+        if let Some(collection) = &mut runtime.collection {
+            collection.account_quota_floors = published.account_quota_floors;
+            prune_account_quota_floors(collection);
+            collection.updated_at = collection.updated_at.max(published.updated_at);
+        }
+        if let Some(account) = account {
+            sync_runtime_quota_cooldowns(&mut runtime, &[account], now_ms());
+        }
+    }
+    emit_local_access_state_updated();
+    snapshot_state_without_gateway_reload().await
 }
 
 pub async fn update_local_access_model_rules(
@@ -593,6 +660,7 @@ pub async fn update_local_access_routing_options(
     max_concurrent_image_requests: u16,
     max_account_concurrency: u16,
     account_concurrency_wait_ms: u64,
+    session_identity_mapping_enabled: Option<bool>,
 ) -> Result<CodexLocalAccessState, String> {
     ensure_runtime_loaded().await?;
 
@@ -608,8 +676,13 @@ pub async fn update_local_access_routing_options(
     let responses_websockets_changed =
         collection.responses_websockets_enabled != responses_websockets_enabled;
     let profile_websocket_sync_needed = !responses_websockets_changed
-        && local_access_profile_takeovers_need_sync(&collection);
+        && collect_local_access_routing_sync_dirs(&collection)
+            .iter()
+            .any(|profile_dir| local_access_profile_takeover_needs_sync(profile_dir, &collection));
     collection.session_affinity = session_affinity;
+    if let Some(enabled) = session_identity_mapping_enabled {
+        collection.session_identity_mapping_enabled = enabled;
+    }
     collection.session_affinity_default_enabled_migrated = true;
     collection.session_affinity_ttl_ms =
         session_affinity_ttl_ms.clamp(SESSION_AFFINITY_TTL_MIN_MS, SESSION_AFFINITY_TTL_MAX_MS);
@@ -623,6 +696,7 @@ pub async fn update_local_access_routing_options(
     collection.max_concurrent_image_requests =
         max_concurrent_image_requests.clamp(1, MAX_CONCURRENT_IMAGE_REQUESTS_PER_ACCOUNT);
     collection.max_account_concurrency = max_account_concurrency.min(MAX_ACCOUNT_CONCURRENCY_LIMIT);
+    collection.account_concurrency_default_migrated = true;
     collection.account_concurrency_wait_ms = account_concurrency_wait_ms.clamp(
         ACCOUNT_CONCURRENCY_WAIT_MIN_MS,
         ACCOUNT_CONCURRENCY_WAIT_MAX_MS,
@@ -637,7 +711,27 @@ pub async fn update_local_access_routing_options(
 
     ensure_gateway_matches_runtime().await?;
     if responses_websockets_changed || profile_websocket_sync_needed {
-        ensure_local_access_profile_takeovers_from_runtime().await?;
+        let collection = gateway_runtime().lock().await.collection.clone();
+        if let Some(collection) = collection.as_ref().filter(|collection| collection.enabled) {
+            maintain_local_access_takeover_dirs(
+                collect_local_access_routing_sync_dirs(collection),
+                collection,
+            )
+            .await?;
+        }
+    }
+    // The automatic collector skips the shared default path while an OAuth
+    // client is running. This explicit command may sync its recorded profile.
+    if !account::is_dev_profile() {
+        tokio::task::spawn_blocking(|| {
+            let collection = gateway_runtime().blocking_lock().collection.clone();
+            if let Some(collection) = collection {
+                sync_owned_oauth_profile_websockets(&codex_account::get_codex_home(), &collection)?;
+            }
+            Ok::<(), String>(())
+        })
+        .await
+        .map_err(|error| format!("Codex WebSocket 配置同步失败: {error}"))??;
     }
     snapshot_state().await
 }
@@ -738,36 +832,7 @@ pub async fn update_local_access_upstream_proxy_config(
     snapshot_state().await
 }
 
-pub async fn update_local_access_gateway_mode(
-    gateway_mode: CodexLocalAccessGatewayMode,
-) -> Result<CodexLocalAccessState, String> {
-    ensure_runtime_loaded().await?;
 
-    let maybe_collection = {
-        let runtime = gateway_runtime().lock().await;
-        runtime.collection.clone()
-    };
-
-    let Some(mut collection) = maybe_collection else {
-        return Err("本地接入集合尚未创建".to_string());
-    };
-
-    if collection.gateway_mode == gateway_mode {
-        return snapshot_state().await;
-    }
-
-    collection.gateway_mode = gateway_mode;
-    collection.updated_at = now_ms();
-    save_collection_to_disk(&collection)?;
-
-    {
-        let mut runtime = gateway_runtime().lock().await;
-        sync_runtime_collection(&mut runtime, collection);
-    }
-
-    ensure_gateway_matches_runtime().await?;
-    snapshot_state().await
-}
 
 pub async fn update_local_access_debug_logs(
     debug_logs: bool,
@@ -800,36 +865,62 @@ pub async fn update_local_access_debug_logs(
     snapshot_state().await
 }
 
+fn normalize_image_generation_main_model(model: Option<String>) -> Result<Option<String>, String> {
+    let normalized = model.unwrap_or_default().trim().to_string();
+    if normalized.is_empty() {
+        return Ok(None);
+    }
+    if normalized.chars().count() > 200
+        || normalized
+            .chars()
+            .any(|ch| ch.is_whitespace() || ch.is_control())
+    {
+        return Err("codex.localAccess.imageGenerationMainModel.invalid".to_string());
+    }
+    Ok(Some(effective_image_generation_main_model(Some(&normalized)).to_owned()))
+}
+
+pub async fn update_local_access_image_generation_main_model(
+    model: Option<String>,
+) -> Result<CodexLocalAccessState, String> {
+    let normalized = normalize_image_generation_main_model(model)?;
+    save_image_generation_models(None, Some(normalized)).await
+}
+
 pub async fn update_local_access_image_generation_model(
     image_generation_model: String,
 ) -> Result<CodexLocalAccessState, String> {
-    let normalized_model = image_generation_model.trim().to_string();
-    if normalized_model.is_empty() {
-        return Err("codex.localAccess.imageGenerationModel.required".to_string());
-    }
-    if normalized_model.chars().count() > 200 {
-        return Err("codex.localAccess.imageGenerationModel.tooLong".to_string());
-    }
-    ensure_runtime_loaded().await?;
+    let normalized_model = normalize_image_model_id(&image_generation_model)?;
+    save_image_generation_models(Some(normalized_model), None).await
+}
+
+async fn save_image_generation_models(
+    tool_model: Option<String>,
+    main_model: Option<Option<String>>,
+) -> Result<CodexLocalAccessState, String> {
+    let _update_guard = image_configuration_update_lock().lock().await;
+    ensure_runtime_loaded_without_start().await?;
 
     let maybe_collection = {
         let runtime = gateway_runtime().lock().await;
         runtime.collection.clone()
     };
-    let Some(mut collection) = maybe_collection else {
-        return Err("本地接入集合尚未创建".to_string());
-    };
-    if collection.image_generation_model != normalized_model {
-        collection.image_generation_model = normalized_model;
-        collection.updated_at = now_ms();
-        let collection_to_save = collection.clone();
-        tauri::async_runtime::spawn_blocking(move || save_collection_to_disk(&collection_to_save))
-            .await
-            .map_err(|error| format!("保存生图模型配置任务失败: {}", error))??;
-        {
-            let mut runtime = gateway_runtime().lock().await;
-            sync_runtime_collection(&mut runtime, collection);
+    let collection = maybe_collection
+        .map(Ok)
+        .unwrap_or_else(new_local_access_collection)?;
+    let update_main = main_model.is_some();
+    let path = local_access_file_path()?;
+    let published = tauri::async_runtime::spawn_blocking(move || {
+        persist_image_model_settings(&path, &collection, tool_model, main_model, None)
+    })
+    .await
+    .map_err(|error| format!("保存生图模型配置任务失败: {}", error))??;
+    {
+        let mut runtime = gateway_runtime().lock().await;
+        if runtime.collection.is_none() {
+            sync_runtime_collection(&mut runtime, published.clone());
         }
+        publish_image_model_settings(&mut runtime, &published, update_main);
     }
     ensure_gateway_matches_runtime().await?;
     snapshot_state().await
@@ -837,12 +928,20 @@ pub async fn update_local_access_image_generation_model(
 
 /// 更新 API 服务的生图转发账号池。
 ///
-/// 生图转发账号池只接收仍然有效的 OAuth 账号（带 refresh_token，sidecar 自行续期）；
+/// 生图转发账号池接收带 refresh_token 的 OAuth 或匹配当前图片模型的 API Key；
 /// 设置后图片生成 / 图片编辑请求只交给这些账号执行，对话请求仍按服务账号池调度。
 pub async fn update_local_access_image_generation_accounts(
     account_ids: Vec<String>,
 ) -> Result<CodexLocalAccessState, String> {
-    ensure_runtime_loaded().await?;
+    update_local_access_image_generation_accounts_with_models(account_ids, None).await
+}
+
+pub async fn update_local_access_image_generation_accounts_with_models(
+    account_ids: Vec<String>,
+    image_generation_account_models: Option<HashMap<String, String>>,
+) -> Result<CodexLocalAccessState, String> {
+    let _update_guard = image_configuration_update_lock().lock().await;
+    ensure_runtime_loaded_without_start().await?;
 
     let maybe_collection = {
         let runtime = gateway_runtime().lock().await;
@@ -852,27 +951,65 @@ pub async fn update_local_access_image_generation_accounts(
         return Err("本地接入集合尚未创建".to_string());
     };
 
-    let accounts = codex_account::list_accounts_checked()?;
+    let mut image_models = image_generation_account_models
+        .unwrap_or_else(|| collection.image_generation_account_models.clone())
+        .into_iter()
+        .map(|(id, model)| (id.trim().to_string(), model.trim().to_string()))
+        .filter(|(id, _)| !id.is_empty())
+        .collect::<HashMap<_, _>>();
+    let accounts = tauri::async_runtime::spawn_blocking(codex_account::list_accounts_checked)
+        .await
+        .map_err(|error| format!("读取生图来源账号任务失败: {}", error))??;
     let mut next_account_ids: Vec<String> = Vec::new();
+    let mut source_models = Vec::new();
     for raw_id in account_ids {
         let account_id = raw_id.trim();
         if account_id.is_empty() || next_account_ids.iter().any(|item| item == account_id) {
             continue;
         }
         let Some(account) = accounts.iter().find(|item| item.id == account_id) else {
-            continue;
+            // A partial account read must not silently replace the saved image scope.
+            return Err("codex.localAccess.imageAccounts.sourceUnavailable".to_string());
         };
-        if account.is_api_key_auth()
-            || account.is_agent_identity_auth()
-            || !codex_account::account_has_refresh_token(account)
-        {
-            continue;
+        if !is_image_generation_source_for_model(account, &collection.image_generation_model) {
+            return Err("codex.localAccess.imageAccounts.sourceUnavailable".to_string());
         }
+        let actual = resolve_image_generation_source_model(
+            account,
+            &collection,
+            image_models.get(account_id).map(String::as_str),
+        )
+        .ok_or_else(|| "codex.localAccess.imageAccounts.modelRequired".to_string())?;
+        source_models.push(actual);
         next_account_ids.push(account_id.to_string());
     }
 
-    if collection.image_generation_account_ids != next_account_ids {
-        collection.image_generation_account_ids = next_account_ids;
+    let fallback = collection.clone();
+    let path = local_access_file_path()?;
+    let published = tauri::async_runtime::spawn_blocking(move || {
+        persist_image_model_settings_with_sources(
+            &path,
+            &fallback,
+            None,
+            None,
+            None,
+            Some(source_models),
+        )
+    })
+    .await
+    .map_err(|error| format!("记录生图来源型号任务失败: {}", error))??;
+    copy_image_model_catalog_fields(&mut collection, &published);
+    {
+        let mut runtime = gateway_runtime().lock().await;
+        publish_image_model_settings(&mut runtime, &published, false);
+    }
+    image_models.retain(|id, _| next_account_ids.contains(id));
+    if apply_image_generation_source_selection(
+        &mut collection,
+        next_account_ids,
+        image_models,
+        &accounts,
+    ) {
         collection.updated_at = now_ms();
         let collection_to_save = collection.clone();
         tauri::async_runtime::spawn_blocking(move || save_collection_to_disk(&collection_to_save))
@@ -1042,6 +1179,7 @@ pub async fn remove_local_access_accounts(
         .filter(|account_id| remove_ids.contains(*account_id))
         .cloned()
         .collect::<Vec<_>>();
+    crate::modules::chatgpt_plan_service::remember_modes_before_removal(&collection.account_ids, &removed_account_ids).await?;
     if !removed_account_ids.is_empty() {
         restore_removed_local_access_accounts(&removed_account_ids).await;
     }
@@ -1064,7 +1202,7 @@ pub async fn remove_local_access_accounts(
 }
 
 pub async fn rotate_local_access_api_key() -> Result<CodexLocalAccessState, String> {
-    ensure_runtime_loaded().await?;
+    ensure_runtime_loaded_without_start().await?;
 
     let maybe_collection = {
         let runtime = gateway_runtime().lock().await;
@@ -1112,7 +1250,7 @@ pub async fn rotate_local_access_api_key() -> Result<CodexLocalAccessState, Stri
 pub async fn create_local_access_api_key(
     label: Option<String>,
 ) -> Result<CodexLocalAccessState, String> {
-    ensure_runtime_loaded().await?;
+    ensure_runtime_loaded_without_start().await?;
     let maybe_collection = {
         let runtime = gateway_runtime().lock().await;
         runtime.collection.clone()
@@ -1139,7 +1277,7 @@ pub async fn set_local_access_api_key_account_priority(
     account_id: String,
     pinned: bool,
 ) -> Result<CodexLocalAccessState, String> {
-    ensure_runtime_loaded().await?;
+    ensure_runtime_loaded_without_start().await?;
     let maybe_collection = {
         let runtime = gateway_runtime().lock().await;
         runtime.collection.clone()
@@ -1199,6 +1337,15 @@ pub async fn set_local_access_api_key_account_priority(
 }
 
 pub async fn update_local_access_api_key(
+    api_key_id: String, label: Option<String>, enabled: Option<bool>, model_prefix: Option<String>,
+    allowed_models: Option<Vec<String>>, excluded_models: Option<Vec<String>>, token_limit: Option<u64>,
+    account_ids: Option<Vec<String>>, inherit_account_pool: Option<bool>,
+) -> Result<CodexLocalAccessState, String> {
+    update_local_access_api_key_with_budget(api_key_id, label, enabled, model_prefix, allowed_models,
+        excluded_models, token_limit, account_ids, inherit_account_pool, None, None).await
+}
+
+pub async fn update_local_access_api_key_with_budget(
     api_key_id: String,
     label: Option<String>,
     enabled: Option<bool>,
@@ -1208,8 +1355,10 @@ pub async fn update_local_access_api_key(
     token_limit: Option<u64>,
     account_ids: Option<Vec<String>>,
     inherit_account_pool: Option<bool>,
+    budget: Option<CodexApiKeyBudget>,
+    max_reasoning_effort: Option<String>,
 ) -> Result<CodexLocalAccessState, String> {
-    ensure_runtime_loaded().await?;
+    ensure_runtime_loaded_without_start().await?;
     let (maybe_collection, historical_token_used) = {
         let runtime = gateway_runtime().lock().await;
         let historical_token_used = runtime
@@ -1243,6 +1392,10 @@ pub async fn update_local_access_api_key(
     if let Some(label) = label {
         collection.api_keys[index].label = normalize_api_key_label(Some(label.as_str()), "API Key");
     }
+    if let Some(budget) = budget {
+        validate_key_budget(&budget)?;
+        collection.api_keys[index].budget = budget;
+    }
     if let Some(enabled) = enabled {
         collection.api_keys[index].enabled = enabled;
     }
@@ -1254,6 +1407,14 @@ pub async fn update_local_access_api_key(
     }
     if let Some(excluded_models) = excluded_models {
         collection.api_keys[index].excluded_models = normalize_model_rule_list(excluded_models);
+    }
+    if let Some(value) = max_reasoning_effort {
+        collection.api_keys[index].max_reasoning_effort = if value.is_empty() {
+            None
+        } else {
+            Some(crate::models::codex_local_access::CodexReasoningLevel::parse(&value)
+                .ok_or("Unsupported maximum reasoning effort")?)
+        };
     }
     if let Some(token_limit) = token_limit {
         if token_limit > 0 && collection.api_keys[index].token_limit.is_none() {
@@ -1291,7 +1452,7 @@ pub async fn update_local_access_api_key(
 pub async fn rotate_local_access_named_api_key(
     api_key_id: String,
 ) -> Result<CodexLocalAccessState, String> {
-    ensure_runtime_loaded().await?;
+    ensure_runtime_loaded_without_start().await?;
     let maybe_collection = {
         let runtime = gateway_runtime().lock().await;
         runtime.collection.clone()
@@ -1325,7 +1486,7 @@ pub async fn rotate_local_access_named_api_key(
 pub async fn delete_local_access_api_key(
     api_key_id: String,
 ) -> Result<CodexLocalAccessState, String> {
-    ensure_runtime_loaded().await?;
+    ensure_runtime_loaded_without_start().await?;
     let maybe_collection = {
         let runtime = gateway_runtime().lock().await;
         runtime.collection.clone()
@@ -1378,18 +1539,15 @@ pub async fn update_local_access_bound_oauth_account(
         let bound_account = validate_local_access_bound_oauth_account(&bound_id)?;
         // API Service 绑定动作复用客户端启动的 OAuth 预检：仅在 access_token
         // 不可用时使用 refresh_token 换取最新链，刷新失败则由统一错误协议进入重新授权流程。
-        let bound_account = match codex_account::prepare_account_for_instance_launch_preflight(
-            &bound_account.id,
-        )
-        .await
-        {
-            Ok(account) => account,
-            Err(error) => {
-                return Err(codex_account::format_account_switch_error(
-                    &bound_id, error,
-                ));
-            }
-        };
+        let bound_account =
+            match codex_account::prepare_account_for_instance_launch_preflight(&bound_account.id)
+                .await
+            {
+                Ok(account) => account,
+                Err(error) => {
+                    return Err(codex_account::format_account_switch_error(&bound_id, error));
+                }
+            };
         collection.bound_oauth_account_id = Some(bound_account.id);
         collection.bound_oauth_quota_reserve = bound_oauth_quota_reserve;
     } else {
@@ -1416,18 +1574,16 @@ pub async fn update_local_access_bound_oauth_account(
         collect_local_access_profile_takeover_dirs(),
         &previous_collection,
         &next_collection,
-    ).await?;
+    )
+    .await?;
     snapshot_state().await
 }
 
 pub async fn clear_local_access_stats() -> Result<CodexLocalAccessState, String> {
     ensure_runtime_loaded().await?;
-    if let Err(error) = clear_local_access_usage_events_db() {
-        logger::log_codex_api_warn(&format!(
-            "清空 API 服务请求日志失败，继续清空内存统计: {}",
-            error
-        ));
-    }
+    tauri::async_runtime::spawn_blocking(clear_local_access_usage_events_db)
+        .await
+        .map_err(|error| format!("清空 API 服务请求日志任务失败: {error}"))??;
 
     let cleared = empty_stats_snapshot();
     {
@@ -1441,12 +1597,49 @@ pub async fn clear_local_access_stats() -> Result<CodexLocalAccessState, String>
     snapshot_state().await
 }
 
+#[derive(Default)]
+struct UpdateGatewayRecovery {
+    main: bool,
+    instance_keys: HashSet<String>,
+}
+
+static UPDATE_GATEWAY_RECOVERY: std::sync::LazyLock<TokioMutex<UpdateGatewayRecovery>> =
+    std::sync::LazyLock::new(|| TokioMutex::new(UpdateGatewayRecovery::default()));
+
 pub async fn prepare_local_access_gateway_for_restart() -> Result<CodexLocalAccessState, String> {
+    let mut recovery = UPDATE_GATEWAY_RECOVERY.lock().await;
     ensure_runtime_loaded_without_start().await?;
-    stop_all_sidecar_processes_for_app_shutdown().await?;
+    stop_all_sidecar_processes_for_app_shutdown(Some(&mut recovery)).await?;
 
     let runtime = gateway_runtime().lock().await;
     Ok(build_state_snapshot(&runtime))
+}
+
+pub async fn resume_local_access_after_failed_update() -> Result<(), String> {
+    let mut pending = UPDATE_GATEWAY_RECOVERY.lock().await;
+    let recovery = std::mem::take(&mut *pending);
+    let mut errors = Vec::new();
+    if recovery.main {
+        if let Err(error) = ensure_gateway_matches_runtime().await {
+            errors.push(format!("恢复 API 服务失败: {error}"));
+        }
+    }
+    if !recovery.instance_keys.is_empty() {
+        let processes = process::collect_codex_process_entries();
+        if let Err(error) =
+            restore_instance_gateways_after_failed_update(&recovery.instance_keys, &processes).await
+        {
+            errors.push(error);
+        }
+    }
+    if recovery.main || !recovery.instance_keys.is_empty() {
+        emit_local_access_state_updated();
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("\n"))
+    }
 }
 
 /// 仅重启当前 API 服务 Sidecar，保留账号集合、API Key 和持久化配置。
@@ -1470,41 +1663,29 @@ pub async fn restart_local_access_sidecar() -> Result<CodexLocalAccessState, Str
     snapshot_state().await
 }
 
-pub async fn kill_local_access_port_processes() -> Result<CodexLocalAccessPortCleanupResult, String>
-{
-    if let Err(err) = ensure_runtime_loaded_without_start().await {
-        logger::log_codex_api_warn(&format!(
-            "[CodexLocalAccess] 清理端口前加载配置失败: {}",
-            err
-        ));
-        return Err(err);
-    }
-
+pub async fn kill_local_access_port_processes() -> Result<CodexLocalAccessPortCleanupResult, String> {
+    ensure_runtime_loaded_without_start().await?;
+    let lifecycle = gateway_lifecycle_lock().lock().await;
     let collection = {
         let runtime = gateway_runtime().lock().await;
         runtime.collection.clone()
     }
     .ok_or_else(|| "API 服务集合尚未创建".to_string())?;
 
-    stop_gateway().await;
-
-    let config_path = sidecar_config_path(&local_access_sidecar_dir()?);
-    let cleanup_result =
-        cleanup_managed_sidecar_port_processes(collection.port, config_path).await?;
-    let killed_count = match cleanup_result {
-        Ok(count) => count as u32,
-        Err(error) => {
-            logger::log_codex_api_warn(&format!(
-                "[CodexLocalAccess] 未清理非本实例端口进程，将继续尝试启动并准备随机端口兜底: port={}, error={}",
-                collection.port, error
-            ));
-            0
-        }
-    };
-
-    if collection.enabled {
-        ensure_gateway_matches_runtime().await?;
+    {
+        let _stop_request = GatewayStopRequestGuard::begin();
+        advance_gateway_lifecycle_generation();
+        stop_gateway_locked_checked("explicit_port_cleanup").await.1?;
     }
+    let config_path = sidecar_config_path(&local_access_sidecar_dir()?);
+    let killed_count =
+        cleanup_managed_sidecar_port_processes(collection.port, config_path).await?? as u32;
+    if local_access_gateway_should_run(&collection) {
+        ensure_gateway_matches_runtime_once_locked().await?;
+    } else {
+        wait_for_gateway_port_release(bind_host_for_collection(&collection), collection.port).await?;
+    }
+    drop(lifecycle);
 
     let state = snapshot_state().await?;
     Ok(CodexLocalAccessPortCleanupResult {
@@ -1513,15 +1694,40 @@ pub async fn kill_local_access_port_processes() -> Result<CodexLocalAccessPortCl
     })
 }
 
+pub async fn change_random_local_access_port() -> Result<CodexLocalAccessState, String> {
+    ensure_runtime_loaded_without_start().await?;
+    let lifecycle = gateway_lifecycle_lock().lock().await;
+    let (bind_host, previous_port) = {
+        let runtime = gateway_runtime().lock().await;
+        let collection = runtime
+            .collection
+            .as_ref()
+            .ok_or_else(|| "本地接入集合尚未创建".to_string())?;
+        (bind_host_for_collection(collection).to_owned(), collection.port)
+    };
+    let port = allocate_random_local_port_excluding(&bind_host, Some(previous_port))?;
+    persist_recovered_local_access_port(port).await?;
+    let result = ensure_gateway_matches_runtime_once_locked().await;
+    if let Err(error) = &result {
+        gateway_runtime().lock().await.last_error = Some(error.clone());
+    }
+    drop(lifecycle);
+    emit_local_access_state_updated();
+    result?;
+    ensure_local_access_profile_takeovers_from_runtime().await?;
+    snapshot_state().await
+}
+
 pub async fn update_local_access_port(port: u16) -> Result<CodexLocalAccessState, String> {
     ensure_runtime_loaded_without_start().await?;
+    let lifecycle = gateway_lifecycle_lock().lock().await;
 
     let maybe_collection = {
         let runtime = gateway_runtime().lock().await;
         runtime.collection.clone()
     };
 
-    let Some(mut collection) = maybe_collection else {
+    let Some(collection) = maybe_collection else {
         return Err("本地接入集合尚未创建".to_string());
     };
 
@@ -1531,58 +1737,121 @@ pub async fn update_local_access_port(port: u16) -> Result<CodexLocalAccessState
         Some(collection.port),
     )?;
     if collection.port == port {
+        drop(lifecycle);
         return snapshot_state().await;
     }
 
-    collection.port = port;
-    collection.updated_at = now_ms();
-    save_collection_to_disk(&collection)?;
-
-    {
-        let mut runtime = gateway_runtime().lock().await;
-        sync_runtime_collection(&mut runtime, collection);
-    }
+    persist_recovered_local_access_port(port).await?;
+    drop(lifecycle);
 
     ensure_gateway_matches_runtime().await?;
     snapshot_state().await
 }
 
+fn local_access_enable_transition_lock() -> &'static TokioMutex<()> {
+    static LOCK: std::sync::OnceLock<TokioMutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| TokioMutex::new(()))
+}
+
+fn finish_local_access_disable(
+    gateway_result: Result<(), String>,
+    restore_profiles: impl FnOnce() -> Result<(), String>,
+) -> Result<(), String> {
+    let restore_result = restore_profiles();
+    match (gateway_result, restore_result) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(stop_error), Ok(())) => Err(stop_error),
+        (Ok(()), Err(restore_error)) => Err(restore_error),
+        (Err(stop_error), Err(restore_error)) => Err(format!(
+            "{}; 恢复 Codex 配置时也失败: {}",
+            stop_error, restore_error
+        )),
+    }
+}
+
 pub async fn set_local_access_enabled(enabled: bool) -> Result<CodexLocalAccessState, String> {
-    if enabled {
-        advance_gateway_lifecycle_generation();
-        ensure_runtime_loaded().await?;
-    } else {
-        ensure_runtime_loaded_without_start().await?;
+    // Concurrent entry points must not duplicate file restoration or overwrite a newer toggle.
+    let _transition_guard = local_access_enable_transition_lock()
+        .try_lock()
+        .map_err(|_| "API 服务正在启停，请稍后重试".to_string())?;
+    let mut result = async {
+        if enabled {
+            advance_gateway_lifecycle_generation();
+            ensure_runtime_loaded().await?;
+        } else {
+            ensure_runtime_loaded_without_start().await?;
+        }
+
+        let maybe_collection = {
+            let runtime = gateway_runtime().lock().await;
+            runtime.collection.clone()
+        };
+
+        let Some(mut collection) = maybe_collection else {
+            return Err("本地接入集合尚未创建".to_string());
+        };
+
+        collection.enabled = enabled;
+        collection.updated_at = now_ms();
+        let persisted = collection.clone();
+        tauri::async_runtime::spawn_blocking(move || save_collection_to_disk(&persisted))
+            .await
+            .map_err(|error| format!("保存 API 服务配置失败: {error}"))??;
+        let next_collection = collection.clone();
+
+        {
+            let mut runtime = gateway_runtime().lock().await;
+            sync_runtime_collection(&mut runtime, collection);
+        }
+
+        if enabled {
+            ensure_gateway_matches_runtime().await?;
+            ensure_local_access_profile_takeovers(&next_collection).await?;
+            snapshot_state().await
+        } else {
+            let gateway_result = stop_gateway_and_wait_for_release(
+                bind_host_for_collection(&next_collection),
+                next_collection.port,
+            )
+            .await;
+            let generation = current_gateway_lifecycle_generation();
+            let restore_deadline = Instant::now() + Duration::from_secs(30);
+            let restore_worker = tauri::async_runtime::spawn_blocking(move || {
+                restore_takeover_profiles_after_disable_with_projects(&next_collection, || {
+                    if Instant::now() >= restore_deadline
+                        || gateway_lifecycle_generation_changed(generation)
+                    {
+                        return Err("恢复客户端配置已超时或被新的启停操作替代，请重试".to_string());
+                    }
+                    Ok(())
+                }, true)
+            });
+            let restore_result = match timeout(Duration::from_secs(30), restore_worker).await {
+                Ok(result) => result
+                    .map_err(|error| format!("恢复客户端配置失败: {error}"))
+                    .and_then(|result| result),
+                Err(_) => Err("恢复客户端配置超时，请重试".to_string()),
+            };
+            let project_state_deferred = restore_result.as_ref().copied().unwrap_or(false);
+            finish_local_access_disable(gateway_result, || restore_result.map(|_| ()))?;
+            let mut state = snapshot_state_without_gateway_reload().await?;
+            state.project_state_deferred = project_state_deferred;
+            Ok(state)
+        }
     }
+    .await;
 
-    let maybe_collection = {
-        let runtime = gateway_runtime().lock().await;
-        runtime.collection.clone()
-    };
-
-    let Some(mut collection) = maybe_collection else {
-        return Err("本地接入集合尚未创建".to_string());
-    };
-
-    collection.enabled = enabled;
-    collection.updated_at = now_ms();
-    save_collection_to_disk(&collection)?;
-    let next_collection = collection.clone();
-
-    {
-        let mut runtime = gateway_runtime().lock().await;
-        sync_runtime_collection(&mut runtime, collection);
+    let mut runtime = gateway_runtime().lock().await;
+    match &mut result {
+        Ok(state) => {
+            runtime.last_error = None;
+            state.last_error = None;
+        }
+        Err(error) => runtime.last_error = Some(error.clone()),
     }
-
-    if enabled {
-        ensure_gateway_matches_runtime().await?;
-        ensure_local_access_profile_takeovers(&next_collection).await?;
-        snapshot_state().await
-    } else {
-        stop_gateway().await;
-        restore_takeover_profiles_after_disable(&next_collection)?;
-        snapshot_state_without_gateway_reload().await
-    }
+    drop(runtime);
+    emit_local_access_state_updated();
+    result
 }
 
 pub async fn restore_local_access_gateway() {
@@ -1591,12 +1860,64 @@ pub async fn restore_local_access_gateway() {
         runtime.loaded = true;
         runtime.last_error = Some(err.clone());
         logger::log_codex_api_warn(&format!("[CodexLocalAccess] 初始化失败: {}", err));
+    } else {
+        schedule_monthly_token_alert_check();
+    }
+}
+
+// Upgrade cleanup only: retired Go processes can be stopped, never started.
+#[cfg(target_os = "windows")]
+fn retired_sidecar_binary_file_names() -> Vec<String> {
+    let target = env!("COCKPIT_RUST_TARGET");
+    if cfg!(target_os = "windows") {
+        vec![
+            format!("{CODEX_LOCAL_ACCESS_SIDECAR_BIN_NAME}.exe"),
+            format!("{CODEX_LOCAL_ACCESS_SIDECAR_BIN_NAME}-{target}.exe"),
+        ]
+    } else {
+        vec![
+            CODEX_LOCAL_ACCESS_SIDECAR_BIN_NAME.to_string(),
+            format!("{CODEX_LOCAL_ACCESS_SIDECAR_BIN_NAME}-{target}"),
+        ]
     }
 }
 
 #[cfg(target_os = "windows")]
+fn push_retired_sidecar_binary_candidates(candidates: &mut Vec<PathBuf>, dir: &Path) {
+    for name in retired_sidecar_binary_file_names() {
+        let path = dir.join(name);
+        if !candidates.iter().any(|candidate| candidate == &path) {
+            candidates.push(path);
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn retired_sidecar_binary_candidates() -> Result<Vec<PathBuf>, String> {
+    let exe = std::env::current_exe().map_err(|e| format!("读取当前程序路径失败: {}", e))?;
+    let parent = exe
+        .parent()
+        .ok_or_else(|| format!("当前程序路径缺少父目录: {}", exe.display()))?;
+    let mut candidates = Vec::new();
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let dev_sidecar_dir = manifest_dir.join("../sidecars/cockpit-cliproxy/bin");
+
+    if cfg!(debug_assertions) {
+        push_retired_sidecar_binary_candidates(&mut candidates, &dev_sidecar_dir);
+    }
+    push_retired_sidecar_binary_candidates(&mut candidates, parent);
+    if let Some(contents_dir) = parent.parent() {
+        push_retired_sidecar_binary_candidates(&mut candidates, &contents_dir.join("Resources"));
+    }
+    if !cfg!(debug_assertions) {
+        push_retired_sidecar_binary_candidates(&mut candidates, &dev_sidecar_dir);
+    }
+    Ok(candidates)
+}
+
+#[cfg(target_os = "windows")]
 fn close_installed_sidecar_processes_by_path(timeout_secs: u64) -> Result<usize, String> {
-    let candidates = sidecar_binary_candidates()?
+    let candidates = retired_sidecar_binary_candidates()?
         .into_iter()
         .filter(|path| path.exists())
         .collect::<Vec<_>>();
@@ -1613,20 +1934,30 @@ fn close_installed_sidecar_processes_by_path(timeout_secs: u64) -> Result<usize,
     Ok(closed)
 }
 
-async fn stop_all_sidecar_processes_for_app_shutdown() -> Result<(), String> {
+async fn stop_all_sidecar_processes_for_app_shutdown(
+    mut update_recovery: Option<&mut UpdateGatewayRecovery>,
+) -> Result<(), String> {
     let mut errors = Vec::new();
     #[cfg(target_os = "windows")]
     let preserve_running_mixed_gateway = has_running_persisted_mixed_model_gateway();
 
+    if let Some(recovery) = update_recovery.as_deref_mut() {
+        recovery.main |= GATEWAY_PREPARING.load(Ordering::SeqCst);
+    }
     let stopped_endpoint = stop_gateway().await;
     if let Some(endpoint) = stopped_endpoint {
+        if let Some(recovery) = update_recovery.as_deref_mut() {
+            recovery.main = true;
+        }
         if let Err(error) = wait_for_gateway_port_release(&endpoint.bind_host, endpoint.port).await
         {
             errors.push(format!("等待 API 服务 sidecar 释放端口失败: {}", error));
         }
     }
 
-    let provider_endpoints = stop_all_provider_gateways_for_app_shutdown().await;
+    let provider_endpoints = stop_all_provider_gateways_for_app_shutdown(
+        update_recovery.map(|recovery| &mut recovery.instance_keys),
+    ).await;
     for endpoint in provider_endpoints {
         if let Err(error) = wait_for_gateway_port_release(&endpoint.bind_host, endpoint.port).await
         {
@@ -1654,7 +1985,7 @@ async fn stop_all_sidecar_processes_for_app_shutdown() -> Result<(), String> {
 }
 
 pub async fn shutdown_local_access_gateway_for_app_exit() {
-    if let Err(error) = stop_all_sidecar_processes_for_app_shutdown().await {
+    if let Err(error) = stop_all_sidecar_processes_for_app_shutdown(None).await {
         logger::log_codex_api_warn(&format!(
             "[CodexLocalAccess] 应用退出时关闭 sidecar 失败: {}",
             error

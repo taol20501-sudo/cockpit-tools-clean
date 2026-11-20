@@ -1,4 +1,5 @@
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
+import { ChevronRight, Crosshair } from 'lucide-react';
 import { PlatformOverviewTabsHeader, PlatformOverviewTab } from '../components/platform/PlatformOverviewTabsHeader';
 import { WorkbuddyInstancesContent } from './WorkbuddyInstancesPage';
 import { useWorkbuddyAccountStore } from '../stores/useWorkbuddyAccountStore';
@@ -12,13 +13,23 @@ import {
   getWorkbuddyQuotaCategoryGroups,
 } from '../types/workbuddy';
 import { useProviderAccountsPage } from '../hooks/useProviderAccountsPage';
+import { useWorkbuddyProbeAutoRecheck } from '../hooks/useWorkbuddyProbeAutoRecheck';
 import { WorkbuddyCheckinModal } from '../components/codebuddy-suite/CodebuddySuiteCheckinModal';
 import { CodebuddySessionManager } from '../components/codebuddy/CodebuddySessionManager';
 import { CodebuddySuiteAccountsSharedView, type CodebuddySuiteAccountsPlatformConfig } from '../components/codebuddy-suite/CodebuddySuiteAccountsSharedView';
 import { compareCurrentAccountFirst } from '../utils/currentAccountSort';
+import { WorkbuddyCreditsDialog, WorkbuddyCreditsSummary } from '../components/codebuddy-suite/WorkbuddyCredits';
+import { getWorkbuddyCredits } from '../utils/workbuddyCredits';
+import {
+  subscribeWorkbuddyProbeStatus,
+} from '../utils/workbuddyProbeStatus';
+import { WorkbuddyProbeNotice } from '../components/workbuddy/WorkbuddyProbeNotice';
+import { WorkbuddyModelProbeModal } from '../components/workbuddy/WorkbuddyModelProbeModal';
 
 const WORKBUDDY_FLOW_NOTICE_COLLAPSED_KEY = 'agtools.workbuddy.flow_notice_collapsed';
-const WORKBUDDY_CURRENT_ACCOUNT_ID_KEY = 'agtools.workbuddy.current_account_id';
+
+/** 受限提示里的短时间格式：MM/DD HH:mm */
+
 
 const workbuddyPlatformConfig: CodebuddySuiteAccountsPlatformConfig<WorkbuddyAccount> = {
   pageClassName: 'workbuddy-accounts-page',
@@ -33,7 +44,7 @@ const workbuddyPlatformConfig: CodebuddySuiteAccountsPlatformConfig<WorkbuddyAcc
     permissionKey: 'workbuddy.flowNotice.permission',
     permissionDefault: '权限范围：读取 WorkBuddy 认证数据库，调用系统凭据能力（macOS Keychain / Windows DPAPI / Linux Secret Service）进行解密/回写。',
     networkKey: 'workbuddy.flowNotice.network',
-    networkDefault: '网络范围：OAuth 授权登录与 Token 刷新需联网请求 WorkBuddy 服务。不上传本地密钥或凭证。',
+    networkDefault: 'OAuth 登录和 Token 刷新会请求 WorkBuddy 服务。积分余额与明细查询使用账号 Token 请求 WorkBuddy 计费服务。本地登录文件和系统密钥保留在本机。',
   },
   noAccountsKey: 'workbuddy.noAccounts',
   noAccountsDefault: '暂无 WorkBuddy 账号',
@@ -47,9 +58,9 @@ const workbuddyPlatformConfig: CodebuddySuiteAccountsPlatformConfig<WorkbuddyAcc
   oauthFeatureItem1Key: 'workbuddy.oauthFeature.oauth.item1',
   oauthFeatureItem1Default: '在浏览器完成 OAuth 后即可添加账号并用于 IDE 切换。',
   oauthFeatureItem2Key: 'workbuddy.oauthFeature.oauth.item2',
-  oauthFeatureItem2Default: '授权完成后会自动刷新资源包配额数据。',
+  oauthFeatureItem2Default: '授权完成后会自动查询积分余额。',
   oauthFeatureItem3Key: 'workbuddy.oauthFeature.oauth.item3',
-  oauthFeatureItem3Default: '账号卡片将按资源包展示额度、进度和刷新/到期时间。',
+  oauthFeatureItem3Default: '账号卡片展示积分概览，可打开「积分明细」查看积分记录和到期时间。',
   oauthUrlInputPlaceholderKey: 'workbuddy.oauthUrlInputPlaceholder',
   oauthUrlInputPlaceholderDefault: '可手动输入授权地址',
   oauthWaitingKey: 'workbuddy.oauthWaiting',
@@ -77,13 +88,23 @@ const workbuddyPlatformConfig: CodebuddySuiteAccountsPlatformConfig<WorkbuddyAcc
 
 export function WorkbuddyAccountsPage() {
   const [activeTab, setActiveTab] = useState<PlatformOverviewTab>('overview');
+  const [creditAccountId, setCreditAccountId] = useState<string | null>(null);
+  const [probeOpen, setProbeOpen] = useState(false);
+  const [probeAccountId, setProbeAccountId] = useState<string | null>(null);
+  const [selectedAccountIds, setSelectedAccountIds] = useState<string[]>([]);
+  const [probeVersion, setProbeVersion] = useState(0);
   const store = useWorkbuddyAccountStore();
+
+  // 探测结果变化时刷新卡片上的受限标识
+  useEffect(() => subscribeWorkbuddyProbeStatus(() => setProbeVersion((v) => v + 1)), []);
+
+  // 恢复时间过后自动复测：确认恢复则在卡片提示后标注「已恢复」
+  useWorkbuddyProbeAutoRecheck(store.accounts);
 
   const page = useProviderAccountsPage<WorkbuddyAccount>({
     platformKey: 'WorkBuddy',
     oauthLogPrefix: 'WorkbuddyOAuth',
     flowNoticeCollapsedKey: WORKBUDDY_FLOW_NOTICE_COLLAPSED_KEY,
-    currentAccountIdKey: WORKBUDDY_CURRENT_ACCOUNT_ID_KEY,
     exportFilePrefix: 'workbuddy_accounts',
     oauthTabKeys: ['oauth'],
     store: {
@@ -128,6 +149,39 @@ export function WorkbuddyAccountsPage() {
     [page.sortDirection, store.accounts, store.currentAccountId],
   );
 
+  const platformConfig = useMemo<CodebuddySuiteAccountsPlatformConfig<WorkbuddyAccount>>(() => ({
+    ...workbuddyPlatformConfig,
+    renderQuotaSummary: (account) => {
+      if (account.enterprise_id) return null;
+      const credits = getWorkbuddyCredits(account);
+      return credits.left == null ? null : (
+        <WorkbuddyCreditsSummary credits={credits} onDetails={() => setCreditAccountId(account.id)} />
+      );
+    },
+    renderQuotaAction: (account) => account.enterprise_id ? null : (
+      <button type="button" className="btn btn-sm workbuddy-credit-link" onClick={() => setCreditAccountId(account.id)}>
+        {page.t('workbuddy.credits.details')} <ChevronRight size={13} aria-hidden="true" />
+      </button>
+    ),
+    // 每张卡片操作栏里的探测入口：点一下直接带上该账号打开探测弹窗
+    renderCardActionExtra: (account) => (
+      <button
+        type="button"
+        className="card-action-btn"
+        onClick={() => {
+          setProbeAccountId(account.id);
+          setProbeOpen(true);
+        }}
+        title={page.t('workbuddy.modelProbe.title', '探测模型可用性')}
+      >
+        <Crosshair size={14} />
+      </button>
+    ),
+    // 卡片内的模型受限标识（切号前一眼确认）：可点 × 关闭
+    renderCardNotice: (account) => <WorkbuddyProbeNotice accountId={account.id} />,
+  }), [page.t, probeVersion]);
+  const creditAccount = store.accounts.find((account) => account.id === creditAccountId);
+
   return (
     <div className={`ghcp-accounts-page ${workbuddyPlatformConfig.pageClassName}`}>
       <PlatformOverviewTabsHeader
@@ -141,12 +195,46 @@ export function WorkbuddyAccountsPage() {
       ) : activeTab === 'instances' ? (
         <WorkbuddyInstancesContent accountsForSelect={accountsForInstances} />
       ) : (
-        <CodebuddySuiteAccountsSharedView
+        <>
+          <div className="page-toolbar workbuddy-probe-toolbar">
+            <button
+              type="button"
+              className="btn btn-secondary btn-sm"
+              onClick={() => setProbeOpen(true)}
+            >
+              <Crosshair size={14} aria-hidden="true" />
+              {page.t('workbuddy.modelProbe.open', '探测模型可用性')}
+            </button>
+          </div>
+          <CodebuddySuiteAccountsSharedView
+            accounts={store.accounts}
+            loading={store.loading}
+            page={page}
+            platformConfig={platformConfig}
+            onSelectionChange={setSelectedAccountIds}
+            onRefreshAccounts={() => { store.fetchAccounts(); }}
+          />
+        </>
+      )}
+      {creditAccount && (
+        <WorkbuddyCreditsDialog
+          key={creditAccount.id}
+          account={creditAccount}
+          accountLabel={page.maskAccountText(getWorkbuddyAccountDisplayEmail(creditAccount))}
+          onClose={() => setCreditAccountId(null)}
+        />
+      )}
+      {probeOpen && (
+        <WorkbuddyModelProbeModal
           accounts={store.accounts}
-          loading={store.loading}
-          page={page}
-          platformConfig={workbuddyPlatformConfig}
-          onRefreshAccounts={() => { store.fetchAccounts(); }}
+          currentAccountId={probeAccountId ?? store.currentAccountId}
+          selectedAccountIds={selectedAccountIds}
+          initialScope={probeAccountId ? 'current' : undefined}
+          lockedAccountId={probeAccountId}
+          onClose={() => {
+            setProbeOpen(false);
+            setProbeAccountId(null);
+          }}
         />
       )}
     </div>

@@ -30,6 +30,7 @@ export interface ZedAccount {
   preferences_raw?: unknown;
   created_at: number;
   last_used: number;
+  last_switched_at?: number | null;
   email?: string | null;
   plan_type?: string | null;
   quota?: unknown;
@@ -83,6 +84,23 @@ function isUnlimitedEditPredictionsLimit(value: string | null | undefined): bool
 
 export function getZedAccountDisplayEmail(account: ZedAccount): string {
   return account.display_name || account.github_login || account.user_id || account.id;
+}
+
+export function getZedPlanTone(planRaw?: string | null): string {
+  const normalized = (planRaw || '').trim().toLowerCase();
+  if (!normalized) return 'unknown';
+  if (normalized.includes('enterprise') || normalized.includes('team')) return 'enterprise';
+  if (normalized.includes('trial')) return 'trial';
+  if (
+    normalized.includes('pro') ||
+    normalized.includes('plus') ||
+    normalized.includes('ultra') ||
+    normalized.includes('ultimate')
+  ) {
+    return 'pro';
+  }
+  if (normalized.includes('free')) return 'free';
+  return 'unknown';
 }
 
 export function getZedPlanBadge(account: ZedAccount): string {

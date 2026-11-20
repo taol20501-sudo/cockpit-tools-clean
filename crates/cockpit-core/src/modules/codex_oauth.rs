@@ -1,36 +1,55 @@
 use crate::models::codex::CodexTokens;
 use crate::modules::logger;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+#[cfg(feature = "desktop")]
 use rand::Rng;
 use serde::{Deserialize, Serialize};
+#[cfg(feature = "desktop")]
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
-use std::io::{ErrorKind, Write};
-use std::net::{TcpListener, TcpStream};
+#[cfg(feature = "desktop")]
+use std::io::ErrorKind;
+use std::io::Write;
+#[cfg(feature = "desktop")]
+use std::net::TcpListener;
+use std::net::TcpStream;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+#[cfg(feature = "desktop")]
 use std::time::Duration;
+#[cfg(feature = "desktop")]
 use tauri::{AppHandle, Emitter};
 use url::Url;
 
 const CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
+#[cfg(feature = "desktop")]
 const AUTH_ENDPOINT: &str = "https://auth.openai.com/oauth/authorize";
 const TOKEN_ENDPOINT: &str = "https://auth.openai.com/oauth/token";
+#[cfg(feature = "desktop")]
 const SCOPES: &str =
     "openid profile email offline_access api.connectors.read api.connectors.invoke";
 const ORIGINATOR: &str = "Codex Desktop";
 const OAUTH_CALLBACK_PORT: u16 = 1455;
+#[cfg(feature = "desktop")]
 const OAUTH_PORT_IN_USE_CODE: &str = "CODEX_OAUTH_PORT_IN_USE";
 const OAUTH_STATE_FILE: &str = "codex_oauth_pending.json";
+#[cfg(feature = "desktop")]
 const OAUTH_TIMEOUT_SECONDS: i64 = 300;
 const TOKEN_REFRESH_SKEW_SECONDS: i64 = 300;
 pub const ID_TOKEN_REFRESH_LEAD_SECONDS: i64 = 10 * 60;
+#[cfg(feature = "desktop")]
 const DEVICE_USER_CODE_ENDPOINT: &str = "https://auth.openai.com/api/accounts/deviceauth/usercode";
+#[cfg(feature = "desktop")]
 const DEVICE_TOKEN_ENDPOINT: &str = "https://auth.openai.com/api/accounts/deviceauth/token";
+#[cfg(feature = "desktop")]
 const DEVICE_VERIFICATION_URL: &str = "https://auth.openai.com/codex/device";
+#[cfg(any(feature = "desktop", test))]
 const DEVICE_EXCHANGE_REDIRECT_URI: &str = "https://auth.openai.com/deviceauth/callback";
+#[cfg(feature = "desktop")]
 const DEVICE_TIMEOUT_SECONDS: u64 = 15 * 60;
+#[cfg(any(feature = "desktop", test))]
 const DEVICE_DEFAULT_POLL_SECONDS: u64 = 5;
+#[cfg(feature = "desktop")]
 const DEVICE_REQUEST_TIMEOUT_SECONDS: u64 = 25;
 
 pub fn get_callback_port() -> u16 {
@@ -68,6 +87,7 @@ pub struct CodexDeviceAuthStartResponse {
     pub poll_interval_seconds: u64,
 }
 
+#[cfg(feature = "desktop")]
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct CodexDeviceAuthErrorEvent {
@@ -75,12 +95,14 @@ struct CodexDeviceAuthErrorEvent {
     error: String,
 }
 
+#[cfg(feature = "desktop")]
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct CodexOAuthLoginCallbackEvent {
     login_id: String,
 }
 
+#[cfg(feature = "desktop")]
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct CodexOAuthLoginTimeoutEvent {
@@ -114,12 +136,14 @@ lazy_static::lazy_static! {
     static ref COMPLETE_ATTEMPT_SEQ: AtomicU64 = AtomicU64::new(0);
 }
 
+#[cfg(feature = "desktop")]
 fn generate_base64url_token() -> String {
     let mut rng = rand::thread_rng();
     let bytes: Vec<u8> = (0..32).map(|_| rng.gen::<u8>()).collect();
     URL_SAFE_NO_PAD.encode(bytes)
 }
 
+#[cfg(feature = "desktop")]
 fn generate_code_challenge(code_verifier: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(code_verifier.as_bytes());
@@ -198,6 +222,7 @@ fn set_oauth_state(state: Option<OAuthState>) {
     persist_state_to_disk(state.as_ref());
 }
 
+#[cfg(feature = "desktop")]
 fn ensure_callback_listener_for_state(app_handle: &AppHandle, state: &OAuthState) {
     if state.device_auth_id.is_some() {
         return;
@@ -248,6 +273,7 @@ fn ensure_callback_listener_for_state(app_handle: &AppHandle, state: &OAuthState
     }
 }
 
+#[cfg(feature = "desktop")]
 fn find_available_port() -> Result<u16, String> {
     match TcpListener::bind(("127.0.0.1", OAUTH_CALLBACK_PORT)) {
         Ok(listener) => {
@@ -262,6 +288,7 @@ fn find_available_port() -> Result<u16, String> {
     }
 }
 
+#[cfg(any(feature = "desktop", test))]
 fn parse_device_poll_interval(value: Option<&serde_json::Value>) -> u64 {
     value
         .and_then(|item| item.as_u64().or_else(|| item.as_str()?.parse().ok()))
@@ -269,6 +296,7 @@ fn parse_device_poll_interval(value: Option<&serde_json::Value>) -> u64 {
         .unwrap_or(DEVICE_DEFAULT_POLL_SECONDS)
 }
 
+#[cfg(feature = "desktop")]
 async fn request_device_user_code() -> Result<(String, String, u64), String> {
     let client = reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(DEVICE_REQUEST_TIMEOUT_SECONDS))
@@ -316,6 +344,7 @@ async fn request_device_user_code() -> Result<(String, String, u64), String> {
     ))
 }
 
+#[cfg(feature = "desktop")]
 fn clear_oauth_state_for_login_id(login_id: &str) {
     let should_clear = OAUTH_STATE
         .lock()
@@ -327,6 +356,7 @@ fn clear_oauth_state_for_login_id(login_id: &str) {
     }
 }
 
+#[cfg(feature = "desktop")]
 fn emit_device_auth_error(app: &AppHandle, login_id: &str, error: String) {
     clear_oauth_state_for_login_id(login_id);
     let _ = app.emit(
@@ -338,6 +368,7 @@ fn emit_device_auth_error(app: &AppHandle, login_id: &str, error: String) {
     );
 }
 
+#[cfg(feature = "desktop")]
 async fn poll_device_token(
     app: AppHandle,
     login_id: String,
@@ -449,6 +480,7 @@ async fn poll_device_token(
     }
 }
 
+#[cfg(feature = "desktop")]
 pub async fn start_device_auth(app: AppHandle) -> Result<CodexDeviceAuthStartResponse, String> {
     hydrate_oauth_state_if_missing();
     if OAUTH_STATE.lock().unwrap().is_some() {
@@ -540,6 +572,7 @@ fn parse_callback_url(callback_url: &str, port: u16) -> Result<Url, String> {
     .map_err(|e| format!("回调链接格式无效: {}", e))
 }
 
+#[cfg(feature = "desktop")]
 fn build_auth_url(redirect_uri: &str, code_challenge: &str, state: &str) -> String {
     format!(
         "{}?response_type=code&client_id={}&redirect_uri={}&scope={}&code_challenge={}&code_challenge_method=S256&id_token_add_organizations=true&codex_cli_simplified_flow=true&state={}&originator={}",
@@ -553,6 +586,7 @@ fn build_auth_url(redirect_uri: &str, code_challenge: &str, state: &str) -> Stri
     )
 }
 
+#[cfg(feature = "desktop")]
 fn to_start_response(state: &OAuthState) -> CodexOAuthLoginStartResponse {
     CodexOAuthLoginStartResponse {
         login_id: state.login_id.clone(),
@@ -572,6 +606,7 @@ fn clear_oauth_state_if_matches(expected_state: &str, expected_login_id: &str) {
     }
 }
 
+#[cfg(feature = "desktop")]
 pub async fn start_oauth_login(
     app_handle: AppHandle,
 ) -> Result<CodexOAuthLoginStartResponse, String> {
@@ -646,6 +681,7 @@ pub async fn start_oauth_login(
     Ok(CodexOAuthLoginStartResponse { login_id, auth_url })
 }
 
+#[cfg(feature = "desktop")]
 async fn start_callback_server(
     port: u16,
     expected_state: String,
@@ -1101,6 +1137,7 @@ pub fn submit_callback_url(login_id: &str, callback_url: &str) -> Result<(), Str
     Ok(())
 }
 
+#[cfg(feature = "desktop")]
 pub fn restore_pending_oauth_listener(app_handle: AppHandle) {
     hydrate_oauth_state_if_missing();
     let state = {
@@ -1162,21 +1199,23 @@ fn resolve_refreshed_id_token(
         .map(str::trim)
         .filter(|value| !value.is_empty())
     {
-        if is_id_token_expired(id_token) {
-            return Err("Token 刷新响应中的 id_token 已过期或无效".to_string());
+        if !is_id_token_expired(id_token) {
+            return Ok(id_token.to_string());
         }
-        return Ok(id_token.to_string());
     }
 
     if let Some(id_token) = current_id_token
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        .filter(|value| !is_id_token_expired(value))
     {
+        // OAuth refresh responses are allowed to omit id_token. Keep the old
+        // value long enough to persist a possibly rotated refresh_token.
         return Ok(id_token.to_string());
     }
 
-    Err("响应中缺少 id_token，且本地 id_token 已过期或无效".to_string())
+    // Codex app-server authentication is based on access_token. Persist the
+    // rotated token chain even when the response omits the optional OIDC token.
+    Ok(String::new())
 }
 
 pub async fn refresh_access_token_with_fallback(
@@ -1224,7 +1263,15 @@ pub async fn refresh_access_token_with_fallback(
     let token_response: serde_json::Value =
         serde_json::from_str(&body).map_err(|e| format!("解析 Token 响应失败: {}", e))?;
 
-    let id_token = resolve_refreshed_id_token(&token_response, current_id_token)?;
+    refreshed_tokens_from_response(&token_response, refresh_token, current_id_token)
+}
+
+fn refreshed_tokens_from_response(
+    token_response: &serde_json::Value,
+    refresh_token: &str,
+    current_id_token: Option<&str>,
+) -> Result<CodexTokens, String> {
+    let id_token = resolve_refreshed_id_token(token_response, current_id_token)?;
 
     let access_token = token_response
         .get("access_token")
@@ -1295,39 +1342,67 @@ mod tests {
     }
 
     #[test]
-    fn refreshed_id_token_replaces_expired_current_value() {
+    fn refreshed_id_token_prefers_fresh_response_value() {
         let fresh = make_jwt(chrono::Utc::now().timestamp() + TOKEN_REFRESH_SKEW_SECONDS + 3600);
-        let expired = make_jwt(chrono::Utc::now().timestamp() - 3600);
+        let old = make_jwt(chrono::Utc::now().timestamp() - 3600);
         let response = serde_json::json!({ "id_token": fresh });
 
         assert_eq!(
-            resolve_refreshed_id_token(&response, Some(&expired))
-                .expect("replace expired id_token"),
+            resolve_refreshed_id_token(&response, Some(&old)).expect("resolve response id_token"),
             response["id_token"].as_str().unwrap()
         );
     }
 
     #[test]
-    fn refreshed_id_token_reuses_only_fresh_current_value() {
+    fn refreshed_id_token_reuses_fresh_current_value() {
         let fresh = make_jwt(chrono::Utc::now().timestamp() + TOKEN_REFRESH_SKEW_SECONDS + 3600);
+        let response = serde_json::json!({});
+
         assert_eq!(
-            resolve_refreshed_id_token(&serde_json::json!({}), Some(&fresh))
-                .expect("reuse fresh id_token"),
+            resolve_refreshed_id_token(&response, Some(&fresh)).expect("reuse fresh id_token"),
             fresh
         );
     }
 
     #[test]
-    fn refreshed_id_token_rejects_missing_value_when_current_is_expired() {
+    fn refreshed_id_token_keeps_current_value_when_response_omits_it() {
         let expired = make_jwt(chrono::Utc::now().timestamp() - 3600);
-        assert!(resolve_refreshed_id_token(&serde_json::json!({}), Some(&expired)).is_err());
+        let resolved = resolve_refreshed_id_token(&serde_json::json!({}), Some(&expired))
+            .expect("current id_token can be retained until runtime validation");
+
+        assert_eq!(resolved, expired);
     }
 
     #[test]
-    fn refreshed_id_token_rejects_expired_response_value() {
+    fn refreshed_id_token_omits_expired_response_value_without_losing_rotated_chain() {
         let expired = make_jwt(chrono::Utc::now().timestamp() - 3600);
-        assert!(
-            resolve_refreshed_id_token(&serde_json::json!({ "id_token": expired }), None).is_err()
+        let response = serde_json::json!({ "id_token": expired });
+
+        assert_eq!(
+            resolve_refreshed_id_token(&response, None)
+                .expect("access refresh result remains persistable"),
+            ""
         );
     }
+
+    #[test]
+    fn optional_identity_keeps_rotated_chain_and_existing_metadata() {
+        let old_id = make_jwt(chrono::Utc::now().timestamp() - 3600);
+        let response = serde_json::json!({"access_token":"rotated-access", "refresh_token":"rotated-refresh"});
+        let tokens = super::refreshed_tokens_from_response(&response, "old-refresh", Some(&old_id)).unwrap();
+        assert_eq!(tokens.access_token, "rotated-access");
+        assert_eq!(tokens.refresh_token.as_deref(), Some("rotated-refresh"));
+        assert_eq!(tokens.id_token, old_id);
+        let no_identity = super::refreshed_tokens_from_response(&response, "old-refresh", None).unwrap();
+        assert_eq!(no_identity.id_token, "");
+        assert_eq!(no_identity.refresh_token.as_deref(), Some("rotated-refresh"));
+    }
+
+    #[test]
+    fn optional_identity_keeps_refresh_fallback_but_still_requires_access_token() {
+        let tokens = super::refreshed_tokens_from_response(&serde_json::json!({"access_token":"new-access"}), "old-refresh", None).unwrap();
+        assert_eq!(tokens.refresh_token.as_deref(), Some("old-refresh"));
+        assert!(super::refreshed_tokens_from_response(&serde_json::json!({"refresh_token":"new-refresh"}), "old-refresh", None).unwrap_err().contains("access_token"));
+    }
+
 }

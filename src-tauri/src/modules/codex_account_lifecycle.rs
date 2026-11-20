@@ -1,48 +1,91 @@
 // Codex 账号模块：Profile refresh, account upsert and account removal lifecycle。
 // 通过 include! 保持原 modules::codex_account 作用域，完整保留私有调用关系。
+async fn finish_account_profile_refresh(
+    account: CodexAccount,
+    profile_result: Result<(Option<String>, Option<String>, Option<String>), String>,
+) -> Result<CodexAccount, String> {
+    let (account_name, account_structure, account_id_from_remote) = profile_result?;
+
+    tokio::task::spawn_blocking(move || {
+        persist_codex_account_profile(
+            &account,
+            account_name,
+            account_structure,
+            account_id_from_remote,
+        )
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+fn persist_codex_account_profile(
+    account: &CodexAccount,
+    name: Option<String>,
+    structure: Option<String>,
+    remote_id: Option<String>,
+) -> Result<CodexAccount, String> {
+    let _guard = CODEX_ACCOUNT_MUTATION_LOCK
+        .lock()
+        .map_err(|_| "CODEX_PROFILE_WRITE_LOCK_POISONED".to_string())?;
+    let mut current =
+        load_account(&account.id).ok_or_else(|| "CODEX_STALE_ACCOUNT".to_string())?;
+    if merge_codex_account_profile(&mut current, account, name, structure, remote_id) {
+        save_account_with_tombstone_guard(&current)?;
+    }
+    Ok(current)
+}
+
 /// 刷新账号资料（团队名/结构）
 async fn refresh_account_profile_once(account_id: &str) -> Result<CodexAccount, String> {
-    let mut account = prepare_account_for_injection(account_id).await?;
+    let account = prepare_account_for_injection(account_id).await?;
     if account.is_api_key_auth() || account.is_agent_identity_auth() {
         return Ok(account);
     }
 
-    let (account_name, account_structure, account_id_from_remote) =
-        fetch_remote_account_profile(&account).await?;
+    let profile_result = fetch_remote_account_profile(&account).await;
+    finish_account_profile_refresh(account, profile_result).await
+}
 
+fn merge_codex_account_profile(
+    current: &mut CodexAccount,
+    original: &CodexAccount,
+    name: Option<String>,
+    structure: Option<String>,
+    remote_id: Option<String>,
+) -> bool {
+    if current.token_generation != original.token_generation
+        || current.tokens.access_token != original.tokens.access_token
+        || current.account_id != original.account_id
+    {
+        return false;
+    }
     let mut changed = false;
-
-    if let Some(remote_account_id) = normalize_optional_value(account_id_from_remote) {
-        if normalize_optional_ref(account.account_id.as_deref()) != Some(remote_account_id.clone())
-        {
-            account.account_id = Some(remote_account_id);
-            changed = true;
+    for (field, initial, value) in [
+        (&mut current.account_name, &original.account_name, name),
+        (
+            &mut current.account_structure,
+            &original.account_structure,
+            structure,
+        ),
+        (&mut current.account_id, &original.account_id, remote_id),
+    ] {
+        if let Some(value) = normalize_optional_value(value) {
+            if field == initial && field.as_deref() != Some(value.as_str()) {
+                *field = Some(value);
+                changed = true;
+            }
         }
     }
-
-    if let Some(name) = normalize_optional_value(account_name) {
-        if normalize_optional_ref(account.account_name.as_deref()) != Some(name.clone()) {
-            account.account_name = Some(name);
-            changed = true;
-        }
-    }
-
-    if let Some(structure) = normalize_optional_value(account_structure) {
-        if normalize_optional_ref(account.account_structure.as_deref()) != Some(structure.clone()) {
-            account.account_structure = Some(structure);
-            changed = true;
-        }
-    }
-
-    if changed {
-        save_account(&account)?;
-    }
-
-    Ok(account)
+    changed
 }
 
 pub async fn refresh_account_profile(account_id: &str) -> Result<CodexAccount, String> {
-    refresh_account_profile_once(account_id).await
+    tokio::time::timeout(
+        Duration::from_secs(30),
+        refresh_account_profile_once(account_id),
+    )
+    .await
+    .map_err(|_| "CODEX_PROFILE_REFRESH_TIMEOUT".to_string())?
 }
 
 /// 添加或更新账号
@@ -122,11 +165,6 @@ pub fn upsert_agent_identity_account(identity: CodexAgentIdentity) -> Result<Cod
     account.requires_reauth = false;
     account.reauth_reason = None;
     account.authorization_status = None;
-    account.client_auth_status = None;
-    account.last_client_auth_observed_at = None;
-    account.last_client_login_redirect_at = None;
-    account.last_client_launch_at = None;
-    account.last_client_auth_instance_id = None;
     account.update_last_used();
     save_account_from_user_action(&mut account)?;
 
@@ -177,6 +215,7 @@ pub fn upsert_api_key_account(
     api_vision_routing_model: Option<String>,
     account_name: Option<String>,
     api_model_context_windows: Option<HashMap<String, i64>>,
+    api_auth_scheme: Option<String>,
 ) -> Result<CodexAccount, String> {
     let (api_key, api_base_url) = validate_api_key_credentials(&api_key, api_base_url.as_deref())?;
     let provider_config = resolve_api_provider_config(
@@ -187,7 +226,13 @@ pub fn upsert_api_key_account(
     )?;
     let account_id = build_api_key_account_id(&api_key);
     let account_name = normalize_optional_value(account_name);
-    let mut index = load_account_index();
+    // Initialize legacy storage before taking the lock. Re-read the saved
+    // index under the lock so a parallel Key import cannot lose its row.
+    let initial_index = load_account_index_inner(false)?;
+    let _guard = CODEX_ACCOUNT_MUTATION_LOCK
+        .lock()
+        .map_err(|_| "Codex 账号写入锁已损坏".to_string())?;
+    let mut index = read_saved_account_index()?.unwrap_or(initial_index);
 
     let mut account = if let Some(mut acc) = load_account(&account_id) {
         let sync_model_catalog_to_codex =
@@ -204,6 +249,7 @@ pub fn upsert_api_key_account(
             api_model_vision_support.clone(),
             api_vision_routing_model.clone(),
             api_model_context_windows.clone(),
+            api_auth_scheme.clone(),
         );
         if acc.email.trim().is_empty() {
             acc.email = build_api_key_email(&api_key);
@@ -228,6 +274,7 @@ pub fn upsert_api_key_account(
         acc.account_name = account_name;
         acc.api_sync_model_catalog_to_codex = api_sync_model_catalog_to_codex.unwrap_or(false);
         acc.api_wire_api = normalize_api_wire_api(api_wire_api.clone());
+        acc.api_auth_scheme = api_auth_scheme.clone();
         acc.api_supports_websockets = api_supports_websockets;
         let _ = normalize_api_key_websocket_capability(&mut acc);
         acc.api_supports_vision = api_supports_vision;
@@ -238,6 +285,7 @@ pub fn upsert_api_key_account(
 
     account.auth_mode = CodexAuthMode::Apikey;
     let _ = enforce_deepseek_responses_account(&mut account);
+    let _ = upgrade_opencode_go_model_catalog(&mut account);
     if api_model_context_windows.is_some() || !account.api_model_context_windows.is_empty() {
         account.api_model_context_windows = normalize_api_model_context_windows(
             api_model_context_windows.unwrap_or_else(|| account.api_model_context_windows.clone()),
@@ -245,7 +293,7 @@ pub fn upsert_api_key_account(
             &account.api_model_mappings,
         );
     }
-    save_account_from_user_action(&mut account)?;
+    save_account_from_user_action_unlocked(&mut account)?;
 
     if let Some(summary) = index.accounts.iter_mut().find(|item| item.id == account.id) {
         summary.email = account.email.clone();
@@ -305,9 +353,36 @@ fn upsert_account_with_import_hints(
     )
 }
 
+fn oauth_reauth_matches_user_and_workspace(
+    target: &CodexAccount,
+    user_id: Option<&str>,
+    account_id: Option<&str>,
+    organization_id: Option<&str>,
+) -> bool {
+    let matches_id = |stored: Option<&str>, received: Option<&str>| {
+        let stored = normalize_optional_ref(stored);
+        stored.is_some() && stored == normalize_optional_ref(received)
+    };
+    let organization_matches = match (
+        normalize_optional_ref(target.organization_id.as_deref()),
+        normalize_optional_ref(organization_id),
+    ) {
+        (Some(stored), Some(received)) => stored == received,
+        _ => true,
+    };
+    !target.is_web_session_auth()
+        && matches_id(target.user_id.as_deref(), user_id)
+        && matches_id(target.account_id.as_deref(), account_id)
+        && organization_matches
+}
+
 fn resolve_reauth_target_account_id(
     target_account_id: Option<&str>,
     email: &str,
+    user_id: Option<&str>,
+    account_id: Option<&str>,
+    organization_id: Option<&str>,
+    generated_id: &str,
 ) -> Result<Option<String>, String> {
     let Some(target_id) = normalize_optional_ref(target_account_id) else {
         return Ok(None);
@@ -318,20 +393,39 @@ fn resolve_reauth_target_account_id(
         return Err("API Key 账号不能通过 OAuth 重新授权".to_string());
     }
     if !target.email.trim().is_empty() && !target.email.eq_ignore_ascii_case(email) {
-        return Err(format!(
-            "重新授权账号邮箱不匹配: 目标账号为 {}，本次授权为 {}",
-            target.email, email
-        ));
+        if !is_oauth_identity_candidate(&target)
+            || !oauth_reauth_matches_user_and_workspace(&target, user_id, account_id, organization_id)
+        {
+            return Err(format!(
+                "CODEX_OAUTH_RESTART_REQUIRED: 重新授权账号邮箱不匹配: 目标账号为 {}，本次授权为 {}",
+                target.email, email
+            ));
+        }
+        // 重新授权会清理衍生 ID 下的重复记录，换邮箱时先确认该记录的身份。
+        if generated_id != target_id
+            && load_account(generated_id).is_some_and(|duplicate| {
+                !is_oauth_identity_candidate(&duplicate)
+                    || !oauth_reauth_matches_user_and_workspace(
+                        &duplicate,
+                        user_id,
+                        account_id,
+                        organization_id,
+                    )
+            })
+        {
+            return Err("CODEX_OAUTH_RESTART_REQUIRED: 新邮箱对应的账号记录与重新授权身份冲突".into());
+        }
     }
     // 历史混合记录保留原文件及引用；本次授权回到 OAuth 身份域独立保存。
     if !is_oauth_identity_candidate(&target) {
         return Ok(None);
     }
-    Ok(Some(if target.id.trim().is_empty() {
+    let id = if target.id.trim().is_empty() {
         target_id
     } else {
         target.id
-    }))
+    };
+    Ok(Some(id))
 }
 
 fn upsert_account_with_hints_and_reauth_target(
@@ -375,10 +469,23 @@ fn upsert_account_with_hints_and_reauth_target(
             .or(organization_id_hint),
     );
 
-    let mut index = load_account_index();
+    // Prepare legacy storage first, then read and update the current index while
+    // holding the same lock as imports, credential refresh and deletion.
+    let initial_index = load_account_index_inner(false)?;
+    let _guard = CODEX_ACCOUNT_MUTATION_LOCK
+        .lock()
+        .map_err(|_| "Codex 账号写入锁已损坏".to_string())?;
+    let mut index = read_saved_account_index()?.unwrap_or(initial_index);
     let generated_id =
         build_account_storage_id(&email, account_id.as_deref(), organization_id.as_deref());
-    let reauth_target = resolve_reauth_target_account_id(reauth_target_account_id, &email)?;
+    let reauth_target = resolve_reauth_target_account_id(
+        reauth_target_account_id,
+        &email,
+        user_id.as_deref(),
+        account_id.as_deref(),
+        organization_id.as_deref(),
+        &generated_id,
+    )?;
     let has_reauth_target = reauth_target.is_some();
 
     // 明确的重新授权来自某个旧账号卡片，必须优先覆盖该旧账号。
@@ -409,6 +516,9 @@ fn upsert_account_with_hints_and_reauth_target(
         acc.api_provider_name = None;
         acc.bound_oauth_account_id = None;
         acc.bound_oauth_use_local_gateway = false;
+        if has_reauth_target {
+            acc.email.clone_from(&email);
+        }
         acc.user_id = user_id;
         acc.plan_type = plan_type.clone();
         acc.subscription_active_until = subscription_active_until.clone();
@@ -454,11 +564,6 @@ fn upsert_account_with_hints_and_reauth_target(
     // login_required 只代表历史观测结果，不能继续污染这次授权后的状态。
     // 这里不能只依赖 reauth_target：用户从 OAuth 入口重新授权时可能没有
     // 携带旧卡片 ID，但仍然会复用同一个账号记录。
-    account.client_auth_status = None;
-    account.last_client_auth_observed_at = None;
-    account.last_client_login_redirect_at = None;
-    account.last_client_launch_at = None;
-    account.last_client_auth_instance_id = None;
 
     // 远端 API 鉴权拒绝描述的是旧 access_token。OAuth 已换入新凭据后继续
     // 保留它，会让 sidecar 账号池错误地把新凭据当成仍被远端拒绝。
@@ -472,6 +577,9 @@ fn upsert_account_with_hints_and_reauth_target(
         account.egress_proxy_disabled = false;
     }
 
+    // Save the replacement before removing an existing duplicate.
+    save_account_from_user_action_unlocked(&mut account)?;
+
     if has_reauth_target && generated_id != account.id {
         let removed_duplicate = index.accounts.iter().any(|item| item.id == generated_id);
         if removed_duplicate {
@@ -479,7 +587,7 @@ fn upsert_account_with_hints_and_reauth_target(
             if index.current_account_id.as_deref() == Some(generated_id.as_str()) {
                 index.current_account_id = Some(account.id.clone());
             }
-            if let Err(err) = delete_account_file(&generated_id) {
+            if let Err(err) = delete_account_file_unlocked(&generated_id) {
                 logger::log_warn(&format!(
                     "清理 Codex 重新授权重复账号详情失败: duplicate_id={}, target_id={}, error={}",
                     generated_id, account.id, err
@@ -492,9 +600,6 @@ fn upsert_account_with_hints_and_reauth_target(
             }
         }
     }
-
-    // 显式导入/授权可以重新创建用户刚刚删除过的同一账号。
-    save_account_from_user_action(&mut account)?;
 
     // 更新索引中的摘要信息
     if let Some(summary) = index.accounts.iter_mut().find(|a| a.id == account.id) {
@@ -638,6 +743,9 @@ pub fn remove_accounts(account_ids: &[String]) -> Result<(), String> {
         delete_account_file_unlocked(&account_id)?;
     }
     drop(_guard);
+    for id in &deleted_account_ids {
+        crate::modules::codex_device_restrictions::retire_account(id);
+    }
     // 账号删除后，引用它的混合模型路由必须自动关闭（渠道配置保留），
     // 否则后台监控会反复尝试恢复失败的网关，并弹出与删除账号无关的报错。
     match crate::modules::codex_instance::disable_model_routing_for_deleted_accounts(

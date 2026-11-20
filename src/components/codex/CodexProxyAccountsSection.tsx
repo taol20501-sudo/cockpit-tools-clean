@@ -2,13 +2,12 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { CheckSquare, Search, ShieldCheck, Square, X } from 'lucide-react';
 import type { CodexAccount } from '../../types/codex';
-import { getCodexPlanBadgePresentation } from '../../types/codex';
-import { CODEX_PLAN_BADGE_STYLE_CHANGED_EVENT, getCodexPlanBadgeStyle, withCodexPlanBadgeStyle } from '../../utils/codexPreferences';
 import { proxySummary } from '../../utils/codexProxyPresentation';
 import { canUseCodexAccountProxy } from '../../utils/codexAccountProxy';
 import type { ProxyBindingValue } from '../../utils/codexProxyBatch';
 import { filterProxyAccounts, resolveExitMode, unifiedFollowingIds, type CodexProxyExitFilter } from '../../utils/codexProxyDraft';
-import { useCodexAccountStore } from '../../stores/useCodexAccountStore';
+import { applyCodexProxyAccountSnapshot, type CodexProxyTargetAccount } from '../../services/codexProxyTargetService';
+import { CodexAccountPlanBadge } from './CodexAccountPlanBadge';
 import { SingleSelectDropdown } from '../SingleSelectDropdown';
 import { CodexProxyBatchBindDialog } from './CodexProxyBatchBindDialog';
 import { CodexProxyAccountDialog, CodexProxyFollowDialog } from './CodexProxyAccountDialog';
@@ -25,27 +24,22 @@ export function CodexProxyAccountsSection() {
   const [applied, setApplied] = useState<Record<string, ProxyBindingValue>>({});
   const [search, setSearch] = useState('');
   const [filter, setFilter] = useState<CodexProxyExitFilter>('all');
-  const [planBadgeStyle, setPlanBadgeStyle] = useState(getCodexPlanBadgeStyle);
   const [selection, setSelection] = useState<string[]>([]);
   const [batchOpen, setBatchOpen] = useState(false);
   const [followOpen, setFollowOpen] = useState(false);
   const entryRow = useRef<HTMLTableRowElement>(null);
   const [dialog, setDialog] = useState<{ id: string; tab: 'edit' | 'details' } | null>(null);
 
-  useEffect(() => {
-    const update = () => setPlanBadgeStyle(getCodexPlanBadgeStyle());
-    window.addEventListener(CODEX_PLAN_BADGE_STYLE_CHANGED_EVENT, update);
-    return () => window.removeEventListener(CODEX_PLAN_BADGE_STYLE_CHANGED_EVENT, update);
-  }, []);
   const savedValue = useCallback((account: CodexAccount): ProxyBindingValue =>
     Object.prototype.hasOwnProperty.call(applied, account.id) ? applied[account.id] : account.egress_proxy ?? null, [applied]);
   const visible = useMemo(() => filterProxyAccounts(eligible, { search, filter, saved: savedValue }), [eligible, filter, savedValue, search]);
   const following = useMemo(() => new Set(unifiedFollowingIds(eligible, savedValue, unified)), [eligible, savedValue, unified]);
-  const pickedAccounts = useMemo(() => eligible.filter((entry) => selection.includes(entry.id)), [selection, eligible]);
+  const ready = (entry: CodexAccount) => !(entry as CodexProxyTargetAccount).proxyTargetLoading && !(entry as CodexProxyTargetAccount).proxyTargetError;
+  const pickedAccounts = useMemo(() => eligible.filter((entry) => selection.includes(entry.id) && ready(entry)), [selection, eligible]);
   const allVisibleSelected = visible.length > 0 && visible.every((entry) => selection.includes(entry.id));
   const unifiedLabel = unified?.binding ? [unified.binding.sourceName, unified.binding.name, unified.binding.selectedName].filter(Boolean).join(' · ') : '';
   const recordApplied = useCallback((account: CodexAccount) => {
-    useCodexAccountStore.getState().applyAccountSnapshot(account);
+    applyCodexProxyAccountSnapshot(account);
     setApplied((old) => ({ ...old, [account.id]: account.egress_proxy ?? null }));
   }, []);
   useEffect(() => {
@@ -54,7 +48,7 @@ export function CodexProxyAccountsSection() {
   }, [entryAccountId, eligible.length]);
   const toggle = (id: string) => setSelection((old) => old.includes(id) ? old.filter((entry) => entry !== id) : [...old, id]);
   const toggleAll = () => {
-    const ids = visible.map((entry) => entry.id);
+    const ids = visible.filter(ready).map((entry) => entry.id);
     setSelection((old) => ids.every((id) => old.includes(id)) ? old.filter((id) => !ids.includes(id)) : [...new Set([...old, ...ids])]);
   };
   const open = (id: string, tab: 'edit' | 'details') => { selectAccount(id); setDialog({ id, tab }); };
@@ -89,18 +83,16 @@ export function CodexProxyAccountsSection() {
         </tr></thead>
         <tbody>{visible.map((entry) => {
           const binding = savedValue(entry);
-          const mode = resolveExitMode(binding, { catalog, loading: catalogLoading, failed: Boolean(catalogError) }, following.has(entry.id), entry.egress_proxy_disabled);
-          const proxy = entry.egress_proxy_disabled ? t('codex.proxy.modeDisabled') : binding ? proxySummary(binding) : following.has(entry.id) ? unifiedLabel : t('codex.proxy.modeDefault');
-          const plan = entry.plan_type?.trim();
-          const planClass = plan ? withCodexPlanBadgeStyle(getCodexPlanBadgePresentation(entry).className, planBadgeStyle) : '';
+          const mode = entry.egress_proxy_error ? 'stale' : resolveExitMode(binding, { catalog, loading: catalogLoading, failed: Boolean(catalogError) }, following.has(entry.id), entry.egress_proxy_disabled);
+          const proxy = (entry as CodexProxyTargetAccount).proxyTargetError ? t('codex.proxy.runtimeReadFailed') : (entry as CodexProxyTargetAccount).proxyTargetLoading ? t('common.loading') : entry.egress_proxy_error ? t('codex.proxy.modeStale') : entry.egress_proxy_disabled ? t('codex.proxy.modeDisabled') : binding ? proxySummary(binding) : following.has(entry.id) ? unifiedLabel : t('codex.proxy.modeDefault');
           return <tr key={entry.id} ref={entry.id === entryAccountId ? entryRow : undefined} className={selection.includes(entry.id) ? 'is-selected' : entry.id === selectedId ? 'is-current' : undefined}>
             <td className="codex-proxy-accounts-check-cell"><button type="button" role="checkbox" aria-checked={selection.includes(entry.id)}
-              className="btn btn-secondary compact codex-proxy-accounts-check" onClick={() => toggle(entry.id)} aria-label={resolveName(entry)}>
+              className="btn btn-secondary compact codex-proxy-accounts-check" disabled={!ready(entry)} onClick={() => toggle(entry.id)} aria-label={resolveName(entry)}>
               {selection.includes(entry.id) ? <CheckSquare size={17} /> : <Square size={17} />}</button></td>
             <th scope="row"><div className="codex-proxy-accounts-identity"><span className="codex-proxy-accounts-avatar">{resolveName(entry).slice(0, 1).toUpperCase()}</span>
               <span className="codex-proxy-accounts-name" title={resolveName(entry)}>{resolveName(entry)}</span>
-              {plan && <span className={`tier-badge ${planClass}`} title={plan}>{plan}</span>}</div></th>
-            <td><span className={`codex-proxy-accounts-mode is-${mode}`}>{t(entry.egress_proxy_disabled ? 'codex.proxy.modeDisabled' : binding ? 'codex.proxy.modeIndependent' : 'codex.proxy.managerAccounts.following')}</span></td>
+              <CodexAccountPlanBadge account={entry} /></div></th>
+            <td><span className={`codex-proxy-accounts-mode is-${mode}`}>{t(entry.egress_proxy_disabled ? 'codex.proxy.modeDisabled' : binding || entry.egress_proxy_error || entry.egress_proxy_legacy_bound ? 'codex.proxy.modeIndependent' : 'codex.proxy.managerAccounts.following')}</span></td>
             <td><div className="codex-proxy-accounts-proxy"><span title={proxy}>{proxy}</span>
               {mode === 'stale' && <small>{t('codex.proxy.modeStale')}</small>}</div></td>
             <td><div className="codex-proxy-accounts-row-actions">

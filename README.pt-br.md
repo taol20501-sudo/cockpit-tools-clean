@@ -31,12 +31,14 @@ Uma **ferramenta universal de gerenciamento de contas para IDEs de IA**, atualme
 
 Um painel visual totalmente novo que oferece uma visão geral do status em um único lugar:
 
-- **Suporte a doze Plataformas**: Exibe simultaneamente o status das contas do Antigravity IDE, Codex, GitHub Copilot, Windsurf, Kiro, Cursor, CodeBuddy, CodeBuddy CN, Qoder, Trae e Zed
+- **Painel com 16 plataformas**: Exibe o status das contas do Antigravity IDE, Codex, GitHub Copilot, Windsurf, Kiro, Cursor, Grok CLI, CodeBuddy, CodeBuddy CN, Qoder, Trae, TraeWork, Trae CN, TraeWork CN, Zed e ZCode.
 - **Monitoramento de Cotas**: Visualização em tempo real das cotas restantes e dos horários de redefinição para cada modelo
 - **Ações Rápidas**: Atualização com um clique, ativação com um clique
 - **Progresso Visual**: Barras de progresso intuitivas mostrando o consumo de cotas
 
 > ![Visão geral do painel](docs/images/dashboard_overview.png)
+
+> Capturas de tela atualizadas em 2 de novembro de 2026, feitas no Cockpit Tools v1.3.78 com os dados das contas ocultos.
 
 ### 2. Gerenciamento de Contas do Antigravity IDE
 
@@ -224,9 +226,11 @@ Estas são as perguntas de segurança mais comuns respondidas diretamente:
 
 - **Esta é uma ferramenta para desktop local**: ela não requer uma conta de nuvem separada para este projeto e não depende do armazenamento em nuvem hospedado pelo projeto.
 - **Os dados são armazenados principalmente em sua máquina**:
-  - `~/.antigravity_cockpit`: Contas do Antigravity IDE, configurações, status do WebSocket, etc.
+  - `~/.cockpit_tools`: contas de todas as plataformas, configurações compartilhadas, registros, cópias de segurança e configurações de instâncias; o ambiente de desenvolvimento usa `~/.cockpit_tools_dev`, e `COCKPIT_TOOLS_DATA_DIR` permite definir um diretório personalizado
+  - Instalações existentes recebem automaticamente, em segundo plano, uma entrada com o novo nome por meio de um link simbólico no Unix ou uma junção de diretórios no Windows para `~/.antigravity_cockpit` / `~/.antigravity_cockpit_dev`. Não é necessária migração manual. O diretório físico antigo e os caminhos das instâncias existentes são preservados, e ambas as entradas acessam os mesmos dados. A sessão atual mantém o caminho original; as próximas inicializações usam a nova entrada. Se a criação do link falhar, o diretório antigo continua em uso. Se os dois nomes corresponderem a diretórios independentes, o antigo permanece em uso, sem mesclar ou sobrescrever dados automaticamente
+  - As instâncias gerenciadas ficam, por padrão, em `instances/<plataforma>` no diretório compartilhado. No Windows, algumas plataformas usam `%APPDATA%\.cockpit_tools\instances\<plataforma>`, com a mesma compatibilidade automática para diretórios antigos. Diretórios personalizados permanecem inalterados
   - `~/.codex`: Arquivo `auth.json` de login atual do Codex
-  - Pasta de dados do aplicativo local em `com.antigravity.cockpit-tools`: Dados de índice de múltiplas contas do Codex / GitHub Copilot / Windsurf / Kiro / Cursor / CodeBuddy / CodeBuddy CN / Qoder / Trae / Zed, etc.
+  - Dados do aplicativo no sistema em `com.taol20501.cockpit-tools-clean`: estado do WebView do aplicativo e dados relacionados; os diretórios históricos `com.antigravity.cockpit-tools` são usados apenas para importar dados antigos
 - **O WebSocket é somente local por padrão**: vincula-se a `127.0.0.1`, porta padrão `19528`; você pode desativá-lo ou alterar a porta em Configurações.
 - **Quando ocorre acesso à rede**: login OAuth, atualização de token, obtenção de cota, verificações de atualização e outras solicitações oficiais da API.
 **Solicitações de permissão de privacidade do macOS**: após iniciar o Codex/agente a partir do Cockpit Tools, se um comando do shell executado pelo agente acessar pastas protegidas, como Área de Trabalho, Documentos, Downloads ou Fotos, o macOS poderá exibir a solicitação como "O Cockpit Tools gostaria de acessar...". Isso ocorre porque esses comandos são processos filhos iniciados pelo Cockpit Tools, portanto, o macOS atribui a solicitação ao aplicativo host; isso não significa, por si só, que o processo principal do Cockpit Tools esteja ativamente verificando essas pastas. Conceda acesso somente se você confiar na tarefa atual do agente e nos comandos que ela executará. Em caso de dúvida, negue a solicitação ou execute o projeto a partir de um diretório de trabalho normal primeiro.

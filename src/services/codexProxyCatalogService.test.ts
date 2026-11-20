@@ -40,6 +40,14 @@ test('selector traversal terminates even for cyclic imported groups', () => {
   assert.equal(service.catalogSelectors(cyclic, 'root', { root: 'Proxy' }).length, 1);
 });
 
+test('node chains expose required relay selectors and stop at cycles', () => {
+  const { service } = harness(async () => ({}));
+  const chained = { ...source, nodes: [{ ...node, dialerProxy: 'Nested' }] };
+  assert.deepEqual(Array.from(service.catalogSelectors(chained, 'node', {}), (g: any) => g.id), ['nested']);
+  assert.deepEqual(Array.from(service.catalogSelectors(chained, 'node', { nested: 'Tokyo' }), (g: any) => g.id), ['nested']);
+  assert.deepEqual(Array.from(service.catalogSelectors({ ...source, nodes: [{ ...node, dialerProxy: 'DIRECT' }] }, 'node', {})), []);
+});
+
 test('binding sends only identifiers and group choices, never subscription credentials', async () => {
   const calls: unknown[] = [];
   const { service } = harness(async (command, args) => { calls.push({ command, args }); return {}; });
@@ -49,6 +57,17 @@ test('binding sends only identifiers and group choices, never subscription crede
     { command: 'codex_proxy_catalog_bind', args: { accountId: 'account', sourceId: 'source', itemId: 'root', selections: { root: 'Tokyo' } } },
     { command: 'codex_proxy_catalog_probe', args: { requestId: 'request', sourceId: 'source', itemId: 'node', selections: {} } },
   ]));
+});
+
+test('network settings forward the source revision and preserve an explicit IPv6 off value', async () => {
+  const calls: unknown[] = [];
+  const { service } = harness(async (command, args) => { calls.push({ command, args }); return { sources: [] }; });
+  const network = { doh: true, dnsServers: ['https://resolver.example/dns-query'], ipv6: false };
+  await service.setProxyCatalogNetwork('source', 'revision', network);
+  assert.equal(JSON.stringify(calls), JSON.stringify([
+    { command: 'codex_proxy_catalog_network', args: { sourceId: 'source', revision: 'revision', network } },
+  ]));
+  assert.equal(service.catalogErrorKey('PROXY_DNS_INVALID'), 'codex.proxy.catalog.invalidDnsServer');
 });
 
 test('a frontend timeout requests backend cancellation and never displays request data', async () => {
@@ -84,11 +103,17 @@ test('error allowlist never interpolates URLs, file paths, or raw backend messag
   for (const input of ['https://user:secret@host/?token=secret', 'CATALOG_DOWNLOAD: secret', '/Users/user/private-file']) {
     assert.equal(service.catalogErrorKey(input), 'codex.proxy.catalog.failed');
   }
-  assert.equal(service.catalogErrorKey(new Error('CATALOG_REDIRECT')), 'codex.proxy.catalog.downloadFailed');
+  assert.equal(service.catalogErrorKey(new Error('CATALOG_REDIRECT')), 'codex.proxy.catalog.downloadRedirect');
+  assert.equal(service.catalogErrorKey('CATALOG_DOWNLOAD'), 'codex.proxy.catalog.downloadFailed');
+  assert.equal(service.catalogErrorKey('CATALOG_DOWNLOAD_DENIED'), 'codex.proxy.catalog.downloadDenied');
+  assert.equal(service.catalogErrorKey('CATALOG_DOWNLOAD_TLS'), 'codex.proxy.catalog.downloadTls');
+  assert.equal(service.catalogErrorKey('CATALOG_DOWNLOAD_DNS'), 'codex.proxy.catalog.errorDns');
   assert.equal(service.catalogErrorKey('CATALOG_FINISHING'), 'codex.proxy.catalog.busy');
   assert.equal(service.catalogErrorKey('CATALOG_CANCELLED'), 'common.cancelled');
   assert.equal(service.catalogErrorKey('CATALOG_PARTIAL_UNBIND'), 'codex.proxy.catalog.partialDelete');
   assert.equal(service.catalogErrorKey('PROXY_ENGINE_MISSING'), 'codex.proxy.engineMissing');
+  assert.equal(service.catalogErrorKey('PROXY_UNSUPPORTED_PROTOCOL'), 'codex.proxy.unsupportedProtocol');
+  assert.equal(service.catalogErrorKey('PROXY_ENGINE_CONFIG_INVALID'), 'codex.proxy.catalog.reasonInvalid');
 });
 
 test('unavailable resource reasons distinguish protocol limits, group limits and missing members', () => {
@@ -98,13 +123,13 @@ test('unavailable resource reasons distinguish protocol limits, group limits and
     SUBSCRIPTION_GROUP_TIMEOUT: 'reasonGroupTimeout',
     SUBSCRIPTION_PROVIDER_UNSUPPORTED: 'reasonProvider', SUBSCRIPTION_GROUP_UNAVAILABLE: 'reasonMembers',
     PROXY_UNSUPPORTED_OPTION: 'reasonOptions', SUBSCRIPTION_INVALID: 'reasonInvalid',
-    PROXY_TLS_INSECURE: 'reasonTlsInsecure', PROXY_TRANSPORT_UNSUPPORTED: 'reasonTransport',
+    PROXY_TLS_INSECURE: 'refreshRequired', PROXY_TRANSPORT_UNSUPPORTED: 'reasonTransport',
     PROXY_ECH_UNSUPPORTED: 'reasonEch',
   };
   for (const [error, key] of Object.entries(reasons)) {
     assert.equal(service.catalogUnsupportedKey({ error }), `codex.proxy.catalog.${key}`);
   }
-  assert.equal(service.catalogUnsupportedKey({ kind: 'relay' }), 'codex.proxy.catalog.reasonStrategy');
+  assert.equal(service.catalogUnsupportedKey({ kind: 'relay', error: 'SUBSCRIPTION_GROUP_STRATEGY' }), 'codex.proxy.catalog.reasonStrategy');
   assert.equal(service.catalogErrorKey('SUBSCRIPTION_GROUP_TIMEOUT'), 'codex.proxy.catalog.reasonGroupTimeout');
   assert.equal(service.catalogUnsupportedKey(undefined, 'DIRECT'), 'codex.proxy.catalog.reasonBuiltin');
   assert.equal(service.catalogUnsupportedKey(undefined, 'missing'), 'codex.proxy.catalog.reasonMissing');
@@ -201,7 +226,8 @@ test('native automatic groups keep their distinct labels and precise unavailable
     assert.equal(service.catalogUnsupportedKey({ kind, error: 'SUBSCRIPTION_UNSUPPORTED' }), 'codex.proxy.catalog.reasonOptions');
     assert.equal(service.catalogUnsupportedKey({ kind, error: 'SUBSCRIPTION_GROUP_UNAVAILABLE' }), 'codex.proxy.catalog.reasonMembers');
   }
-  for (const kind of ['relay', 'https://secret.invalid', '__proto__', 'constructor']) {
+  for (const kind of ['native', 'relay']) assert.equal(service.catalogGroupKindKey(kind), 'codex.proxy.catalog.groups');
+  for (const kind of ['https://secret.invalid', '__proto__', 'constructor']) {
     assert.equal(service.catalogGroupKindKey(kind), 'codex.proxy.catalog.reasonStrategy');
   }
 });

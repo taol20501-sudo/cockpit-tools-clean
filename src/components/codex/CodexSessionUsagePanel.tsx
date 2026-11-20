@@ -1,3 +1,4 @@
+import { buildCodexSessionUsageQuery as buildUsageQuery } from '../../utils/codexSessionUsageQuery';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { confirm as confirmDialog } from '@tauri-apps/plugin-dialog';
@@ -13,6 +14,9 @@ import {
 } from 'lucide-react';
 import { SingleSelectDropdown, type SingleSelectOption } from '../SingleSelectDropdown';
 import * as codexInstanceService from '../../services/codexInstanceService';
+import { getCodexProfileLifetimeTokens } from '../../services/codexService';
+import { useCodexAccountStore } from '../../stores/useCodexAccountStore';
+import { isStandardCodexOAuthAccount } from '../../types/codex';
 import type {
   CodexSessionUsageQuery,
   CodexSessionUsageReport,
@@ -30,32 +34,11 @@ import {
 import { CodexUsageTrend, type UsageTrendPoint } from './CodexUsageTrend';
 import {
   normalizeCodexSessionUsageRange,
-  persistCodexSessionUsageRange,
-  readCodexSessionUsageRange,
-  type CodexSessionUsageRange as UsageRange,
+  CODEX_SESSION_USAGE_RANGE_STORAGE_KEY,
 } from '../../utils/codexStatsRangePreference';
-
-function startOfLocalDay(value: Date): Date {
-  return new Date(value.getFullYear(), value.getMonth(), value.getDate());
-}
-
-function buildUsageQuery(range: UsageRange, instanceId: string): CodexSessionUsageQuery {
-  const now = new Date();
-  const toTimestamp = Math.floor(now.getTime() / 1000);
-  let fromTimestamp: number | null = null;
-  if (range === '7d') {
-    fromTimestamp = Math.floor(startOfLocalDay(now).getTime() / 1000) - 6 * 24 * 60 * 60;
-  } else if (range === '30d') {
-    fromTimestamp = Math.floor(startOfLocalDay(now).getTime() / 1000) - 29 * 24 * 60 * 60;
-  } else if (range === 'month') {
-    fromTimestamp = Math.floor(new Date(now.getFullYear(), now.getMonth(), 1).getTime() / 1000);
-  }
-  return {
-    fromTimestamp,
-    toTimestamp,
-    instanceId: instanceId || null,
-  };
-}
+import { useDurableUiSetting } from '../../hooks/useDurableUiSetting';
+import { previewDurableUiSetting } from '../../utils/durableUiSettings';
+import { useCodexProxyAccountName } from './useCodexProxyExitEditor';
 
 function TokenAmount({
   value,
@@ -72,6 +55,80 @@ function TokenAmount({
     <strong className="codex-session-usage-amount" title={exact}>
       {compact}
     </strong>
+  );
+}
+
+export function CodexProfileUsageTotal({ lang }: { lang: string }) {
+  const { t } = useTranslation();
+  const accounts = useCodexAccountStore((state) => state.accounts);
+  const currentAccountId = useCodexAccountStore((state) => state.currentAccount?.id);
+  const accountName = useCodexProxyAccountName();
+  const [selectedAccountId, setSelectedAccountId] = useState('');
+  const [lookup, setLookup] = useState<{
+    accountId: string;
+    status: 'loading' | 'ready' | 'error';
+    value?: number | null;
+  } | null>(null);
+  const requestId = useRef(0);
+  const options = accounts.filter(isStandardCodexOAuthAccount).map((account) => ({
+    value: account.id,
+    label: accountName(account),
+  }));
+  const accountId = options.find((option) => option.value === selectedAccountId)?.value
+    ?? options.find((option) => option.value === currentAccountId)?.value
+    ?? options[0]?.value;
+  const result = lookup?.accountId === accountId ? lookup : null;
+
+  const load = async () => {
+    if (!accountId) return;
+    const request = ++requestId.current;
+    setLookup({ accountId, status: 'loading' });
+    try {
+      const value = await getCodexProfileLifetimeTokens(accountId);
+      if (request === requestId.current) setLookup({ accountId, status: 'ready', value });
+    } catch {
+      if (request === requestId.current) setLookup({ accountId, status: 'error' });
+    }
+  };
+
+  return (
+    <div className="codex-session-usage__profile-source">
+      <strong>{t('codex.sessionUsage.comparison.profileTotal')}</strong>
+      {!accountId ? <span>{t('codex.sessionUsage.comparison.noAccount')}</span> : (
+        <>
+          <div className="codex-session-usage__profile-controls">
+            <SingleSelectDropdown
+              value={accountId}
+              options={options}
+              ariaLabel={t('codex.sessionUsage.comparison.account')}
+              onChange={(id) => {
+                ++requestId.current;
+                setLookup(null);
+                setSelectedAccountId(id);
+              }}
+            />
+            <button
+              type="button"
+              className="btn btn-secondary"
+              disabled={result?.status === 'loading'}
+              onClick={() => void load()}
+            >
+              <RefreshCw size={13} aria-hidden="true" />
+              {t(result?.status === 'error' ? 'common.retry' : 'common.refresh')}
+            </button>
+          </div>
+          <div role="status">
+            {result?.status === 'loading' ? t('common.loading')
+              : result?.status === 'error' ? t('codex.sessionUsage.comparison.loadError')
+                : result?.status === 'ready'
+                  ? result.value == null
+                    ? t('codex.sessionUsage.comparison.unavailable')
+                    : <TokenAmount value={result.value} lang={lang} compactDecimals={2} />
+                  : null}
+          </div>
+        </>
+      )}
+    </div>
   );
 }
 
@@ -100,11 +157,13 @@ function UsageBreakdownTable({
   emptyLabel,
   keyLabel,
   lang,
+  showEstimatedCost = false,
 }: {
   rows: CodexSessionUsageBreakdownRow[];
   emptyLabel: string;
   keyLabel: string;
   lang: string;
+  showEstimatedCost?: boolean;
 }) {
   const { t } = useTranslation();
   return (
@@ -118,12 +177,13 @@ function UsageBreakdownTable({
             <th>{t('codex.sessionUsage.tables.output', '输出 Tokens')}</th>
             <th>{t('codex.sessionUsage.tables.total', '合计 Tokens')}</th>
             <th>{t('codex.sessionUsage.tables.requests', '请求')}</th>
+            {showEstimatedCost ? <th>{t('codex.sessionUsage.cards.cost')}</th> : null}
           </tr>
         </thead>
         <tbody>
           {rows.length === 0 ? (
             <tr>
-              <td colSpan={6}>{emptyLabel}</td>
+              <td colSpan={showEstimatedCost ? 7 : 6}>{emptyLabel}</td>
             </tr>
           ) : (
             rows.map((row) => (
@@ -142,6 +202,9 @@ function UsageBreakdownTable({
                   <TokenAmount value={row.totalTokens} lang={lang} />
                 </td>
                 <td>{formatSessionUsageCount(row.requestCount)}</td>
+                {showEstimatedCost ? <td title={row.estimatedCostUsd == null ? t('codex.sessionUsage.costUnavailable') : undefined}>
+                  {row.estimatedCostUsd == null ? '—' : formatSessionUsageCostUsd(row.estimatedCostUsd)}
+                </td> : null}
               </tr>
             ))
           )}
@@ -160,7 +223,7 @@ export function CodexSessionUsageSummary({
   const lang = i18n.resolvedLanguage || i18n.language || 'zh-CN';
   const [report, setReport] = useState<CodexSessionUsageReport | null>(null);
   const [loadState, setLoadState] = useState<SessionUsageSummaryLoadState>('scanning');
-  const [range] = useState<UsageRange>(() => readCodexSessionUsageRange());
+  const range = normalizeCodexSessionUsageRange(useDurableUiSetting(CODEX_SESSION_USAGE_RANGE_STORAGE_KEY));
   const query = useMemo(() => buildUsageQuery(range, ''), [range]);
 
   useEffect(() => {
@@ -282,7 +345,7 @@ export function CodexSessionUsagePanel({
   const { t, i18n } = useTranslation();
   const lang = i18n.resolvedLanguage || i18n.language || 'zh-CN';
   const isZh = lang.toLowerCase().startsWith('zh');
-  const [range, setRange] = useState<UsageRange>(() => readCodexSessionUsageRange());
+  const range = normalizeCodexSessionUsageRange(useDurableUiSetting(CODEX_SESSION_USAGE_RANGE_STORAGE_KEY));
   const [instanceId, setInstanceId] = useState('');
   const [report, setReport] = useState<CodexSessionUsageReport | null>(null);
   const [loading, setLoading] = useState(true);
@@ -319,6 +382,7 @@ export function CodexSessionUsagePanel({
   }, [t]);
 
   const runSync = useCallback(async (rebuild: boolean) => {
+    const syncQuery = buildUsageQuery(range, instanceId);
     const version = ++requestVersionRef.current;
     setSyncing(true);
     if (rebuild) {
@@ -328,14 +392,14 @@ export function CodexSessionUsagePanel({
     try {
       const result = await codexInstanceService.syncSessionUsage({
         rebuild,
-        query,
+        query: syncQuery,
       });
       if (version === requestVersionRef.current) {
         if (result.report) {
           setReport(result.report);
         } else {
-          const nextReport = await codexInstanceService.querySessionUsage(query);
-          setReport(nextReport);
+          const nextReport = await codexInstanceService.querySessionUsage(syncQuery);
+          if (version === requestVersionRef.current) setReport(nextReport);
         }
         if (result.errors.length > 0) {
           setError(result.errors[0]);
@@ -357,7 +421,7 @@ export function CodexSessionUsagePanel({
         setLoading(false);
       }
     }
-  }, [query, t]);
+  }, [instanceId, range, t]);
 
   useEffect(() => {
     void loadCached(query);
@@ -388,6 +452,7 @@ export function CodexSessionUsagePanel({
 
   const rangeOptions = useMemo<SingleSelectOption[]>(
     () => [
+      { value: 'today', label: t('codex.sessionUsage.range.today') },
       { value: '7d', label: t('codex.sessionUsage.range.7d', '近 7 天') },
       { value: '30d', label: t('codex.sessionUsage.range.30d', '近 30 天') },
       { value: 'month', label: t('codex.sessionUsage.range.month', '本月') },
@@ -416,6 +481,8 @@ export function CodexSessionUsagePanel({
           bucketStart: new Date(`${row.key}T00:00:00`).getTime(),
           usage: {
             totalTokens: row.totalTokens,
+            inputTokens: row.inputTokens,
+            outputTokens: row.outputTokens,
             requestCount: row.requestCount,
             estimatedCostUsd: 0,
           },
@@ -451,8 +518,7 @@ export function CodexSessionUsagePanel({
             options={rangeOptions}
             onChange={(value) => {
               const nextRange = normalizeCodexSessionUsageRange(value);
-              setRange(nextRange);
-              persistCodexSessionUsageRange(nextRange);
+              previewDurableUiSetting(CODEX_SESSION_USAGE_RANGE_STORAGE_KEY, nextRange);
             }}
             ariaLabel={t('codex.sessionUsage.range.label', '时间范围')}
             menuWidth={140}
@@ -537,6 +603,31 @@ export function CodexSessionUsagePanel({
         )}
       </p>
 
+      <section className="codex-session-usage__hero codex-session-usage__sources">
+        <div className="codex-session-usage__local-source">
+          <div className="codex-session-usage__hero-total">
+            <div className="codex-session-usage__hero-icon" aria-hidden="true">
+              <Zap size={22} />
+            </div>
+            <div>
+              <span>{t('codex.sessionUsage.comparison.localTotal')}</span>
+              {hasData
+                ? <TokenAmount value={totals?.totalTokens ?? 0} lang={lang} compactDecimals={2} />
+                : <span>—</span>}
+            </div>
+          </div>
+          {hasData && (
+            <div className="codex-session-usage__hero-side">
+              <span><Send size={13} />{t('codex.sessionUsage.cards.requests', '请求数')}</span>
+              <strong>{formatSessionUsageCount(totals?.requestCount ?? 0)}</strong>
+              <span><DollarSign size={13} />{t('codex.sessionUsage.cards.cost', '估算费用')}</span>
+              <strong>{formatSessionUsageCostUsd(totals?.estimatedCostUsd)}</strong>
+            </div>
+          )}
+        </div>
+        <CodexProfileUsageTotal lang={lang} />
+      </section>
+
       {loading && !report ? (
         <div className="codex-session-usage__empty">
           {t('common.loading', '加载中...')}
@@ -554,34 +645,6 @@ export function CodexSessionUsagePanel({
       ) : (
         <>
           <section className="codex-session-usage__hero">
-            <div className="codex-session-usage__hero-head">
-              <div className="codex-session-usage__hero-total">
-                <div className="codex-session-usage__hero-icon" aria-hidden="true">
-                  <Zap size={22} />
-                </div>
-                <div>
-                  <span>{t('codex.sessionUsage.cards.total', '合计 Tokens')}</span>
-                  <TokenAmount
-                    value={totals?.totalTokens ?? 0}
-                    lang={lang}
-                    compactDecimals={2}
-                  />
-                </div>
-              </div>
-              <div className="codex-session-usage__hero-side">
-                <span>
-                  <Send size={13} />
-                  {t('codex.sessionUsage.cards.requests', '请求数')}
-                </span>
-                <strong>{formatSessionUsageCount(totals?.requestCount ?? 0)}</strong>
-                <span>
-                  <DollarSign size={13} />
-                  {t('codex.sessionUsage.cards.cost', '估算费用')}
-                </span>
-                <strong>{formatSessionUsageCostUsd(totals?.estimatedCostUsd)}</strong>
-              </div>
-            </div>
-
             <div className="codex-session-usage__cards">
             <article className="is-input">
               <div className="codex-session-usage__card-head">
@@ -653,10 +716,14 @@ export function CodexSessionUsagePanel({
             <h4>{t('codex.sessionUsage.tables.day', '按日期')}</h4>
             <UsageBreakdownTable
               rows={report?.byDay ?? []}
+              showEstimatedCost
               keyLabel={t('codex.sessionUsage.tables.dayName', '日期')}
               emptyLabel={t('codex.sessionUsage.empty.title', '还没有会话用量')}
               lang={lang}
             />
+            {(report?.byDay ?? []).some((row) => row.estimatedCostUsd == null) ? (
+              <p className="codex-session-usage__hint">{t('codex.sessionUsage.costUnavailable')}</p>
+            ) : null}
           </section>
         </>
       )}

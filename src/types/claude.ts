@@ -71,6 +71,7 @@ export interface ClaudeAccount {
   account_note?: string | null;
   created_at: number;
   last_used: number;
+  last_switched_at?: number | null;
 }
 
 export interface ClaudeDesktopLoginStartResponse {
@@ -201,26 +202,46 @@ function deriveClaudePlanBadge(account: ClaudeAccount): string {
   const credentialsOauth = asPlainRecord(asPlainRecord(account.claude_credentials_raw)?.claudeAiOauth);
   const profile = asPlainRecord(credentialsOauth?.profile);
 
-  const candidates = [
-    account.plan_type,
+  const rateLimitPlans = [
+    readStringPath(configOauth, ['rateLimitTier']),
+    readStringPath(credentialsOauth, ['rateLimitTier']),
+    readStringPath(profile, ['organization', 'rate_limit_tier']),
+  ]
+    .map((candidate) => normalizeClaudePlanValue(candidate))
+    .filter(Boolean);
+
+  const refineMax = (plan: string): string => {
+    if (plan === 'Max') {
+      const subtier = rateLimitPlans.find((item) => item === 'Max 5x' || item === 'Max 20x');
+      if (subtier) return subtier;
+    }
+    return plan;
+  };
+
+  const explicitCandidates = [
     readStringPath(configOauth, ['subscriptionType']),
     readStringPath(credentialsOauth, ['subscriptionType']),
     readStringPath(configOauth, ['organizationType']),
     readStringPath(profile, ['organization', 'organization_type']),
-    readStringPath(configOauth, ['rateLimitTier']),
-    readStringPath(credentialsOauth, ['rateLimitTier']),
-    readStringPath(profile, ['organization', 'rate_limit_tier']),
   ];
 
-  for (const candidate of candidates) {
+  for (const candidate of explicitCandidates) {
+    const normalized = normalizeClaudePlanValue(candidate);
+    if (normalized && normalized !== 'Free') return refineMax(normalized);
+  }
+
+  if (readBooleanPath(profile, ['account', 'has_claude_max'])) return refineMax('Max');
+  if (readBooleanPath(profile, ['account', 'has_claude_pro'])) return 'Pro';
+
+  const savedPlan = normalizeClaudePlanValue(account.plan_type);
+  if (savedPlan) return refineMax(savedPlan);
+
+  for (const candidate of explicitCandidates) {
     const normalized = normalizeClaudePlanValue(candidate);
     if (normalized) return normalized;
   }
 
-  if (readBooleanPath(profile, ['account', 'has_claude_max'])) return 'Max';
-  if (readBooleanPath(profile, ['account', 'has_claude_pro'])) return 'Pro';
-
-  return '';
+  return rateLimitPlans[0] || '';
 }
 
 export function normalizeClaudeAuthMode(mode?: ClaudeAuthMode | string | null): NormalizedClaudeAuthMode {
@@ -256,14 +277,15 @@ export function getClaudeAccountDisplayEmail(account: ClaudeAccount): string {
 }
 
 export function getClaudePlanBadge(account: ClaudeAccount): string {
+  // Desktop plan labels are authored by the backend; preserve custom/raw labels.
+  if (isClaudeDesktopOAuthAccount(account)) {
+    const plan = account.plan_type?.trim();
+    return plan && !/^(claude\s+desktop|desktop)$/i.test(plan) && !isClaudeBillingSourceValue(plan) ? plan : '';
+  }
   const derivedPlan = deriveClaudePlanBadge(account);
   if (derivedPlan) return derivedPlan;
 
   const raw = account.plan_type?.trim();
-  if (isClaudeDesktopOAuthAccount(account)) {
-    if (!raw || /^claude\s+desktop$/i.test(raw) || /^desktop$/i.test(raw) || isClaudeBillingSourceValue(raw)) return '';
-    return raw;
-  }
   if (raw && !isClaudeBillingSourceValue(raw)) return raw;
   if (!raw) {
     const org = account.organization_name?.trim();

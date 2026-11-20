@@ -30,7 +30,7 @@ const ANTIGRAVITY_LEGACY_APP_CONTENTS_MARKER: &str = "antigravity.app/contents/"
 #[cfg(target_os = "macos")]
 const ANTIGRAVITY_APP_EXEC_MARKER: &str = "antigravity ide.app/contents/macos/electron";
 #[cfg(target_os = "macos")]
-const VSCODE_APP_PATH: &str = "/Applications/Visual Studio Code.app/Contents/MacOS/Electron";
+const VSCODE_APP_PATH: &str = "/Applications/Visual Studio Code.app";
 
 #[cfg(target_os = "windows")]
 const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
@@ -40,9 +40,6 @@ const DETACHED_PROCESS: u32 = 0x0000_0008;
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 #[cfg(target_os = "windows")]
 const WINDOWS_PROCESS_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
-#[cfg(target_os = "windows")]
-static CODEX_STORE_APP_USER_MODEL_ID_CACHE: std::sync::OnceLock<String> =
-    std::sync::OnceLock::new();
 
 #[derive(Debug, Clone, Serialize)]
 pub struct AppLaunchCandidate {
@@ -57,7 +54,7 @@ pub struct AppLaunchCandidate {
 /// Handles paths with spaces in .app bundles (e.g., "Visual Studio Code.app").
 #[cfg(target_os = "macos")]
 fn extract_macos_exe_from_cmdline(cmdline: &str) -> Option<String> {
-    let lower = cmdline.to_lowercase();
+    let lower = cmdline.to_ascii_lowercase();
     // For .app bundles: find the binary after Contents/MacOS/
     if let Some(contents_pos) = lower.find(".app/contents/macos/") {
         let after_macos = contents_pos + ".app/contents/macos/".len();
@@ -68,6 +65,28 @@ fn extract_macos_exe_from_cmdline(cmdline: &str) -> Option<String> {
     }
     // For non-.app executables: first whitespace-delimited token
     cmdline.split_whitespace().next().map(|s| s.to_string())
+}
+
+#[cfg(target_os = "macos")]
+fn macos_profiles_from_argv(args: &[std::ffi::OsString]) -> impl Iterator<Item = &str> {
+    args.iter()
+        .enumerate()
+        .skip(1)
+        .take_while(|(_, arg)| *arg != "--")
+        .filter_map(|(index, arg)| {
+            let arg = arg.to_str()?;
+            if arg == "--user-data-dir" {
+                return args.get(index + 1)?.to_str().filter(|path| !path.starts_with("--"));
+            }
+            arg.strip_prefix("--user-data-dir=")
+        })
+        .filter(|path| !path.trim().is_empty())
+}
+
+#[cfg(target_os = "macos")]
+fn owned_macos_process_command(line: &str, owner: u32) -> Option<&str> {
+    let (uid, tail) = line.trim().split_once(char::is_whitespace)?;
+    (uid.parse::<u32>().ok()? == owner).then(|| tail.trim_start())
 }
 
 fn strict_process_detect_enabled() -> bool {
@@ -198,7 +217,15 @@ fn format_command_preview(command: &Command) -> String {
     let program = quote_command_part(command.get_program().to_string_lossy().as_ref());
     let args = command
         .get_args()
-        .map(|arg| quote_command_part(arg.to_string_lossy().as_ref()))
+        .map(|arg| {
+            let arg = arg.to_string_lossy();
+            if let Some((key, _)) = arg.split_once('=') {
+                if key.eq_ignore_ascii_case("NO_PROXY") || key == "--proxy-bypass-list" {
+                    return format!("{key}=<redacted>");
+                }
+            }
+            quote_command_part(&arg)
+        })
         .collect::<Vec<String>>();
     let preview = if args.is_empty() {
         program
@@ -483,84 +510,31 @@ fn powershell_output_with_timeout(
     args: &[&str],
     timeout: Duration,
 ) -> std::io::Result<std::process::Output> {
-    use std::io::{Error, ErrorKind, Read};
-
     let mut last_error = None;
-    let (mut child, preview) = 'spawn: {
-        for executable in windows_powershell_executable_candidates_for_host() {
-            let spawn_guard =
-                crate::modules::app_lifecycle::acquire_process_spawn_guard("PowerShell")?;
-            let mut command = build_powershell_command(&executable, args);
-            command
-                .stdin(Stdio::null())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped());
-            let preview = format_command_preview(&command);
-            log_command_trace_exec(&preview);
-            match command.spawn() {
-                Ok(child) => {
-                    drop(spawn_guard);
-                    break 'spawn (child, preview);
-                }
-                Err(error) => {
-                    drop(spawn_guard);
-                    crate::modules::logger::log_warn(&format!(
-                        "[PowerShell] 启动候选失败，尝试下一个: exe={} error={}",
-                        executable.display(),
-                        error
-                    ));
-                    last_error = Some(error);
-                }
+    for executable in windows_powershell_executable_candidates_for_host() {
+        let mut command = build_powershell_command(&executable, args);
+        let preview = format_command_preview(&command);
+        log_command_trace_exec(&preview);
+        let start = Instant::now();
+        // Drain both pipes while the process runs. Waiting for exit first blocks
+        // CIM probes once their output fills a pipe, producing false timeouts.
+        // The shared helper also bounds drains held open by descendants and
+        // acquires the lifecycle spawn guard itself.
+        let result = crate::modules::process_timeout::output_with_timeout(&mut command, timeout);
+        log_command_trace_result(&preview, &result, start.elapsed());
+        match result {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                last_error = Some(error);
             }
+            result => return result,
         }
-        let error = last_error.unwrap_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                "未找到可用的 PowerShell（powershell.exe / pwsh.exe）",
-            )
-        });
-        if command_trace_enabled() {
-            crate::modules::logger::log_warn(&format!(
-                "[CmdTrace] SPAWN_ERROR elapsed=0ms err={}",
-                error
-            ));
-        }
-        return Err(error);
-    };
-    let start = Instant::now();
-
-    loop {
-        if let Some(status) = child.try_wait()? {
-            let mut stdout = Vec::new();
-            let mut stderr = Vec::new();
-            if let Some(mut out) = child.stdout.take() {
-                let _ = out.read_to_end(&mut stdout);
-            }
-            if let Some(mut err) = child.stderr.take() {
-                let _ = err.read_to_end(&mut stderr);
-            }
-            let result = Ok(std::process::Output {
-                status,
-                stdout,
-                stderr,
-            });
-            log_command_trace_result(&preview, &result, start.elapsed());
-            return result;
-        }
-
-        if start.elapsed() >= timeout {
-            let _ = child.kill();
-            let _ = child.wait();
-            let result = Err(Error::new(
-                ErrorKind::TimedOut,
-                format!("PowerShell 进程探测超时（{}ms）", timeout.as_millis()),
-            ));
-            log_command_trace_result(&preview, &result, start.elapsed());
-            return result;
-        }
-
-        thread::sleep(Duration::from_millis(100));
     }
+    Err(last_error.unwrap_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "未找到可用的 PowerShell（powershell.exe / pwsh.exe）",
+        )
+    }))
 }
 
 #[cfg(target_os = "windows")]
@@ -653,9 +627,8 @@ fn score_windows_candidate(
         return Some(score);
     }
 
-    // The ChatGPT scanner must not accept helper executables whose paths merely
-    // contain "chatgpt" or the old "codex" GUI name.
-    if exe_names_lower.contains("chatgpt.exe") {
+    // Desktop packages also contain helpers under the same installation path.
+    if exe_names_lower.contains("chatgpt.exe") || exe_names_lower.contains("claude.exe") {
         return None;
     }
 
@@ -875,11 +848,11 @@ fn windows_app_launch_signature(app: &str) -> Option<WindowsAppLaunchSignature> 
         }),
         "qoder" => Some(WindowsAppLaunchSignature {
             label: "Qoder",
-            exe_names: &["Qoder.exe"],
-            command_names: &["qoder"],
-            protocol_names: &["qoder"],
+            exe_names: &["Qoder IDE.exe", "Qoder.exe"],
+            command_names: &["qoder", "qoder-ide"],
+            protocol_names: &["qoder-ide", "qoder"],
             display_keywords: &["qoder"],
-            common_paths: &["Qoder\\Qoder.exe"],
+            common_paths: &[r"Qoder IDE\Qoder IDE.exe", r"Qoder\Qoder.exe"],
             supports_multi_instance: true,
         }),
         "zcode" => Some(WindowsAppLaunchSignature {
@@ -901,7 +874,7 @@ fn windows_app_launch_signature(app: &str) -> Option<WindowsAppLaunchSignature> 
             supports_multi_instance: true,
         }),
         "trae_solo" => Some(WindowsAppLaunchSignature {
-            label: "TRAE SOLO",
+            label: "TraeWork",
             exe_names: &["TRAE SOLO.exe", "Trae.exe", "Electron.exe"],
             command_names: &["trae-solo", "solo"],
             protocol_names: &["solo"],
@@ -927,7 +900,7 @@ fn windows_app_launch_signature(app: &str) -> Option<WindowsAppLaunchSignature> 
             supports_multi_instance: true,
         }),
         "trae_solo_cn" => Some(WindowsAppLaunchSignature {
-            label: "TRAE SOLO CN",
+            label: "TraeWork CN",
             exe_names: &["TRAE SOLO CN.exe", "Trae.exe", "Electron.exe"],
             command_names: &["trae-solo-cn", "solo-cn"],
             protocol_names: &["solo-cn"],
@@ -939,6 +912,15 @@ fn windows_app_launch_signature(app: &str) -> Option<WindowsAppLaunchSignature> 
             ],
             supports_multi_instance: true,
         }),
+        "workbuddy_ai" => Some(WindowsAppLaunchSignature {
+            exe_names: &["WorkBuddyAI.exe"],
+            command_names: &["workbuddyai"],
+            protocol_names: &[],
+            display_keywords: &["workbuddy ai"],
+            label: "WorkBuddy AI",
+            common_paths: &["WorkBuddy AI\\WorkBuddyAI.exe", "workbuddy-ai\\WorkBuddyAI.exe"],
+            supports_multi_instance: true,
+        }),
         "workbuddy" => Some(WindowsAppLaunchSignature {
             label: "WorkBuddy",
             exe_names: &["WorkBuddy.exe"],
@@ -946,6 +928,15 @@ fn windows_app_launch_signature(app: &str) -> Option<WindowsAppLaunchSignature> 
             protocol_names: &["workbuddy"],
             display_keywords: &["workbuddy"],
             common_paths: &["WorkBuddy\\WorkBuddy.exe"],
+            supports_multi_instance: true,
+        }),
+        "minimaxcode" | "minimax_code" => Some(WindowsAppLaunchSignature {
+            label: "MiniMax Code",
+            exe_names: &["MiniMax Code.exe"],
+            command_names: &["minimax code", "minimaxcode"],
+            protocol_names: &["minimax"],
+            display_keywords: &["minimax code", "minimax"],
+            common_paths: &["MiniMax Code\\MiniMax Code.exe"],
             supports_multi_instance: true,
         }),
         "zed" => Some(WindowsAppLaunchSignature {
@@ -1175,6 +1166,7 @@ fn running_app_candidate_matches(
         .filter(|value| !value.is_empty())
         .collect::<Vec<String>>();
     score_windows_candidate(path, &exe_names_lower, &keywords_lower).is_some()
+        && (app != "workbuddy" || !workbuddy_install_is_international(path))
 }
 
 #[cfg(target_os = "windows")]
@@ -1218,8 +1210,29 @@ fn scan_windows_app_launch_targets(
         );
     }
 
+    if app == "claude" {
+        let remaining = Duration::from_millis(1500).saturating_sub(started_at.elapsed());
+        if !remaining.is_zero() {
+            let mut registered = Vec::new();
+            crate::modules::claude_instance::scan_windows_start_apps_for_claude(
+                &mut registered,
+                &mut seen,
+                remaining,
+            );
+            candidates.extend(registered.into_iter().map(|candidate| AppLaunchCandidate {
+                target_type: candidate.target_type,
+                label: candidate.label,
+                target: candidate.target,
+                source: candidate.source,
+                supports_multi_instance: candidate.supports_multi_instance,
+            }));
+        }
+    }
+
     candidates.sort_by_key(|candidate| {
-        let codex_priority = if app == "codex" {
+        let priority = if candidate.target_type == "windows_app" {
+            0
+        } else if app == "codex" {
             let file_name = std::path::Path::new(&candidate.target)
                 .file_name()
                 .and_then(|value| value.to_str())
@@ -1230,9 +1243,9 @@ fn scan_windows_app_launch_targets(
                 1
             }
         } else {
-            0
+            1
         };
-        (codex_priority, candidate.target.to_ascii_lowercase())
+        (priority, candidate.target.to_ascii_lowercase())
     });
     crate::modules::logger::log_info(&format!(
         "[Path Detect] running app probe: app={}, candidates={}, elapsed={}ms",
@@ -1730,6 +1743,10 @@ fn sanitize_linux_gui_launch_env(cmd: &mut Command) {
 }
 
 fn managed_proxy_env_pairs() -> Vec<(&'static str, String)> {
+    managed_proxy_env_pairs_for_launch(false)
+}
+
+fn managed_proxy_env_pairs_for_launch(bypass_loopback: bool) -> Vec<(&'static str, String)> {
     let config = config::get_user_config();
     if config.global_proxy_enabled && config.global_proxy_url.trim().is_empty() {
         crate::modules::logger::log_warn("[Proxy] 全局代理已启用，但代理地址为空，跳过注入");
@@ -1750,6 +1767,7 @@ fn managed_proxy_env_pairs() -> Vec<(&'static str, String)> {
         &inherited,
         &std::env::var("no_proxy").unwrap_or_default(),
         &std::env::var("NO_PROXY").unwrap_or_default(),
+        bypass_loopback,
     )
 }
 
@@ -1760,6 +1778,7 @@ fn build_managed_proxy_env_pairs(
     inherited_proxies: &[String],
     inherited_lower: &str,
     inherited_upper: &str,
+    bypass_loopback: bool,
 ) -> Vec<(&'static str, String)> {
     let mut pairs = Vec::new();
     let proxy_url = proxy_url.trim();
@@ -1773,8 +1792,9 @@ fn build_managed_proxy_env_pairs(
             ("ALL_PROXY", proxy_url.to_string()),
         ]);
     }
-    // Do not alter direct launches with a standalone bypass list.
-    if pairs.is_empty()
+    // macOS can supply a system proxy without any proxy environment variables.
+    if !bypass_loopback
+        && pairs.is_empty()
         && !inherited_proxies
             .iter()
             .any(|value| !value.trim().is_empty())
@@ -1834,7 +1854,7 @@ fn log_managed_proxy_injection(mode: &str, cmd: &Command, pairs: &[(&'static str
         if no_proxy.is_empty() {
             "<empty>"
         } else {
-            no_proxy
+            "<configured; hosts redacted>"
         },
         keys
     ));
@@ -1873,16 +1893,17 @@ fn account_proxy_env_pairs(proxy_url: &str) -> Vec<(&'static str, String)> {
     pairs
 }
 
-pub fn apply_effective_proxy_env_to_command(cmd: &mut Command, egress_proxy_url: Option<&str>) {
-    let Some(proxy_url) = egress_proxy_url
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    else {
-        apply_managed_proxy_env_to_command(cmd);
-        return;
+pub fn apply_effective_proxy_env_to_command(cmd: &mut Command, launch_proxy: &CodexLaunchProxy) {
+    let pairs = match launch_proxy {
+        CodexLaunchProxy::Inherit => {
+            let direct_hosts = config::get_codex_proxy_direct_hosts();
+            proxy_env_with_direct_hosts(
+                managed_proxy_env_pairs_for_launch(!direct_hosts.is_empty()),
+                &direct_hosts,
+            )
+        }
+        _ => launch_proxy.env_overrides(),
     };
-
-    let pairs = account_proxy_env_pairs(proxy_url);
     log_managed_proxy_injection("account-env", cmd, &pairs);
     for (key, value) in pairs {
         cmd.env(key, value);
@@ -1924,7 +1945,7 @@ mod account_egress_proxy_tests {
             (true, "http://user:secret@127.0.0.1:7897"),
         ] {
             let mut args = vec!["--other".to_string()];
-            append_global_electron_proxy_args_from_config(&mut args, enabled, proxy);
+            append_global_electron_proxy_args_from_config(&mut args, enabled, proxy, &[]);
             assert_eq!(args, vec!["--other"]);
         }
         for (proxy, expected) in [
@@ -1932,7 +1953,7 @@ mod account_egress_proxy_tests {
             ("socks5h://127.0.0.1:7897", "socks5://127.0.0.1:7897"),
         ] {
             let mut args = vec!["--other".to_string()];
-            append_global_electron_proxy_args_from_config(&mut args, true, proxy);
+            append_global_electron_proxy_args_from_config(&mut args, true, proxy, &[]);
             assert_eq!(
                 args,
                 vec![
@@ -1978,6 +1999,7 @@ pub fn append_global_electron_proxy_args(args: &mut Vec<String>) {
         args,
         config.global_proxy_enabled,
         &config.global_proxy_url,
+        &config.codex_proxy_direct_hosts,
     );
 }
 
@@ -1985,6 +2007,7 @@ fn append_global_electron_proxy_args_from_config(
     args: &mut Vec<String>,
     enabled: bool,
     proxy_url: &str,
+    direct_hosts: &[String],
 ) {
     if !enabled || proxy_url.trim().is_empty() {
         return;
@@ -1996,16 +2019,33 @@ fn append_global_electron_proxy_args_from_config(
             return;
         }
     }
-    append_electron_proxy_args(args, proxy_url);
+    append_electron_proxy_args_with_direct_hosts(args, proxy_url, direct_hosts);
 }
 
+#[cfg(test)]
 pub fn append_electron_proxy_args(args: &mut Vec<String>, proxy_url: &str) {
+    append_electron_proxy_args_with_direct_hosts(args, proxy_url, &[]);
+}
+
+fn append_electron_proxy_args_with_direct_hosts(
+    args: &mut Vec<String>,
+    proxy_url: &str,
+    direct_hosts: &[String],
+) {
     let proxy_url = proxy_url.trim();
     if proxy_url.is_empty() {
         return;
     }
-    // An explicitly selected account or global proxy takes precedence over old
-    // launch flags; otherwise Chromium can bypass it.
+    clear_electron_proxy_args(args);
+    let chromium_proxy_url = proxy_url.replace("socks5h://", "socks5://");
+    args.push(format!("--proxy-server={chromium_proxy_url}"));
+    args.push(format!(
+        "--proxy-bypass-list={}",
+        super::codex_proxy_direct_hosts::chromium_rules(direct_hosts)
+    ));
+}
+
+fn clear_electron_proxy_args(args: &mut Vec<String>) {
     let mut cleaned = Vec::with_capacity(args.len());
     let mut iter = args.drain(..).peekable();
     while let Some(arg) = iter.next() {
@@ -2031,9 +2071,6 @@ pub fn append_electron_proxy_args(args: &mut Vec<String>, proxy_url: &str) {
     }
     drop(iter);
     *args = cleaned;
-    let chromium_proxy_url = proxy_url.replace("socks5h://", "socks5://");
-    args.push(format!("--proxy-server={chromium_proxy_url}"));
-    args.push("--proxy-bypass-list=localhost;127.0.0.1;[::1]".to_string());
 }
 
 #[cfg(target_os = "macos")]
@@ -2049,16 +2086,14 @@ pub fn append_managed_proxy_env_to_open_args(cmd: &mut Command) {
 }
 
 #[cfg(target_os = "macos")]
-pub fn append_effective_proxy_env_to_open_args(cmd: &mut Command, egress_proxy_url: Option<&str>) {
-    let Some(proxy_url) = egress_proxy_url
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    else {
-        append_managed_proxy_env_to_open_args(cmd);
-        return;
+pub fn append_effective_proxy_env_to_open_args(cmd: &mut Command, launch_proxy: &CodexLaunchProxy) {
+    let pairs = match launch_proxy {
+        CodexLaunchProxy::Inherit => proxy_env_with_direct_hosts(
+            managed_proxy_env_pairs_for_launch(true),
+            &config::get_codex_proxy_direct_hosts(),
+        ),
+        _ => launch_proxy.env_overrides(),
     };
-
-    let pairs = account_proxy_env_pairs(proxy_url);
     log_managed_proxy_injection("account-open-arg", cmd, &pairs);
     for (key, value) in pairs {
         cmd.arg("--env").arg(format!("{}={}", key, value));
@@ -2071,28 +2106,51 @@ pub fn append_managed_proxy_env_to_open_args(_cmd: &mut Command) {}
 #[cfg(not(target_os = "macos"))]
 pub fn append_effective_proxy_env_to_open_args(
     _cmd: &mut Command,
-    _egress_proxy_url: Option<&str>,
+    _launch_proxy: &CodexLaunchProxy,
 ) {
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
-fn spawn_detached_unix(cmd: &mut Command) -> Result<Child, String> {
+fn spawn_detached_unix(cmd: &mut Command) -> Result<u32, String> {
     use std::os::unix::process::CommandExt;
-    if !should_detach_child() {
-        return spawn_command_with_trace(cmd).map_err(|e| format!("启动失败: {}", e));
+    if should_detach_child() {
+        cmd.stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        unsafe {
+            cmd.pre_exec(|| {
+                if libc::setsid() == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
     }
-    cmd.stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
-    unsafe {
-        cmd.pre_exec(|| {
-            if libc::setsid() == -1 {
-                return Err(std::io::Error::last_os_error());
+    spawn_command_with_trace(cmd)
+        .map(background_child_pid)
+        .map_err(|e| format!("启动失败: {}", e))
+}
+
+pub(crate) fn background_child_pid(child: Child) -> u32 {
+    let pid = child.id();
+    // Unix keeps an exited child in the process table until its parent waits.
+    #[cfg(unix)]
+    if let Err(error) = std::thread::Builder::new()
+        .name("cockpit-child-wait".into())
+        .spawn(move || {
+            let mut child = child;
+            if let Err(error) = child.wait() {
+                crate::modules::logger::log_warn(&format!(
+                    "[Process] 回收已启动的子进程失败 pid={pid}: {error}"
+                ));
             }
-            Ok(())
-        });
+        })
+    {
+        crate::modules::logger::log_warn(&format!(
+            "[Process] 无法启动子进程回收线程 pid={pid}: {error}"
+        ));
     }
-    spawn_command_with_trace(cmd).map_err(|e| format!("启动失败: {}", e))
+    pid
 }
 
 /// Strip Windows extended-length path prefixes (`\\?\` / `\\?\UNC\`) for user-facing paths.
@@ -2187,6 +2245,7 @@ fn update_app_path_in_config(app: &str, path: &Path, expected_current: &str) {
     let _ = config::patch_user_config(|current| {
         let configured_path = match app {
             "antigravity" => &mut current.antigravity_app_path,
+            "antigravity_legacy" => &mut current.antigravity_legacy_app_path,
             "codex" => &mut current.codex_app_path,
             "zed" => &mut current.zed_app_path,
             "vscode" => &mut current.vscode_app_path,
@@ -2200,6 +2259,7 @@ fn update_app_path_in_config(app: &str, path: &Path, expected_current: &str) {
             "trae_cn" => &mut current.trae_cn_app_path,
             "trae_solo_cn" => &mut current.trae_solo_cn_app_path,
             "workbuddy" => &mut current.workbuddy_app_path,
+            "minimaxcode" | "minimax_code" => &mut current.minimax_code_app_path,
             _ => return Ok(()),
         };
         if app_path_matches_snapshot(configured_path, expected_current)

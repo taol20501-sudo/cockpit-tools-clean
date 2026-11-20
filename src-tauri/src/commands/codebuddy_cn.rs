@@ -277,7 +277,9 @@ pub fn get_codebuddy_cn_accounts_index_path() -> Result<String, String> {
 pub async fn inject_codebuddy_cn_to_vscode(
     app: AppHandle,
     account_id: String,
+    require_launch: Option<bool>,
 ) -> Result<String, String> {
+    let require_launch = require_launch.unwrap_or(false);
     let started_at = Instant::now();
     logger::log_info(&format!(
         "[CodeBuddy CN Switch] 开始切换账号: account_id={}",
@@ -286,12 +288,19 @@ pub async fn inject_codebuddy_cn_to_vscode(
 
     let account = codebuddy_cn_account::load_account(&account_id)
         .ok_or_else(|| format!("CodeBuddy CN account not found: {}", account_id))?;
+    logger::log_info(&format!(
+        "[CN DIAG] inject_codebuddy_cn_to_vscode: loaded account_id={}",
+        account_id
+    ));
 
     if let Err(err) = crate::modules::codebuddy_cn_instance::update_default_settings(
         Some(Some(account_id.clone())),
         None,
         Some(false),
     ) {
+        if require_launch {
+            return Err(err);
+        }
         logger::log_warn(&format!("更新 CodeBuddy CN 默认实例绑定账号失败: {}", err));
     }
     crate::modules::provider_current_state::set_current_account_id(
@@ -313,7 +322,7 @@ pub async fn inject_codebuddy_cn_to_vscode(
                     {
                         let _ = app.emit(
                         "app:path_missing",
-                        serde_json::json!({ "app": "codebuddy_cn", "retry": { "kind": "default" } }),
+                        serde_json::json!({ "app": "codebuddy_cn", "retry": { "kind": "launchOnly" } }),
                     );
                     }
                     Some(err)
@@ -333,7 +342,11 @@ pub async fn inject_codebuddy_cn_to_vscode(
             started_at.elapsed().as_millis(),
             err
         ));
-        Ok(format!("切换完成，但 CodeBuddy CN 启动失败: {}", err))
+        if require_launch {
+            Err(err)
+        } else {
+            Ok(format!("切换完成，但 CodeBuddy CN 启动失败: {}", err))
+        }
     } else {
         logger::log_info(&format!(
             "[CodeBuddy CN Switch] 切号成功: account_id={}, email={}, elapsed={}ms",

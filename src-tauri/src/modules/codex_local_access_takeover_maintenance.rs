@@ -29,6 +29,49 @@ async fn refresh_owned_takeovers_after_explicit_oauth_binding(
 #[derive(Serialize, Deserialize, PartialEq, Eq)]
 struct TakeoverOwnership {
     connection_hash: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    managed_realtime_ws_base_url: Option<String>,
+}
+
+// A different loopback address may be a user's own voice server. Only a value
+// recorded while it was managed may follow a provider that has already moved.
+fn profile_has_managed_realtime_sideband(
+    profile_dir: &Path,
+    doc: &Document,
+) -> Result<bool, String> {
+    if doc.get("model_provider").and_then(|item| item.as_str())
+        != Some(CODEX_LOCAL_ACCESS_RUNTIME_PROVIDER_ID)
+        || doc
+            .get("experimental_realtime_webrtc_call_base_url")
+            .is_some()
+    {
+        return Ok(false);
+    }
+    if has_managed_realtime_sideband_override(doc) {
+        return Ok(true);
+    }
+    let Some(content) = read_optional_profile_file(&profile_dir.join(TAKEOVER_OWNERSHIP_FILE))?
+    else {
+        return Ok(false);
+    };
+    let Some(record) = serde_json::from_str::<TakeoverOwnership>(&content).ok() else {
+        return Ok(false);
+    };
+    if takeover_connection_hash(doc).as_deref() != Some(record.connection_hash.as_str()) {
+        return Ok(false);
+    }
+    Ok(record
+        .managed_realtime_ws_base_url
+        .as_deref()
+        .is_some_and(|managed| {
+            is_loopback_realtime_sideband_url(managed)
+                && doc
+                    .get("experimental_realtime_ws_base_url")
+                    .and_then(|item| item.as_str())
+                    .is_some_and(|current| {
+                        current.trim_end_matches('/') == managed.trim_end_matches('/')
+                    })
+        }))
 }
 
 fn takeover_connection_hash(doc: &Document) -> Option<String> {
@@ -66,8 +109,18 @@ fn remember_takeover_ownership(profile_dir: &Path) -> Result<(), String> {
     ))?;
     let connection_hash = takeover_connection_hash(&doc)
         .ok_or_else(|| "Cannot record API service profile ownership".to_string())?;
-    let content = serde_json::to_string(&TakeoverOwnership { connection_hash })
-        .map_err(|error| error.to_string())?;
+    let managed_realtime_ws_base_url = profile_has_managed_realtime_sideband(profile_dir, &doc)?
+        .then(|| {
+            doc.get("experimental_realtime_ws_base_url")
+                .and_then(|item| item.as_str())
+                .map(str::to_owned)
+        })
+        .flatten();
+    let content = serde_json::to_string(&TakeoverOwnership {
+        connection_hash,
+        managed_realtime_ws_base_url,
+    })
+    .map_err(|error| error.to_string())?;
     write_string_atomic_if_changed(&profile_dir.join(TAKEOVER_OWNERSHIP_FILE), &content)?;
     Ok(())
 }
@@ -105,6 +158,130 @@ fn profile_still_owned_for_collection(
     )
 }
 
+fn sync_owned_oauth_profile_websockets(
+    profile_dir: &Path,
+    collection: &CodexLocalAccessCollection,
+) -> Result<(), String> {
+    if !collection.enabled {
+        return Ok(());
+    }
+    let config_path = profile_config_path(profile_dir);
+    if read_optional_profile_file(&profile_dir.join(TAKEOVER_OWNERSHIP_FILE))?.is_none() {
+        return Ok(());
+    }
+    let _lease = codex_account::try_acquire_profile_mutation_lease(
+        profile_dir,
+        "api-profile-websocket-sync",
+    )?;
+    let Some(config) = read_optional_profile_file(&config_path)? else {
+        return Ok(());
+    };
+    let mut doc = crate::modules::codex_config_format::read_codex_config_doc_from_str(&config)?;
+    if recorded_takeover_ownership_matches(profile_dir, &doc)? != Some(true) {
+        return Ok(());
+    }
+    let provider = &doc["model_providers"][CODEX_LOCAL_ACCESS_RUNTIME_PROVIDER_ID];
+    if !profile_base_url_matches(
+        provider.get("base_url").and_then(|item| item.as_str()),
+        &build_collection_base_url(collection),
+    ) || provider
+        .get("experimental_bearer_token")
+        .and_then(|item| item.as_str())
+        .map(str::trim)
+        != Some(collection.api_key.trim())
+        || !read_optional_profile_file(&profile_auth_path(profile_dir))?
+            .as_deref()
+            .is_some_and(is_codex_oauth_auth_text)
+    {
+        return Ok(());
+    }
+
+    let supports_websockets = profile_api_key_supports_websockets(collection, &collection.api_key);
+    let catalog_path = doc
+        .get("model_catalog_json")
+        .and_then(|item| item.as_str())
+        .map(str::trim)
+        .filter(|name| is_cockpit_managed_model_catalog_name(name))
+        .map(|name| profile_dir.join(name));
+    let catalog_update = if let Some(path) = catalog_path {
+        updated_profile_websocket_catalog(&path, supports_websockets)?
+            .map(|content| (path, content))
+    } else {
+        None
+    };
+    let provider = &mut doc["model_providers"][CODEX_LOCAL_ACCESS_RUNTIME_PROVIDER_ID];
+    let config_changed = provider["supports_websockets"].as_bool() != Some(supports_websockets);
+    if !config_changed && catalog_update.is_none() {
+        return Ok(());
+    }
+
+    invalidate_codex_model_cache(profile_dir)?;
+    if config_changed {
+        provider["supports_websockets"] = value(supports_websockets);
+        let updated = crate::modules::codex_config_format::codex_config_doc_to_string(&mut doc);
+        crate::modules::codex_config_format::write_codex_config_toml_atomic(
+            &config_path,
+            &updated,
+        )?;
+    }
+    if let Some((path, content)) = catalog_update {
+        let refresh_meta =
+            !crate::modules::codex_managed_model_catalog_version::managed_catalog_needs_rebuild(
+                &path,
+            );
+        if let Err(error) = write_string_atomic(&path, &content) {
+            if config_changed {
+                crate::modules::codex_config_format::write_codex_config_toml_atomic(
+                    &config_path,
+                    &config,
+                )
+                .map_err(|rollback| {
+                    format!("更新 Codex 模型目录失败: {error}；恢复配置失败: {rollback}")
+                })?;
+            }
+            return Err(error);
+        }
+        if refresh_meta {
+            if let Err(error) =
+                crate::modules::codex_managed_model_catalog_version::write_managed_catalog_meta(
+                    &path,
+                )
+            {
+                logger::log_codex_api_warn(&format!("更新 Codex 模型目录版本戳失败: {error}"));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn updated_profile_websocket_catalog(
+    path: &Path,
+    supports_websockets: bool,
+) -> Result<Option<String>, String> {
+    let Some(content) = read_optional_profile_file(path)? else {
+        return Ok(None);
+    };
+    let mut catalog: Value = serde_json::from_str(&content)
+        .map_err(|error| format!("解析 Codex 模型目录失败: {error}"))?;
+    let models = catalog
+        .get_mut("models")
+        .and_then(Value::as_array_mut)
+        .ok_or_else(|| "Codex 模型目录缺少 models 列表".to_string())?;
+    let mut changed = false;
+    for model in models {
+        let model = model
+            .as_object_mut()
+            .ok_or_else(|| "Codex 模型目录包含无效模型".to_string())?;
+        if model.get("prefer_websockets").and_then(Value::as_bool) != Some(supports_websockets) {
+            model.insert("prefer_websockets".to_owned(), json!(supports_websockets));
+            changed = true;
+        }
+    }
+    changed
+        .then(|| serde_json::to_string_pretty(&catalog).map_err(|error| error.to_string()))
+        .transpose()
+}
+
 fn maintain_local_access_profile(
     profile_dir: &Path,
     collection: &CodexLocalAccessCollection,
@@ -131,12 +308,15 @@ fn maintain_local_access_profile(
                 && doc
                     .get("model_catalog_json")
                     .and_then(|item| item.as_str())
-                    .is_some_and(is_cockpit_managed_model_catalog_name)
+                    .is_some_and(|reference| {
+                        codex_account::catalog_ref_targets_cockpit_managed_file(reference, profile_dir)
+                    })
         }
     };
     if !owned {
         return Ok(());
     }
+    let managed_realtime_sideband = profile_has_managed_realtime_sideband(profile_dir, &doc)?;
     let provider = doc["model_providers"][CODEX_LOCAL_ACCESS_RUNTIME_PROVIDER_ID]
         .as_table_mut()
         .ok_or("Invalid API service provider table")?;
@@ -169,11 +349,18 @@ fn maintain_local_access_profile(
     {
         provider["supports_websockets"] = value(supports_websockets);
     }
-    if old_base != next_base
-        && doc
-            .get("experimental_realtime_ws_base_url")
-            .and_then(|item| item.as_str())
-            == Some(old_base.as_str())
+    if doc
+        .get("experimental_realtime_webrtc_call_base_url")
+        .is_none()
+        && ((managed_realtime_sideband
+            && doc
+                .get("experimental_realtime_ws_base_url")
+                .and_then(|item| item.as_str())
+                .is_some_and(|current| {
+                    current.trim_end_matches('/') != next_base.trim_end_matches('/')
+                }))
+            || (doc.get("experimental_realtime_ws_base_url").is_none()
+                && profile_api_key_uses_oauth_realtime(collection, &collection.api_key)))
     {
         doc["experimental_realtime_ws_base_url"] = value(next_base);
     }
@@ -218,6 +405,8 @@ fn persist_takeover_connection(
 ) -> Result<(), String> {
     let config_path = profile_config_path(profile_dir);
     let auth_path = profile_auth_path(profile_dir);
+    let ownership_path = profile_dir.join(TAKEOVER_OWNERSHIP_FILE);
+    let original_ownership = read_optional_profile_file(&ownership_path)?;
     let result = (|| {
         if config != original_config {
             crate::modules::codex_config_format::write_codex_config_toml_atomic(
@@ -233,7 +422,9 @@ fn persist_takeover_connection(
     if let Err(error) = result {
         let config_rollback = write_optional_profile_file(&config_path, Some(original_config));
         let auth_rollback = write_optional_profile_file(&auth_path, original_auth);
-        return Err(format!("API profile maintenance failed: {error}; config rollback={config_rollback:?}; auth rollback={auth_rollback:?}"));
+        let ownership_rollback =
+            write_optional_profile_file(&ownership_path, original_ownership.as_deref());
+        return Err(format!("API profile maintenance failed: {error}; config rollback={config_rollback:?}; auth rollback={auth_rollback:?}; ownership rollback={ownership_rollback:?}"));
     }
     Ok(())
 }

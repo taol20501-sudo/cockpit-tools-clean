@@ -14,7 +14,9 @@ export type ProviderCurrentPlatform =
   | 'trae_cn'
   | 'trae_solo_cn'
   | 'workbuddy'
+  | 'workbuddy_ai'
   | 'github_copilot'
+  | 'minimaxcode'
   | 'zed';
 
 export async function getProviderCurrentAccountId(

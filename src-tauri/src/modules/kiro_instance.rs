@@ -86,27 +86,7 @@ pub fn get_default_kiro_user_data_dir() -> Result<PathBuf, String> {
 }
 
 pub fn get_default_instances_root_dir() -> Result<PathBuf, String> {
-    #[cfg(target_os = "macos")]
-    {
-        let home = dirs::home_dir().ok_or("无法获取用户主目录")?;
-        return Ok(home.join(".antigravity_cockpit/instances/kiro"));
-    }
-
-    #[cfg(target_os = "windows")]
-    {
-        let appdata =
-            std::env::var("APPDATA").map_err(|_| "无法获取 APPDATA 环境变量".to_string())?;
-        return Ok(PathBuf::from(appdata).join(".antigravity_cockpit\\instances\\kiro"));
-    }
-
-    #[cfg(target_os = "linux")]
-    {
-        let home = dirs::home_dir().ok_or("无法获取用户主目录")?;
-        return Ok(home.join(".antigravity_cockpit/instances/kiro"));
-    }
-
-    #[allow(unreachable_code)]
-    Err("Kiro 应用多开仅支持 macOS、Windows 和 Linux".to_string())
+    crate::modules::data_paths::managed_instances_root_dir("kiro")
 }
 
 pub fn get_instance_defaults() -> Result<InstanceDefaults, String> {
@@ -119,6 +99,8 @@ pub fn get_instance_defaults() -> Result<InstanceDefaults, String> {
 }
 
 pub fn create_instance(params: CreateInstanceParams) -> Result<InstanceProfile, String> {
+    let directory_preexisted = std::path::Path::new(params.user_data_dir.trim()).exists();
+    let creation_mode = params.init_mode.clone().unwrap_or_else(|| "copy".to_string());
     let _creation_guard = crate::modules::instance_storage_cleanup::protect_instance_creation()?;
     let _lock = KIRO_INSTANCE_STORE_LOCK
         .lock()
@@ -216,6 +198,9 @@ pub fn create_instance(params: CreateInstanceParams) -> Result<InstanceProfile, 
         last_pid: None,
     };
 
+    crate::modules::instance_directory_ownership::record_creation(
+        std::path::Path::new(&instance.user_data_dir), &instance.id, &creation_mode, directory_preexisted,
+    )?;
     store.instances.push(instance.clone());
     save_instance_store(&store)?;
     Ok(instance)
@@ -554,7 +539,7 @@ fn format_command_preview(command: &Command) -> String {
     modules::process::summarize_text_for_process_log(&preview, 600)
 }
 
-fn spawn_command_with_trace(cmd: &mut Command) -> std::io::Result<std::process::Child> {
+fn spawn_command_with_trace(cmd: &mut Command) -> std::io::Result<u32> {
     let preview = format_command_preview(cmd);
     if command_trace_enabled() {
         modules::logger::log_info(&format!("[CmdTrace][Kiro] EXEC {}", preview));
@@ -577,7 +562,7 @@ fn spawn_command_with_trace(cmd: &mut Command) -> std::io::Result<std::process::
             )),
         }
     }
-    result
+    result.map(modules::process::background_child_pid)
 }
 
 fn collect_running_process_exe_by_pid() -> HashMap<u32, String> {
@@ -1177,8 +1162,7 @@ fn spawn_kiro_windows(
             cmd.arg(arg.trim());
         }
     }
-    let child = spawn_command_with_trace(&mut cmd).map_err(|e| format!("启动 Kiro 失败: {}", e))?;
-    Ok(child.id())
+    spawn_command_with_trace(&mut cmd).map_err(|e| format!("启动 Kiro 失败: {}", e))
 }
 
 #[cfg(target_os = "macos")]
@@ -1208,7 +1192,7 @@ fn spawn_kiro_macos_open(
         }
     }
 
-    let child = spawn_command_with_trace(&mut cmd).map_err(|e| format!("启动 Kiro 失败: {}", e))?;
+    let pid = spawn_command_with_trace(&mut cmd).map_err(|e| format!("启动 Kiro 失败: {}", e))?;
     modules::logger::log_info("Kiro 启动命令已发送（open -n -a）");
     let probe_started = std::time::Instant::now();
     let timeout = std::time::Duration::from_secs(6);
@@ -1220,9 +1204,9 @@ fn spawn_kiro_macos_open(
     }
     modules::logger::log_warn(&format!(
         "[Kiro Start] 启动后 6s 内未匹配到实例 PID，回退 open pid={}",
-        child.id()
+        pid
     ));
-    Ok(child.id())
+    Ok(pid)
 }
 
 #[cfg(target_os = "linux")]
@@ -1249,8 +1233,7 @@ fn spawn_kiro_unix(
             cmd.arg(arg.trim());
         }
     }
-    let child = spawn_command_with_trace(&mut cmd).map_err(|e| format!("启动 Kiro 失败: {}", e))?;
-    Ok(child.id())
+    spawn_command_with_trace(&mut cmd).map_err(|e| format!("启动 Kiro 失败: {}", e))
 }
 
 pub fn start_kiro_with_args_with_new_window(

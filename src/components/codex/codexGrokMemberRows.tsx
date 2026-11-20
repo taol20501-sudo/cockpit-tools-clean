@@ -1,13 +1,11 @@
 import {
   formatGrokQuotaUsedTotal,
   getGrokQuotaClass,
+  getGrokQuotaSummaryItems,
   type GrokAccount,
 } from "../../types/grok";
-import { getCodexPlanFilterKey, type CodexAccount } from "../../types/codex";
-import {
-  getCodexLocalAccessAccountIneligibleReason,
-  isCodexLocalAccessEligibleAccount,
-} from "../../utils/codexLocalAccessAccounts";
+import { getCodexPlanFilterKey, isCodexAgentIdentityAccount, isCodexEffectiveFreePlan, type CodexAccount } from "../../types/codex";
+import { getCodexServiceEndpoint } from "../../utils/chatgptPlanOverview";
 
 const GROK_MEMBER_ROW_ID_PREFIX = "grok:";
 
@@ -24,7 +22,7 @@ export function selectCodexLocalAccessMemberRows(input: {
   showCodexPlatform: boolean;
   showGrokPlatform: boolean;
   restrictFreeAccounts: boolean;
-  selected: ReadonlySet<string>;
+  isSelected: (account: CodexAccount) => boolean;
 }): CodexAccount[] {
   const sourceIds = new Set(input.grokAccounts.map((account) => account.id));
   return [...input.codexAccounts, ...input.grokRows].filter((account) => {
@@ -36,10 +34,11 @@ export function selectCodexLocalAccessMemberRows(input: {
     if (input.manageGrok && !isGrokRow && upstreamId && sourceIds.has(upstreamId)) {
       return false;
     }
-    const reason = getCodexLocalAccessAccountIneligibleReason(account, input.restrictFreeAccounts);
-    return reason === "pending_oauth" || reason === "web_session_quota_only"
-      || isCodexLocalAccessEligibleAccount(account, input.restrictFreeAccounts)
-      || input.selected.has(account.id);
+    const endpoint = getCodexServiceEndpoint(account);
+    return !input.restrictFreeAccounts
+      || isCodexAgentIdentityAccount(endpoint)
+      || !isCodexEffectiveFreePlan(endpoint)
+      || input.isSelected(account);
   });
 }
 
@@ -109,7 +108,7 @@ export function buildGrokMemberRowAccounts(input: {
     );
 }
 
-/** Grok 账号额度：只展示 GrokBuild 这一项。 */
+/** Grok 账号额度：统一计费展示共享池，旧套餐保留 GrokBuild。 */
 export function CodexGrokBuildQuotaChip({
   t,
   account,
@@ -117,30 +116,19 @@ export function CodexGrokBuildQuotaChip({
   t: (key: string, defaultValue?: string | any) => string;
   account: GrokAccount;
 }) {
-  const product = (account.quota?.products ?? []).find((item) =>
-    /grok\s*build/i.test(item.product ?? ""),
+  const item = getGrokQuotaSummaryItems(account, t).find((row) =>
+    account.quota?.isUnifiedBillingUser === true
+      ? row.key === "weekly"
+      : row.label.replace(/[^a-z0-9]/gi, "").replace(/^product/i, "").toLowerCase() === "grokbuild",
   );
-  if (!product) {
-    return null;
-  }
-  const used = product.used ?? null;
-  const total = product.total ?? null;
-  const remaining = product.remaining ?? null;
-  const usedPercent =
-    product.usagePercent ??
-    (used != null && total != null && total > 0
-      ? (used / total) * 100
-      : remaining != null && total != null && total > 0
-        ? ((total - remaining) / total) * 100
-        : null);
-  if (usedPercent == null) {
-    return null;
-  }
-  const clampedUsed = Math.max(0, Math.min(100, Math.round(usedPercent)));
+  if (!item) return null;
+  const used = item.used ?? null;
+  const total = item.total ?? null;
+  const clampedUsed = Math.max(0, Math.min(100, Math.floor(item.percentage)));
   const remainingPercent = 100 - clampedUsed;
   const amountText = formatGrokQuotaUsedTotal(used, total);
   const title = [
-    product.product,
+    item.label,
     amountText || null,
     t("common.shared.quota.leftPercent", {
       defaultValue: "{{value}}% left",
@@ -157,7 +145,7 @@ export function CodexGrokBuildQuotaChip({
       >
         <span className="codex-local-access-quota-dot" />
         <span>
-          {product.product} {remainingPercent}%
+          {item.label} {remainingPercent}%
         </span>
       </span>
     </div>

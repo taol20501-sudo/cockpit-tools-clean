@@ -1,10 +1,15 @@
 import { invoke } from '@tauri-apps/api/core';
+import { codexRemoteBinding } from '../utils/codexRemoteBinding';
+import type { CustomProviderUsage } from '../utils/codexCustomProviderUsage';
 
 export type ModelProviderUsageIntegrationType = 'sub2api' | 'new_api';
 export type ModelProviderUsageMode =
   | ModelProviderUsageIntegrationType
   | 'deepseek'
-  | 'token_plan';
+  | 'token_plan'
+  | 'cockpit'
+  | 'custom'
+  | 'openai_official';
 
 export interface ModelProviderModel {
   id: string;
@@ -17,6 +22,8 @@ export interface ModelProviderModelsResult {
 }
 
 export interface ModelProviderUsageSummary {
+  cockpit?: import('../types/codexRemoteService').CodexRemoteConnection | null;
+  sourceBinding?: string;
   mode?: string | null;
   isValid?: boolean | null;
   status?: string | null;
@@ -69,18 +76,24 @@ function usageDetailNumber(
 export function resolveNewApiQuotaSnapshot(
   summary?: ModelProviderUsageSummary,
 ): NewApiQuotaSnapshot {
+  const legacyUsage = usageDetailNumber(summary, 'totalUsage');
   const used =
     finiteUsageNumber(summary?.quotaUsed) ??
-    finiteUsageNumber(summary?.totalCost);
-  const granted =
-    usageDetailNumber(summary, 'totalGranted') ??
-    finiteUsageNumber(summary?.quotaLimit) ??
+    finiteUsageNumber(summary?.totalCost) ??
+    (legacyUsage == null ? null : legacyUsage / 100);
+  const billingLimit =
     usageDetailNumber(summary, 'hardLimitUsd') ??
     usageDetailNumber(summary, 'softLimitUsd') ??
     usageDetailNumber(summary, 'systemHardLimitUsd');
+  const granted =
+    usageDetailNumber(summary, 'totalGranted') ??
+    finiteUsageNumber(summary?.quotaLimit) ??
+    (summary?.quotaUnlimited === true && billingLimit === 100_000_000 ? null : billingLimit);
   const available =
     usageDetailNumber(summary, 'totalAvailable') ??
     finiteUsageNumber(summary?.quotaRemaining) ??
+    finiteUsageNumber(summary?.remaining) ??
+    finiteUsageNumber(summary?.balance) ??
     (granted != null && used != null
       ? Math.max(0, granted - used)
       : null);
@@ -89,6 +102,36 @@ export function resolveNewApiQuotaSnapshot(
     usageDetailNumber(summary, 'accessUntil');
 
   return { granted, available, expiresAt };
+}
+
+export function presentNewApiQuota(
+  summary: ModelProviderUsageSummary | undefined,
+  unlimitedText: string,
+  unavailableText: string,
+): { text: string; percent: number | null; expiresAt: number | null } {
+  const { granted, available, expiresAt } = resolveNewApiQuotaSnapshot(summary);
+  const unit = summary?.unit ?? '';
+  if (available != null) {
+    const amount = formatModelProviderUsageMoney(available, unit);
+    return {
+      text: granted == null ? amount : `${amount} / ${formatModelProviderUsageMoney(granted, unit)}`,
+      percent: granted != null && granted > 0
+        ? Math.max(0, Math.min(100, Math.round((available / granted) * 100)))
+        : null,
+      expiresAt,
+    };
+  }
+  if (granted != null) {
+    return {
+      text: `${unavailableText} / ${formatModelProviderUsageMoney(granted, unit)}`,
+      percent: null,
+      expiresAt,
+    };
+  }
+  if (summary?.quotaUnlimited === true) {
+    return { text: unlimitedText, percent: 100, expiresAt };
+  }
+  return { text: unavailableText, percent: null, expiresAt };
 }
 
 export function buildUsageBaseUrlCandidates(baseUrl: string): string[] {
@@ -113,17 +156,28 @@ export function buildUsageBaseUrlCandidates(baseUrl: string): string[] {
 export async function queryModelProviderUsage(input: {
   baseUrl: string;
   apiKey: string;
+  /** Only used for OpenAI organization usage; never replaces the model credential. */
+  usageApiKey?: string;
   integrationType?: ModelProviderUsageIntegrationType | null;
+  customUsage?: CustomProviderUsage;
+  respectRelayBalanceSwitch?: boolean;
+  accountId?: string;
 }): Promise<ModelProviderUsageSummary> {
-  const candidates = buildUsageBaseUrlCandidates(input.baseUrl);
+  const candidates = input.customUsage ? [input.baseUrl] : buildUsageBaseUrlCandidates(input.baseUrl);
   let lastError: unknown = null;
   for (const baseUrl of candidates) {
     try {
-      return await invoke('codex_query_model_provider_usage', {
+      const summary = await invoke<ModelProviderUsageSummary>('codex_query_model_provider_usage', {
         baseUrl,
         apiKey: input.apiKey,
+        usageApiKey: input.usageApiKey ?? null,
         integrationType: input.integrationType ?? null,
+        respectRelayBalanceSwitch: input.respectRelayBalanceSwitch ?? false,
+        accountId: input.accountId ?? null,
+        customUsage: input.customUsage ?? null,
       });
+      if (summary.cockpit) summary.sourceBinding = await codexRemoteBinding(input.baseUrl, input.apiKey);
+      return summary;
     } catch (error) {
       lastError = error;
       if (!isModelProviderUsageUnavailableError(error)) {
@@ -137,11 +191,21 @@ export async function queryModelProviderUsage(input: {
 export async function listModelProviderModels(input: {
   baseUrl: string;
   apiKey: string;
+  wireApi?: string;
+  authScheme?: "x-api-key" | "bearer";
+  launchAccountId?: string;
 }): Promise<ModelProviderModelsResult> {
   return await invoke('codex_list_model_provider_models', {
     baseUrl: input.baseUrl,
     apiKey: input.apiKey,
+    wireApi: input.wireApi ?? null,
+    authScheme: input.authScheme ?? null,
+    launchAccountId: input.launchAccountId ?? null,
   });
+}
+
+export function isRelayBalanceDisabledError(error: unknown): boolean {
+  return String(error).replace(/^Error:\s*/, '') === 'PROVIDER_RELAY_BALANCE_DISABLED';
 }
 
 export function isModelProviderUsageUnavailableError(error: unknown): boolean {
@@ -157,11 +221,14 @@ export function resolveModelProviderUsageMode(
   summary?: ModelProviderUsageSummary,
 ): ModelProviderUsageMode | null {
   if (!summary) return null;
+  if (summary.cockpit) return 'cockpit';
   if (
     summary.mode === 'new_api' ||
     summary.mode === 'sub2api' ||
     summary.mode === 'deepseek' ||
-    summary.mode === 'token_plan'
+    summary.mode === 'token_plan' ||
+    summary.mode === 'custom' ||
+    summary.mode === 'openai_official'
   ) {
     return summary.mode;
   }

@@ -10,7 +10,7 @@ use tauri::image::Image;
 #[cfg(not(target_os = "macos"))]
 use tauri::menu::{IsMenuItem, Menu, MenuItem, PredefinedMenuItem, Submenu};
 use tauri::{
-    tray::{MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent},
+    tray::{TrayIcon, TrayIconBuilder},
     Emitter, Runtime,
 };
 use tracing::info;
@@ -18,6 +18,10 @@ use tracing::info;
 #[cfg(target_os = "macos")]
 use crate::modules::config::TrayIconStyle;
 use crate::modules::logger;
+
+#[path = "tray_click.rs"]
+mod tray_click;
+use tray_click::handle_tray_event;
 
 /// 托盘菜单 ID
 pub const TRAY_ID: &str = "main-tray";
@@ -166,7 +170,11 @@ fn configure_macos_status_item_identity<R: Runtime>(tray: &TrayIcon<R>) {
 
 #[cfg(target_os = "macos")]
 pub fn apply_tray_icon_style<R: Runtime>(app: &tauri::AppHandle<R>) -> Result<(), String> {
-    let style = crate::modules::config::get_user_config().tray_icon_style;
+    let config = crate::modules::config::get_user_config();
+    if !config.show_tray_icon {
+        return Ok(());
+    }
+    let style = config.tray_icon_style;
     if let Some(tray) = app.tray_by_id(TRAY_ID) {
         let (icon, icon_as_template) =
             macos_tray_icon_for_style(app, style).map_err(|err| err.to_string())?;
@@ -192,6 +200,27 @@ pub fn apply_tray_icon_style<R: Runtime>(app: &tauri::AppHandle<R>) -> Result<()
     Ok(())
 }
 
+pub(crate) fn set_tray_visibility<R: Runtime>(
+    app: &tauri::AppHandle<R>,
+    visible: bool,
+) -> Result<(), String> {
+    if let Some(tray) = app.tray_by_id(TRAY_ID) {
+        tray.set_visible(visible).map_err(|err| err.to_string())?;
+        #[cfg(target_os = "macos")]
+        if visible {
+            // Showing the icon again creates a new native status item.
+            configure_macos_status_item_identity(&tray);
+            apply_tray_icon_style(app)?;
+        }
+    } else if visible {
+        create_tray_skeleton(app).map_err(|err| err.to_string())?;
+    }
+    if visible {
+        update_tray_menu(app)?;
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum PlatformId {
     Antigravity,
@@ -213,10 +242,11 @@ pub(crate) enum PlatformId {
     TraeCn,
     TraeSoloCn,
     Workbuddy,
+    MinimaxCode,
 }
 
 impl PlatformId {
-    pub(crate) fn default_order() -> [Self; 18] {
+    pub(crate) fn default_order() -> [Self; 19] {
         [
             Self::Claude,
             Self::Codex,
@@ -236,6 +266,7 @@ impl PlatformId {
             Self::TraeCn,
             Self::TraeSoloCn,
             Self::Workbuddy,
+            Self::MinimaxCode,
         ]
     }
 
@@ -259,6 +290,7 @@ impl PlatformId {
             crate::modules::tray_layout::PLATFORM_TRAE_CN => Some(Self::TraeCn),
             crate::modules::tray_layout::PLATFORM_TRAE_SOLO_CN => Some(Self::TraeSoloCn),
             crate::modules::tray_layout::PLATFORM_WORKBUDDY => Some(Self::Workbuddy),
+            crate::modules::tray_layout::PLATFORM_MINIMAX_CODE => Some(Self::MinimaxCode),
             _ => None,
         }
     }
@@ -283,6 +315,7 @@ impl PlatformId {
             Self::TraeCn => crate::modules::tray_layout::PLATFORM_TRAE_CN,
             Self::TraeSoloCn => crate::modules::tray_layout::PLATFORM_TRAE_SOLO_CN,
             Self::Workbuddy => crate::modules::tray_layout::PLATFORM_WORKBUDDY,
+            Self::MinimaxCode => crate::modules::tray_layout::PLATFORM_MINIMAX_CODE,
         }
     }
 
@@ -302,10 +335,11 @@ impl PlatformId {
             Self::Qoder => "Qoder",
             Self::Zcode => "ZCode",
             Self::Trae => "Trae",
-            Self::TraeSolo => "TRAE SOLO",
+            Self::TraeSolo => super::trae_account::TraePlatformKind::TraeSolo.display_name(),
             Self::TraeCn => "Trae CN",
-            Self::TraeSoloCn => "TRAE SOLO CN",
+            Self::TraeSoloCn => super::trae_account::TraePlatformKind::TraeSoloCn.display_name(),
             Self::Workbuddy => "WorkBuddy",
+            Self::MinimaxCode => "MiniMax Code",
         }
     }
 
@@ -329,6 +363,7 @@ impl PlatformId {
             Self::TraeCn => "trae-cn",
             Self::TraeSoloCn => "trae-solo-cn",
             Self::Workbuddy => "workbuddy",
+            Self::MinimaxCode => "minimaxcode",
         }
     }
 }
@@ -382,7 +417,7 @@ enum TrayMenuSnapshotEntry {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[cfg(not(target_os = "macos"))]
+#[cfg(any(test, not(target_os = "macos")))]
 struct TrayMenuSnapshot {
     lang: String,
     show_window: String,
@@ -418,6 +453,13 @@ pub fn create_tray_skeleton<R: Runtime>(
     app: &tauri::AppHandle<R>,
 ) -> Result<TrayIcon<R>, tauri::Error> {
     info!("[Tray] 创建骨架托盘...");
+
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    {
+        *APPLIED_TRAY_MENU_SNAPSHOT
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = None;
+    }
 
     #[cfg(not(target_os = "macos"))]
     let lang = crate::modules::config::get_user_config().language;
@@ -578,14 +620,12 @@ where
     F: FnMut(PlatformId) -> AccountDisplayInfo,
 {
     match entry {
-        TrayMenuEntry::Platform(platform) => {
-            TrayMenuSnapshotEntry::Platform(snapshot_platform(
-                *platform,
-                format!("platform:{}:submenu", platform.as_str()),
-                platform.title().to_string(),
-                lookup(*platform),
-            ))
-        }
+        TrayMenuEntry::Platform(platform) => TrayMenuSnapshotEntry::Platform(snapshot_platform(
+            *platform,
+            format!("platform:{}:submenu", platform.as_str()),
+            platform.title().to_string(),
+            lookup(*platform),
+        )),
         TrayMenuEntry::Group {
             id,
             name,
@@ -669,13 +709,7 @@ fn build_tray_menu_from_snapshot<R: Runtime>(
         true,
         None::<&str>,
     )?;
-    let quit = MenuItem::with_id(
-        app,
-        menu_ids::QUIT,
-        &snapshot.quit,
-        true,
-        None::<&str>,
-    )?;
+    let quit = MenuItem::with_id(app, menu_ids::QUIT, &snapshot.quit, true, None::<&str>)?;
 
     let mut visible_submenus: Vec<Submenu<R>> = Vec::new();
     for entry in &snapshot.visible_entries {
@@ -799,6 +833,17 @@ fn build_platform_details_submenu_from_snapshot<R: Runtime>(
 fn resolve_tray_entries() -> Vec<TrayMenuEntry> {
     let layout = crate::modules::tray_layout::load_tray_layout();
     let visible = sanitize_platform_list(&layout.tray_platform_ids);
+    // 被隐藏或被禁用的平台都不出现在托盘菜单中，也不触发其账号读取/修复
+    let hidden_set: HashSet<PlatformId> = layout
+        .hidden_platform_ids
+        .iter()
+        .chain(layout.disabled_platform_ids.iter())
+        .filter_map(|p| PlatformId::from_str(p.trim()))
+        .collect();
+    let visible = visible
+        .into_iter()
+        .filter(|p| !hidden_set.contains(p))
+        .collect::<Vec<_>>();
     let visible_set: HashSet<PlatformId> = visible.iter().copied().collect();
 
     if visible_set.is_empty() {
@@ -934,6 +979,7 @@ fn get_account_display_info(platform: PlatformId, lang: &str) -> AccountDisplayI
             build_trae_display_info(lang, platform)
         }
         PlatformId::Workbuddy => build_workbuddy_display_info(lang),
+        PlatformId::MinimaxCode => build_minimax_code_display_info(lang),
     }
 }
 
@@ -966,6 +1012,34 @@ fn build_antigravity_display_info(lang: &str) -> AccountDisplayInfo {
 #[cfg(not(target_os = "macos"))]
 fn normalize_antigravity_model_for_match(value: &str) -> String {
     let normalized = value.trim().to_lowercase();
+    if normalized.starts_with("gemini-4-carbon")
+        || matches!(
+            normalized.as_str(),
+            "carbon:weekly" | "gemini-carbon-wtu-weekly"
+        )
+    {
+        return "gemini-4-carbon".into();
+    }
+    if normalized.starts_with("gemini-4-argon")
+        || matches!(
+            normalized.as_str(),
+            "argon:weekly" | "gemini-argon-wtu-weekly"
+        )
+    {
+        return "gemini-4-argon".into();
+    }
+    if normalized.starts_with("gemini-3.8-flash") {
+        return "gemini-3.8-flash".into();
+    }
+    if normalized.starts_with("gemini-4-hydrogen") {
+        return "gemini-4-hydrogen".into();
+    }
+    if normalized.starts_with("claude-sonnet-5-5") {
+        return "claude-sonnet-5-5".into();
+    }
+    if normalized.starts_with("claude-opus-5-5") {
+        return "claude-opus-5-5".into();
+    }
     if normalized.is_empty() {
         return normalized;
     }
@@ -1151,7 +1225,14 @@ fn build_codex_display_info(lang: &str) -> AccountDisplayInfo {
         }
 
         AccountDisplayInfo {
-            account: format!("📧 {}", account.email),
+            account: format!(
+                "📧 {}",
+                account.display_name(&crate::modules::i18n::translate(
+                    lang,
+                    "common.apiKeyAccount",
+                    &[]
+                )),
+            ),
             quota_lines,
         }
     } else {
@@ -1389,7 +1470,14 @@ fn build_cursor_display_info(lang: &str) -> AccountDisplayInfo {
     let usage = read_cursor_tray_usage(&account);
     let reset_text = format_reset_time_from_ts(lang, usage.reset_ts);
 
-    if let Some(total_used) = usage.total_used_percent {
+    if usage.weekly {
+        let label = crate::modules::i18n::translate(lang, "cursor.quota.weeklyUsage", &[]);
+        let used = usage
+            .total_used_percent
+            .map(format_percent_text)
+            .unwrap_or_else(|| "—".to_owned());
+        quota_lines.push(format_quota_line(lang, &label, &used, Some(&reset_text)));
+    } else if let Some(total_used) = usage.total_used_percent {
         quota_lines.push(format_quota_line(
             lang,
             "Total",
@@ -1418,6 +1506,10 @@ fn build_cursor_display_info(lang: &str) -> AccountDisplayInfo {
 
     if let Some(on_demand_text) = usage.on_demand_text {
         quota_lines.push(format!("On-Demand: {}", on_demand_text));
+    }
+    if let Some(cents) = usage.paid_monthly_cents {
+        let label = crate::modules::i18n::translate(lang, "cursor.quota.additionalMonthlyUsed", &[]);
+        quota_lines.push(format!("{label}: ${:.2}", cents as f64 / 100.0));
     }
 
     if quota_lines.is_empty() {
@@ -1681,6 +1773,74 @@ fn build_workbuddy_usage_status_line(
         account.dosage_notify_code.as_deref(),
         account.dosage_notify_zh.as_deref(),
         account.dosage_notify_en.as_deref(),
+    )
+}
+
+#[cfg(not(target_os = "macos"))]
+fn build_minimax_code_display_info(lang: &str) -> AccountDisplayInfo {
+    let accounts = crate::modules::minimax_code_account::list_accounts();
+    build_minimax_code_family_display_info(lang, resolve_minimax_code_current_account(&accounts))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn build_minimax_code_family_display_info(
+    lang: &str,
+    account: Option<crate::models::minimax_code::MinimaxCodeAccount>,
+) -> AccountDisplayInfo {
+    let Some(account) = account else {
+        return AccountDisplayInfo {
+            account: format!("📧 {}", get_text("not_logged_in", lang)),
+            quota_lines: vec!["—".to_string()],
+        };
+    };
+
+    let display_email = first_non_empty(&[
+        Some(account.email.as_str()),
+        account.nickname.as_deref(),
+        account.uid.as_deref(),
+        Some(account.id.as_str()),
+    ])
+    .unwrap_or("—");
+
+    AccountDisplayInfo {
+        account: format!("📧 {}", display_email),
+        quota_lines: vec![build_minimax_code_usage_status_line(lang, &account)],
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn build_minimax_code_usage_status_line(
+    lang: &str,
+    account: &crate::models::minimax_code::MinimaxCodeAccount,
+) -> String {
+    let label = get_text("plan", lang);
+    let value = account
+        .plan_type
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .or_else(|| {
+            account
+                .status
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+        })
+        .unwrap_or("--");
+    format!("{}: {}", label, value)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn resolve_minimax_code_current_account(
+    accounts: &[crate::models::minimax_code::MinimaxCodeAccount],
+) -> Option<crate::models::minimax_code::MinimaxCodeAccount> {
+    crate::modules::minimax_code_account::resolve_current_account_id(accounts).and_then(
+        |account_id| {
+            accounts
+                .iter()
+                .find(|account| account.id == account_id)
+                .cloned()
+        },
     )
 }
 
@@ -2051,19 +2211,18 @@ fn parse_qoder_quota_bucket(
         })
         .or_else(|| fallback.and_then(|(_, t, _)| *t));
 
-    let percentage = raw
-        .as_ref()
-        .and_then(|r| {
-            json_first_f64(&[
-                r.get("percentage").and_then(json_as_f64),
-                r.get("usagePercent").and_then(json_as_f64),
-                r.get("usage_percentage").and_then(json_as_f64),
-            ])
-        })
-        .or_else(|| match (total, used) {
-            (Some(t), Some(u)) if t > 0.0 => Some((u / t) * 100.0),
-            _ => None,
-        });
+    let percentage = crate::modules::qoder_usage::derived_percent(used, total).or_else(|| {
+        raw.as_ref()
+            .and_then(|r| {
+                json_first_f64(&[
+                    r.get("percentage").and_then(json_as_f64),
+                    r.get("usagePercent").and_then(json_as_f64),
+                    r.get("usage_percentage").and_then(json_as_f64),
+                ])
+            })
+            .map(crate::modules::qoder_usage::percent_points)
+            .or_else(|| fallback.and_then(|(_, _, percentage)| *percentage))
+    });
 
     QoderQuotaBucket {
         used,
@@ -2373,11 +2532,13 @@ fn extract_trae_usage(account: &crate::models::trae::TraeAccount) -> Option<Trae
 #[derive(Debug, Clone, Default)]
 #[cfg(not(target_os = "macos"))]
 struct CursorTrayUsage {
+    weekly: bool,
     total_used_percent: Option<i32>,
     auto_used_percent: Option<i32>,
     api_used_percent: Option<i32>,
     reset_ts: Option<i64>,
     on_demand_text: Option<String>,
+    paid_monthly_cents: Option<i64>,
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -2448,6 +2609,15 @@ fn format_cursor_dollars(cents: f64) -> String {
 
 #[cfg(not(target_os = "macos"))]
 fn read_cursor_tray_usage(account: &crate::models::cursor::CursorAccount) -> CursorTrayUsage {
+    if let Some(weekly) = crate::modules::cursor_account::read_weekly_tray_usage(account) {
+        return CursorTrayUsage {
+            weekly: true,
+            total_used_percent: weekly.used_percent,
+            reset_ts: weekly.reset_at,
+            paid_monthly_cents: weekly.paid_monthly_cents,
+            ..CursorTrayUsage::default()
+        };
+    }
     let Some(raw) = account.cursor_usage_raw.as_ref() else {
         return CursorTrayUsage::default();
     };
@@ -2584,6 +2754,7 @@ fn read_cursor_tray_usage(account: &crate::models::cursor::CursorAccount) -> Cur
         api_used_percent: api_direct.map(clamp_cursor_percent),
         reset_ts,
         on_demand_text,
+        ..CursorTrayUsage::default()
     }
 }
 
@@ -3654,64 +3825,6 @@ fn parse_platform_from_menu_id(id: &str) -> Option<PlatformId> {
     PlatformId::from_str(parts.next()?)
 }
 
-/// 处理托盘图标事件
-fn handle_tray_event<R: Runtime>(tray: &TrayIcon<R>, event: TrayIconEvent) {
-    match event {
-        TrayIconEvent::Click {
-            button,
-            button_state,
-            rect: _rect,
-            ..
-        } => {
-            #[cfg(target_os = "macos")]
-            {
-                if button == MouseButton::Left {
-                    if let Err(err) =
-                        crate::modules::floating_card_window::show_main_window(tray.app_handle())
-                    {
-                        logger::log_warn(&format!("[Tray] 左键恢复主窗口失败: {}", err));
-                    }
-                    return;
-                }
-
-                if button == MouseButton::Right && button_state == MouseButtonState::Down {
-                    let app = tray.app_handle().clone();
-                    let app_for_menu = app.clone();
-                    let _ = app.run_on_main_thread(move || {
-                        crate::modules::macos_native_menu::toggle_tray_menu(&app_for_menu, _rect);
-                    });
-                }
-            }
-
-            #[cfg(not(target_os = "macos"))]
-            if button == MouseButton::Left && button_state == MouseButtonState::Up {
-                if let Err(err) =
-                    crate::modules::floating_card_window::show_main_window(tray.app_handle())
-                {
-                    logger::log_warn(&format!("[Tray] 左键恢复主窗口失败: {}", err));
-                }
-            }
-        }
-        TrayIconEvent::DoubleClick {
-            button: MouseButton::Left,
-            ..
-        } => {
-            #[cfg(target_os = "macos")]
-            {
-                return;
-            }
-
-            #[cfg(not(target_os = "macos"))]
-            if let Err(err) =
-                crate::modules::floating_card_window::show_main_window(tray.app_handle())
-            {
-                logger::log_warn(&format!("[Tray] 双击恢复主窗口失败: {}", err));
-            }
-        }
-        _ => {}
-    }
-}
-
 /// 请求更新托盘菜单（合并同一时间窗内的重复请求）
 ///
 /// Rebuilding the menu re-reads every platform's account library from disk, so
@@ -3719,110 +3832,7 @@ fn handle_tray_event<R: Runtime>(tray: &TrayIcon<R>, event: TrayIconEvent) {
 /// one: a single quota refresh sweep touches a dozen platforms and used to queue
 /// a dozen full rebuilds. Requests are collapsed into one trailing rebuild, then
 /// native menu construction is applied in a single UI-thread pass.
-pub fn update_tray_menu<R: Runtime>(app: &tauri::AppHandle<R>) -> Result<(), String> {
-    TRAY_MENU_REQUESTS.fetch_add(1, Ordering::AcqRel);
-    if TRAY_MENU_REBUILD_SCHEDULED.swap(true, Ordering::AcqRel) {
-        // A worker is already going to pick this request up.
-        return Ok(());
-    }
-    spawn_tray_menu_rebuild_worker(app.clone());
-    Ok(())
-}
-
-fn spawn_tray_menu_rebuild_worker<R: Runtime>(app: tauri::AppHandle<R>) {
-    std::thread::spawn(move || loop {
-        std::thread::sleep(TRAY_MENU_COALESCE_WINDOW);
-        let collapsed = TRAY_MENU_REQUESTS.swap(0, Ordering::AcqRel);
-        let started = std::time::Instant::now();
-        match rebuild_tray_menu_now(&app) {
-            Ok(Some(timing)) => {
-                logger::log_info(&format!(
-                    "[Tray] 托盘菜单已更新: 合并请求={}, 数据耗时={}ms, 提交耗时={}ms, 总耗时={}ms",
-                    collapsed,
-                    timing.data_ms,
-                    timing.apply_ms,
-                    started.elapsed().as_millis()
-                ));
-            }
-            Ok(None) => {
-                logger::log_info(&format!(
-                    "[Tray] 托盘菜单重建已跳过过期快照: 合并请求={}, 耗时={}ms",
-                    collapsed,
-                    started.elapsed().as_millis()
-                ));
-            }
-            Err(err) => {
-                logger::log_warn(&format!("[Tray] 托盘菜单重建失败: {}", err));
-            }
-        }
-
-        // Release the slot, then re-check: a request that landed between the
-        // swap above and this store would otherwise never be served.
-        TRAY_MENU_REBUILD_SCHEDULED.store(false, Ordering::Release);
-        if TRAY_MENU_REQUESTS.load(Ordering::Acquire) == 0 {
-            return;
-        }
-        if TRAY_MENU_REBUILD_SCHEDULED.swap(true, Ordering::AcqRel) {
-            // Someone else claimed the slot and will do the work.
-            return;
-        }
-    });
-}
-
-struct TrayMenuRebuildTiming {
-    data_ms: u128,
-    apply_ms: u128,
-}
-
-fn rebuild_tray_menu_now<R: Runtime>(
-    app: &tauri::AppHandle<R>,
-) -> Result<Option<TrayMenuRebuildTiming>, String> {
-    #[cfg(target_os = "macos")]
-    {
-        crate::modules::macos_native_menu::update_status_item(app)?;
-        if !MACOS_TRAY_SKIP_LOGGED.swap(true, Ordering::Relaxed) {
-            logger::log_info("[Tray] macOS 原生菜单模式，已更新菜单栏状态");
-        }
-        Ok(Some(TrayMenuRebuildTiming {
-            data_ms: 0,
-            apply_ms: 0,
-        }))
-    }
-
-    #[cfg(not(target_os = "macos"))]
-    {
-        let data_started = std::time::Instant::now();
-        let snapshot = collect_tray_menu_snapshot();
-        let data_ms = data_started.elapsed().as_millis();
-        let generation = next_tray_menu_apply_generation(&TRAY_MENU_APPLY_GENERATION);
-        let app_handle = app.clone();
-        let (tx, rx) = std::sync::mpsc::channel();
-        app.run_on_main_thread(move || {
-            if is_stale_tray_menu_apply(&TRAY_MENU_APPLY_GENERATION, generation) {
-                let _ = tx.send(Ok(None));
-                return;
-            }
-            let apply_started = std::time::Instant::now();
-            let result = (|| {
-                let Some(tray) = app_handle.tray_by_id(TRAY_ID) else {
-                    return Ok(());
-                };
-                let menu = build_tray_menu_from_snapshot(&app_handle, &snapshot)
-                    .map_err(|e| e.to_string())?;
-                tray.set_menu(Some(menu)).map_err(|e| e.to_string())
-            })();
-            let apply_ms = apply_started.elapsed().as_millis();
-            let _ = tx.send(result.map(|()| Some(apply_ms)));
-        })
-        .map_err(|e| e.to_string())?;
-
-        match rx.recv().map_err(|_| "等待托盘菜单提交失败".to_string())? {
-            Ok(Some(apply_ms)) => Ok(Some(TrayMenuRebuildTiming { data_ms, apply_ms })),
-            Ok(None) => Ok(None),
-            Err(err) => Err(err),
-        }
-    }
-}
+include!("tray_menu_rebuild.rs");
 
 /// 获取本地化文本
 #[cfg(not(target_os = "macos"))]

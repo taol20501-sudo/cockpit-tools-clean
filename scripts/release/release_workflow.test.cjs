@@ -6,6 +6,9 @@ const test = require("node:test");
 
 const workflowPath = path.join(__dirname, "..", "..", ".github", "workflows", "release.yml");
 const workflow = fs.readFileSync(workflowPath, "utf8");
+const bash = process.platform === "win32"
+  ? path.join(process.env.ProgramFiles, "Git", "bin", "bash.exe")
+  : "bash";
 
 function jobBody(name, nextName) {
   const startMarker = `  ${name}:`;
@@ -16,16 +19,19 @@ function jobBody(name, nextName) {
   return workflow.slice(start, end);
 }
 
+function shellScripts(job) {
+  return [...job.matchAll(/        run: \|\r?\n((?:          .*\r?\n|\r?\n)+)/g)]
+    .map((match) => match[1].replace(/^          /gm, "").replace(/\r/g, ""));
+}
+
 test("release remains draft until all assets, manifests, and checksums are ready", () => {
   const prepare = jobBody("prepare-release", "build-windows");
-  const finalize = jobBody("finalize-legacy-latest", "upload-checksums");
-  const checksums = jobBody("upload-checksums", "publish-release");
+  const finalize = jobBody("finalize-legacy-latest", "publish-release");
   const publish = jobBody("publish-release", "update-homebrew-cask");
 
   assert.match(prepare, /gh release create "\$\{TAG\}" --draft/);
   assert.doesNotMatch(prepare, /--draft=false/);
   assert.doesNotMatch(finalize, /--draft=false/);
-  assert.doesNotMatch(checksums, /--draft=false/);
   assert.match(publish, /needs:[\s\S]*finalize-legacy-latest[\s\S]*upload-checksums/);
   assert.match(publish, /gh release edit "\$\{TAG\}" --draft=false --prerelease=false --latest/);
 });
@@ -39,16 +45,38 @@ test("public updater verification and Homebrew run only after publication", () =
   assert.match(homebrew, /needs:[\s\S]*publish-release/);
 });
 
-// Execute the actual workflow shell steps with fake external commands. This
-// catches early exits that textual ordering checks cannot detect.
+test("every release upload uses the draft-safe retry helper", () => {
+  assert.doesNotMatch(workflow, /gh release upload/);
+  for (const [job, next] of [
+    ["build-windows", "build-macos-aarch64"],
+    ["build-macos-aarch64", "build-macos-x86_64"],
+    ["build-macos-x86_64", "build-macos-universal"],
+    ["build-macos-universal", "finalize-legacy-latest"],
+    ["finalize-legacy-latest", "upload-checksums"],
+    ["upload-checksums", "publish-release"],
+  ]) {
+    const body = jobBody(job, next);
+    assert.match(body, /actions\/checkout@v4/);
+    assert.match(body, /actions\/setup-node@v4/);
+    assert.match(body, /node scripts\/release\/upload_release_assets\.cjs/);
+  }
+});
+
+test("Clean builds only Windows and macOS and stages all supported installers", () => {
+  assert.doesNotMatch(workflow, /build-linux|setup-go/);
+  assert.match(jobBody("build-windows", "build-macos-aarch64"), /windows-x86_64-msi,windows-x86_64-nsis/);
+  for (const [job, next, target] of [
+    ["build-macos-aarch64", "build-macos-x86_64", "aarch64-apple-darwin"],
+    ["build-macos-x86_64", "build-macos-universal", "x86_64-apple-darwin"],
+    ["build-macos-universal", "finalize-legacy-latest", "universal-apple-darwin"],
+  ]) {
+    assert.ok(jobBody(job, next).includes(`node scripts/tauri.cjs build --ci --target ${target}`));
+  }
+});
+
 function runPublishJob(overrides = {}) {
-  const publish = jobBody("publish-release", "update-homebrew-cask");
-  const scripts = [...publish.matchAll(/        run: \|\r?\n((?:          .*\r?\n|\r?\n)+)/g)]
-    .map((match) => match[1].replace(/^          /gm, "").replace(/\r/g, ""));
+  const scripts = shellScripts(jobBody("publish-release", "update-homebrew-cask"));
   assert.equal(scripts.length, 2, "expected publication and verification shell steps");
-  const bash = process.platform === "win32"
-    ? path.join(process.env.ProgramFiles, "Git", "bin", "bash.exe")
-    : "bash";
   const result = spawnSync(bash, ["--noprofile", "--norc", "-e", "-o", "pipefail", "-c", `
     gh() {
       case "$1 $2" in

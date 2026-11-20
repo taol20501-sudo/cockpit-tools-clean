@@ -2,28 +2,79 @@
 // 业务分片只在完整顶层 item 之间切开，通过 include! 保持同一模块作用域；
 // 调用方、网关生命周期、请求转换和账号池行为均与拆分前一致。
 include!("codex_local_access_foundation.rs");
+include!("codex_local_access_budget.rs");
+include!("codex_local_access_budget_storage.rs");
+include!("codex_local_access_quota_reserve.rs");
 include!("codex_local_access_quota_cooldown.rs");
 include!("codex_local_access_request_transform.rs");
+include!("codex_local_access_historical_pricing.rs");
 include!("codex_local_access_routing_pricing.rs");
 include!("codex_local_access_request_logs.rs");
+include!("codex_local_access_connection_source.rs");
+include!("codex_local_access_request_diagnostics.rs");
+include!("codex_local_access_overload.rs");
+include!("codex_local_access_request_diagnostics_poll.rs");
 include!("codex_local_access_profile_takeover.rs");
 include!("codex_local_access_takeover_maintenance.rs");
 include!("codex_local_access_sidecar_config.rs");
 include!("codex_local_access_automatic_routing.rs");
+include!("codex_local_access_injection_display.rs");
 include!("codex_local_access_sidecar_runtime.rs");
+include!("codex_local_access_pool_diagnostics.rs");
 include!("codex_local_access_collection.rs");
+include!("codex_local_access_named_pools.rs");
+include!("codex_local_access_image_sources.rs");
+include!("codex_local_access_image_model_catalog.rs");
+include!("codex_local_access_model_config_transfer.rs");
+include!("codex_local_access_account_references.rs");
+include!("codex_local_access_key_recovery.rs");
+include!("codex_local_access_sidecar_retirement.rs");
 include!("codex_local_access_gateway_runtime.rs");
+include!("codex_local_access_native.rs");
+include!("codex_local_access_native_usage.rs");
+include!("codex_local_access_native_catalog.rs");
+include!("codex_local_access_continuity.rs");
+include!("codex_local_access_sidecar_continuity.rs");
+include!("codex_local_access_native_transport.rs");
+include!("codex_local_access_direct_identity.rs");
+include!("codex_local_access_official_background.rs");
+include!("codex_local_access_native_routes.rs");
+include!("codex_local_access_native_capability.rs");
+include!("codex_local_access_native_images.rs");
+include!("codex_local_access_native_diagnostics.rs");
+include!("codex_local_access_remote_protocol.rs");
+include!("codex_local_access_remote_catalog.rs");
+include!("codex_local_access_remote_analytics.rs");
+include!("codex_local_access_remote_analytics_query.rs");
+include!("codex_local_access_remote_session.rs");
+include!("codex_local_access_native_profiles.rs");
+include!("codex_local_access_service_tier_control.rs");
 include!("codex_local_access_provider_gateway.rs");
+include!("codex_local_access_provider_lifecycle.rs");
 include!("codex_local_access_provider_auth_sync.rs");
 include!("codex_local_access_instance_gateways.rs");
 include!("codex_local_access_probe_chat.rs");
 include!("codex_pelican_transport.rs");
+include!("codex_pelican_provider_transport.rs");
 include!("codex_local_access_commands.rs");
+include!("codex_local_access_claude_code.rs");
+include!("codex_local_access_capability_settings.rs");
+include!("codex_local_access_member_switch.rs");
+include!("codex_local_access_service_members.rs");
+include!("codex_local_access_official_members.rs");
 include!("codex_local_access_http.rs");
 // The retired in-process WebSocket gateway is retained only as a test oracle.
-// Production traffic is handled by the bundled CLIProxyAPI sidecar.
+// Production traffic is handled exclusively by the native Rust engine.
 #[cfg(test)]
 include!("codex_local_access_recovery.rs");
+
+#[cfg(test)]
+#[path = "codex_local_access_gateway_default_tests.rs"]
+mod gateway_default_tests;
+
+#[cfg(test)]
+#[path = "native_capability_integration_tests.rs"]
+mod native_capability_integration_tests;
 
 #[cfg(test)]
 mod tests {
@@ -35,23 +86,94 @@ mod tests {
             display_name: "DeepSeek-V4.1-Flash".into(),
             template: Some(serde_json::json!({"multi_agent_version": null,
                 "supported_reasoning_levels": [{"effort": "max"}]})),
-            image_capable: true,
+            image_capable: Some(true),
+            context_window: None,
         }];
         super::apply_profile_model_definition_overrides(&mut catalog, &definitions);
         assert_eq!(catalog["models"][0]["multi_agent_version"], "v2");
         assert_eq!(catalog["models"][0]["supported_reasoning_levels"][0]["effort"], "max");
         assert_eq!(catalog["models"][0]["input_modalities"], serde_json::json!(["text", "image"]));
     }
+
+    #[test]
+    fn profile_catalog_applies_account_context_window_after_template() {
+        let model_id = "deepseek-v4.1-flash";
+        let mut account = crate::models::codex::CodexAccount::new_api_key(
+            "account".into(),
+            "api-key-test".into(),
+            "test-key".into(),
+            crate::models::codex::CodexApiProviderMode::Custom,
+            Some("https://example.com/v1".into()),
+            None,
+            None,
+            vec![model_id.into()],
+        );
+        account.api_wire_api = Some("responses".into());
+        account
+            .api_model_context_windows
+            .insert(model_id.into(), 1_000_000);
+
+        let mut definitions = vec![super::ProfileModelDefinition {
+            model_id: model_id.into(),
+            display_name: model_id.into(),
+            template: super::codex_protocol::deepseek_model_template(model_id),
+            image_capable: Some(false),
+            context_window: None,
+        }];
+        assert_eq!(
+            definitions[0].template.as_ref().unwrap()["context_window"],
+            272_000
+        );
+        super::apply_profile_model_account_context_windows(
+            &mut definitions,
+            std::slice::from_ref(&account),
+        );
+
+        let catalog = super::build_local_access_profile_catalog(&definitions);
+        let model = catalog["models"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|model| model["slug"] == model_id)
+            .expect("profile model");
+        assert_eq!(model["context_window"], 1_000_000);
+        assert_eq!(model["max_context_window"], 1_000_000);
+        assert_eq!(model["auto_compact_token_limit"], 900_000);
+    }
+
     include!("codex_local_access_tests_automatic_routing.rs");
     include!("codex_local_access_tests_sidecar_gateway.rs");
+    include!("codex_local_access_tests_shared_api_identity.rs");
+    include!("codex_local_access_tests_pool_failure_dismissal.rs");
     include!("codex_local_access_tests_proxy.rs");
     include!("codex_local_access_tests_provider_auth_sync.rs");
     include!("codex_local_access_tests_grok_lifecycle.rs");
     include!("codex_local_access_tests_pricing_profile.rs");
+    include!("codex_local_access_tests_long_price_override.rs");
     include!("codex_local_access_tests_request_routing.rs");
     include!("codex_local_access_tests_provider_gateway_vision.rs");
     include!("codex_local_access_tests_mixed_gateway_scope.rs");
     include!("codex_local_access_tests_takeover.rs");
     include!("codex_local_access_tests_takeover_maintenance.rs");
     include!("codex_local_access_tests_internal_service.rs");
+    include!("codex_local_access_tests_provider_admission.rs");
+    include!("codex_local_access_tests_image_main_model.rs");
+    include!("codex_local_access_tests_image_sources.rs");
+    include!("codex_local_access_tests_image_model_catalog.rs");
+    include!("codex_local_access_tests_inbound_key_recovery.rs");
+    include!("codex_local_access_tests_key_recovery.rs");
+    include!("codex_local_access_tests_service_transitions.rs");
+    include!("codex_local_access_tests_project_switch.rs");
+    include!("codex_local_access_tests_timeout_config.rs");
+    include!("codex_local_access_tests_provider_activation.rs");
+    include!("codex_local_access_tests_account_references.rs");
+    include!("codex_local_access_tests_request_diagnostics.rs");
+    include!("codex_local_access_tests_output_speed.rs");
+    include!("codex_local_access_tests_service_tier_evidence.rs");
+    include!("codex_local_access_tests_service_tier_control.rs");
+    include!("codex_local_access_tests_request_diagnostics_poll.rs");
+    include!("codex_local_access_tests_pool_quota_sum.rs");
 }
+
+include!("codex_local_access_multi_agent_settings.rs");
+include!("codex_local_access_native_multi_agent.rs");

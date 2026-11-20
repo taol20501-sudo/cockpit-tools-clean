@@ -63,16 +63,7 @@ fn build_desktop_gateway_account_id(api_key: &str, api_base_url: &str) -> String
 }
 
 fn normalize_desktop_gateway_auth_scheme(value: Option<&str>) -> String {
-    match value
-        .and_then(|item| normalize_non_empty(Some(item)))
-        .map(|item| item.to_ascii_lowercase().replace('_', "-"))
-        .as_deref()
-    {
-        Some("auto") => "auto".to_string(),
-        Some("x-api-key") => "x-api-key".to_string(),
-        Some("sso") => "sso".to_string(),
-        _ => "bearer".to_string(),
-    }
+    crate::modules::claude_desktop_gateway::normalize_auth_scheme(value)
 }
 
 fn normalize_api_provider_base_url(raw: Option<&str>) -> Result<Option<String>, String> {
@@ -384,17 +375,37 @@ fn derive_oauth_snapshot_plan_type(
     let credentials_oauth = credentials_oauth(credentials_raw);
     let profile = credentials_oauth.and_then(|value| value.get("profile"));
 
+    let rate_limit_plans: Vec<String> = [
+        read_string_path(oauth_account, &["rateLimitTier"]),
+        credentials_oauth.and_then(|value| read_string_path(value, &["rateLimitTier"])),
+        profile.and_then(|value| read_string_path(value, &["organization", "rate_limit_tier"])),
+    ]
+    .into_iter()
+    .filter_map(normalize_desktop_plan_value)
+    .collect();
+
+    let refine_max = |plan: String| -> String {
+        if plan == "Max" {
+            if let Some(subtier) = rate_limit_plans
+                .iter()
+                .find(|item| matches!(item.as_str(), "Max 5x" | "Max 20x"))
+            {
+                return subtier.clone();
+            }
+        }
+        plan
+    };
+
     for raw in [
         read_string_path(oauth_account, &["subscriptionType"]),
         credentials_oauth.and_then(|value| read_string_path(value, &["subscriptionType"])),
         read_string_path(oauth_account, &["organizationType"]),
         profile.and_then(|value| read_string_path(value, &["organization", "organization_type"])),
-        read_string_path(oauth_account, &["rateLimitTier"]),
-        credentials_oauth.and_then(|value| read_string_path(value, &["rateLimitTier"])),
-        profile.and_then(|value| read_string_path(value, &["organization", "rate_limit_tier"])),
     ] {
         if let Some(plan) = normalize_desktop_plan_value(raw) {
-            return Some(plan);
+            if plan != "Free" {
+                return Some(refine_max(plan));
+            }
         }
     }
 
@@ -402,7 +413,7 @@ fn derive_oauth_snapshot_plan_type(
         .and_then(|value| read_bool_path(value, &["account", "has_claude_max"]))
         .unwrap_or(false)
     {
-        return Some("Max".to_string());
+        return Some(refine_max("Max".to_string()));
     }
     if profile
         .and_then(|value| read_bool_path(value, &["account", "has_claude_pro"]))
@@ -411,7 +422,18 @@ fn derive_oauth_snapshot_plan_type(
         return Some("Pro".to_string());
     }
 
-    None
+    for raw in [
+        read_string_path(oauth_account, &["subscriptionType"]),
+        credentials_oauth.and_then(|value| read_string_path(value, &["subscriptionType"])),
+        read_string_path(oauth_account, &["organizationType"]),
+        profile.and_then(|value| read_string_path(value, &["organization", "organization_type"])),
+    ] {
+        if let Some(plan) = normalize_desktop_plan_value(raw) {
+            return Some(plan);
+        }
+    }
+
+    rate_limit_plans.into_iter().next()
 }
 
 fn is_claude_billing_source_value(value: &str) -> bool {
@@ -441,7 +463,13 @@ fn normalize_account_plan_from_snapshots(account: &mut ClaudeAccount) -> bool {
     let should_replace = account
         .plan_type
         .as_deref()
-        .map(|value| is_claude_billing_source_value(value) || is_desktop_plan_placeholder(value))
+        .map(|value| {
+            is_claude_billing_source_value(value)
+                || is_desktop_plan_placeholder(value)
+                || (value.trim().eq_ignore_ascii_case("free") && plan_type != "Free")
+                || (value.trim().eq_ignore_ascii_case("max")
+                    && matches!(plan_type.as_str(), "Max 5x" | "Max 20x"))
+        })
         .unwrap_or(true);
     if !should_replace {
         return false;
@@ -476,6 +504,7 @@ fn derive_account_from_snapshots(
     );
     let now = now_ts_ms();
     let mut account = existing.unwrap_or_else(|| ClaudeAccount {
+        last_switched_at: None,
         id: id.clone(),
         email: email.clone(),
         auth_mode: ClaudeAuthMode::OAuth,
@@ -608,6 +637,7 @@ pub fn import_api_key(
         build_api_key_display_name(&api_key, account_name, api_provider_name.as_deref());
     let now = now_ts_ms();
     let mut account = load_account_file(&id).unwrap_or_else(|| ClaudeAccount {
+        last_switched_at: None,
         id: id.clone(),
         email: display_name.clone(),
         auth_mode: ClaudeAuthMode::ApiKey,
@@ -902,6 +932,7 @@ fn save_desktop_gateway(
     });
 
     let mut account = existing_account.unwrap_or_else(|| ClaudeAccount {
+        last_switched_at: None,
         id: id.clone(),
         email: display_name.clone(),
         auth_mode: ClaudeAuthMode::DesktopGateway,

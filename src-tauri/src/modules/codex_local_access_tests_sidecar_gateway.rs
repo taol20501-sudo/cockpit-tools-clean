@@ -38,7 +38,7 @@
     }
 
     #[test]
-    fn deepseek_provider_model_slots_include_deterministic_vision_shell() {
+    fn deepseek_provider_model_slots_keep_upstream_ids() {
         let slots = super::allocate_provider_model_slots(&[
             "deepseek-v4-flash".to_string(),
             "deepseek-v4-pro".to_string(),
@@ -48,15 +48,15 @@
             slots,
             vec![
                 super::ProviderGatewayModelSlot {
-                    client_model: "gpt-5.5".to_string(),
+                    client_model: "deepseek-v4-flash".to_string(),
                     upstream_model: "deepseek-v4-flash".to_string(),
                 },
                 super::ProviderGatewayModelSlot {
-                    client_model: "gpt-5.4".to_string(),
+                    client_model: "deepseek-v4-pro".to_string(),
                     upstream_model: "deepseek-v4-pro".to_string(),
                 },
                 super::ProviderGatewayModelSlot {
-                    client_model: "gpt-5.4-mini".to_string(),
+                    client_model: "deepseek-v4-flash-vision-exp".to_string(),
                     upstream_model: "deepseek-v4-flash-vision-exp".to_string(),
                 },
             ]
@@ -127,7 +127,7 @@
         assert!(runtime.account_health.is_empty());
         let health = runtime
             .account_pool_health
-            .get("key-1")
+            .get(&super::account_pool_route_key(&event))
             .expect("pool health should be created without an account id");
         assert!(health.diagnostic_available);
         assert_eq!(health.candidate_auths, 2);
@@ -400,8 +400,8 @@
     #[test]
     fn catalog_context_windows_keep_official_and_override_third_party() {
         let official = super::ProviderGatewayModelSlot {
-            client_model: "gpt-5.4".to_string(),
-            upstream_model: "gpt-5.4".to_string(),
+            client_model: "gpt-6.1-sol".to_string(),
+            upstream_model: "gpt-6.1-sol".to_string(),
         };
         let remapped = super::ProviderGatewayModelSlot {
             client_model: "gpt-5.6-sol".to_string(),
@@ -413,7 +413,7 @@
         };
         let catalog = serde_json::json!({
             "models": [
-                { "slug": "gpt-5.4", "context_window": 272000, "max_context_window": 272000 },
+                { "slug": "gpt-6.1-sol", "context_window": 272000, "max_context_window": 272000 },
                 { "slug": "gpt-5.6-sol", "context_window": 372000, "max_context_window": 372000 },
                 { "slug": "gpt-5.5", "context_window": 1048576, "max_context_window": 1048576 }
             ]
@@ -437,7 +437,7 @@
                 .find(|model| model["slug"] == slug)
                 .and_then(|model| model["context_window"].as_i64())
         };
-        assert_eq!(window("gpt-5.4"), Some(272000));
+        assert_eq!(window("gpt-6.1-sol"), Some(272000));
         assert_eq!(window("gpt-5.6-sol"), Some(900_000));
         assert_eq!(window("gpt-5.5"), Some(1048576));
         // 统一口径：显式写窗口时必须同时写 90% 的压缩阈值。
@@ -527,6 +527,22 @@
             .get("en")
             .and_then(serde_json::Value::as_str)
             .is_some_and(|message| message.contains("account")));
+    }
+
+    #[test]
+    fn model_scope_error_translations_preserve_model_placeholder_for_all_locales() {
+        let value = super::sidecar_localized_messages(
+            "codex.localAccess.gatewayErrors.modelNotAvailable",
+        );
+        let messages = value.as_object().expect("localized error messages");
+        assert_eq!(messages.len(), 18);
+        for (locale, message) in messages {
+            let message = message.as_str().expect("message text");
+            assert_eq!(message.matches("{{model}}").count(), 1, "{locale}");
+            if locale != "en" && locale != "en-us" {
+                assert_ne!(Some(message), messages["en"].as_str(), "{locale}");
+            }
+        }
     }
 
     #[test]
@@ -768,7 +784,7 @@
         sidecar_codex_key_config_value, sidecar_config_fingerprint,
         sidecar_config_fingerprint_with_account_proxies, account_proxy_fingerprint,
         sidecar_local_account_usable_for_start, sidecar_payload_default_service_tier,
-        sidecar_quota_reserve_snapshot_value, sidecar_routing_strategy_value, sidecar_stable_id,
+        sidecar_routing_strategy_value, sidecar_stable_id,
         sidecar_usage_event_is_client_canceled, sidecar_usage_event_should_auto_restart,
         now_ms, stats_snapshot_without_events, supported_codex_model_ids,
         sync_provider_gateway_runtime_auth_file,
@@ -789,7 +805,6 @@
         BOUND_OAUTH_QUOTA_RESERVE_MAX_SNAPSHOT_AGE_SECONDS, CODEX_AUTO_REVIEW_MODEL_ID,
         CODEX_GPT_RESERVE_MODEL_ID,
         CODEX_IMAGEGEN_ACTOR_HEADER, CODEX_IMAGE_MODEL_ID,
-        DEFAULT_CODEX_IMAGE_GENERATION_MODEL,
         CODEX_LEGACY_LOCAL_ACCESS_MODEL_CATALOG_FILE, CODEX_LEGACY_PROVIDER_MODEL_CATALOG_FILE,
         CODEX_LOCAL_ACCESS_DISABLE_HOSTED_IMAGE_GENERATION_HEADER,
         CODEX_LOCAL_ACCESS_DISABLE_HOSTED_IMAGE_GENERATION_HEADER_VALUE,
@@ -839,6 +854,7 @@
     use tokio_tungstenite::tungstenite::client::IntoClientRequest;
     use tokio_tungstenite::tungstenite::Message;
     use toml_edit::{value, Document};
+    include!("codex_local_access_tests_env_ordering.rs");
 
     #[tokio::test]
     async fn read_http_request_rejects_declared_request_above_limit() {
@@ -932,6 +948,36 @@
 
     #[tokio::test]
     async fn official_wakeup_agent_identity_recovers_invalid_task_once() {
+        const ISOLATED_MOCK: &str = "COCKPIT_TEST_AGENT_WAKEUP_ISOLATED";
+        if std::env::var_os(ISOLATED_MOCK).is_none() {
+            // This mock must use its loopback server even when the developer
+            // has an application, environment or system proxy configured.
+            let data_dir = make_temp_dir("agent-wakeup-isolated");
+            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+            #[cfg(target_os = "windows")]
+            {
+                use std::os::windows::process::CommandExt;
+                command.creation_flags(0x08000000);
+            }
+            for key in ["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"] {
+                command.env_remove(key);
+            }
+            for key in ["COCKPIT_TOOLS_TEST_DATA_DIR", "COCKPIT_TOOLS_DATA_DIR", "COCKPIT_TEST_DATA_DIR"] {
+                command.env(key, &data_dir);
+            }
+            let output = command
+                .env(ISOLATED_MOCK, "1")
+                .env("NO_PROXY", "*")
+                .env("no_proxy", "*")
+                .args(["--exact", "modules::codex_local_access::tests::official_wakeup_agent_identity_recovers_invalid_task_once", "--nocapture", "--test-threads=1"])
+                .output()
+                .expect("run wakeup mock in isolated proxy environment");
+            fs::remove_dir_all(data_dir).expect("remove wakeup mock data");
+            assert!(output.status.success(), "isolated wakeup mock failed: {}{}",
+                String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"), "wakeup assertion test must execute");
+            return;
+        }
         let account = agent_identity_wakeup_test_account();
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
@@ -1045,37 +1091,60 @@
             port: 14998,
             api_key: "local-api-key".to_string(),
             api_keys: Vec::new(),
+            account_pools: Vec::new(),
+            account_pool_revision: 0,
             access_scope: CodexLocalAccessScope::Localhost,
             client_base_url_host: CodexLocalAccessClientBaseUrlHost::default(),
             image_generation_mode: CodexLocalAccessImageGenerationMode::default(),
-            image_generation_model: DEFAULT_CODEX_IMAGE_GENERATION_MODEL.to_string(),
+            // This fixture represents an existing service that selected 2.5.
+            image_generation_model: "gpt-image-2.5".to_string(),
+        image_generation_models: crate::models::codex_local_access::default_image_generation_models(),
+        image_generation_deleted_models: Vec::new(),
+        image_generation_model_catalog_revision: 0,
+            image_generation_main_model: None,
             image_generation_account_policies: HashMap::new(),
+            chatgpt_plan_codex_image_policies: HashMap::new(),
+            chatgpt_plan_service_revision: 0,
+            paused_account_ids: Vec::new(),
+            official_account_source_ids: HashMap::new(),
+            official_account_bindings: HashMap::new(),
+        service_account_identity_fingerprints: HashMap::new(),
             image_generation_account_ids: Vec::new(),
-            gateway_mode: CodexLocalAccessGatewayMode::default(),
+        image_generation_account_models: HashMap::new(),
+            // These fixtures exercise the explicitly selected Go engine.
+            gateway_mode: CodexLocalAccessGatewayMode::Sidecar,
+            capability_fallback: Default::default(),
+        multi_agent: Default::default(),
+            native_gateway_default_migrated: true,
             upstream_proxy_url: None,
             routing_strategy: CodexLocalAccessRoutingStrategy::default(),
             custom_routing_rules: Vec::new(),
             account_model_rules: Vec::new(),
+            account_quota_floors: HashMap::new(),
             model_aliases: Vec::new(),
             suppress_oauth_model_alias: false,
             model_pricing_version: DEFAULT_MODEL_PRICING_VERSION,
             model_pricings: Vec::new(),
             excluded_models: Vec::new(),
             session_affinity: true,
+            session_identity_mapping_enabled: true,
             session_affinity_ttl_ms: DEFAULT_SESSION_AFFINITY_TTL_MS,
             session_affinity_default_enabled_migrated: true,
             responses_websockets_enabled: false,
             max_retry_credentials: 0,
             max_retry_interval_ms: DEFAULT_MAX_RETRY_INTERVAL_MS,
+            continuous_overload_retry: false,
             timeouts: CodexLocalAccessTimeouts::default(),
             active_timeout_preset_id: "long_wait".to_string(),
             timeout_presets: Vec::new(),
             disable_cooling: false,
             restrict_free_accounts: true,
             debug_logs: true,
+        request_payload_logging: false,
             immediate_sse_response: false,
             max_concurrent_image_requests: 1,
             max_account_concurrency: 0,
+            account_concurrency_default_migrated: true,
             account_concurrency_wait_ms: DEFAULT_ACCOUNT_CONCURRENCY_WAIT_MS,
             bound_oauth_account_id: None,
             bound_oauth_quota_reserve: None,
@@ -1694,7 +1763,7 @@ HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Internet Settings
     }
 
     #[test]
-    fn official_deepseek_responses_uses_shell_remap_gateway() {
+    fn official_deepseek_responses_gateway_uses_original_model_ids() {
         let mut account = CodexAccount::new_api_key(
             "local-account-id".to_string(),
             "deepseek@example.com".to_string(),
@@ -1711,6 +1780,7 @@ HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Internet Settings
         account.api_wire_api = Some("responses".to_string());
         account.api_sync_model_catalog_to_codex = true;
 
+        account.api_instance_access_mode = Some("gateway".to_string());
         assert!(account_requires_provider_gateway(&account));
         assert_eq!(
             provider_gateway_model_slots(&provider_gateway_models_for_account(&account))
@@ -1718,8 +1788,8 @@ HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Internet Settings
                 .map(|slot| (slot.client_model.as_str(), slot.upstream_model.as_str()))
                 .collect::<Vec<_>>(),
             vec![
-                ("gpt-5.5", "deepseek-v4-flash"),
-                ("gpt-5.4", "deepseek-v4-pro"),
+                ("deepseek-v4-flash", "deepseek-v4-flash"),
+                ("deepseek-v4-pro", "deepseek-v4-pro"),
             ]
         );
 
@@ -1733,6 +1803,7 @@ HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Internet Settings
     #[tokio::test]
     async fn account_pool_compaction_cleanup_does_not_enable_removed_feature() {
         let deepseek_gateway = CodexLocalAccessProviderGateway {
+        auth_scheme: None,
             base_url: "https://api.deepseek.com/v1".to_string(),
             api_key: "sk-deepseek".to_string(),
             upstream_model: "deepseek-v4-pro".to_string(),
@@ -1743,12 +1814,14 @@ HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Internet Settings
             vision_routing_model: None,
         };
         let mut key = CodexLocalAccessApiKey {
+            max_reasoning_effort: None,
             id: "provider_gateway_deepseek".to_string(),
             label: "Provider Gateway: deepseek".to_string(),
             key: "agt_test".to_string(),
             provider_gateway: Some(deepseek_gateway.clone()),
             model_routing: None,
             inherit_account_pool: Some(false),
+            account_pool_id: None,
             account_ids: Vec::new(),
             priority_account_ids: Vec::new(),
             preferred_account_id: None,
@@ -1757,6 +1830,8 @@ HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Internet Settings
             excluded_models: Vec::new(),
             token_limit: None,
             token_used: 0,
+            budget: Default::default(),
+            budget_usage: Default::default(),
             enabled: true,
             created_at: 0,
             updated_at: 0,
@@ -1768,6 +1843,7 @@ HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Internet Settings
 
         // 非 GPT 账号池与 DeepSeek 账号池都不再写已移除的压缩开关。
         key.provider_gateway = Some(CodexLocalAccessProviderGateway {
+        auth_scheme: None,
             base_url: "https://token-plan-cn.xiaomimimo.com/v1".to_string(),
             ..deepseek_gateway.clone()
         });
@@ -1777,7 +1853,7 @@ HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Internet Settings
 
         let profile_dir = make_temp_dir("codex-pool-local-compaction");
         let config_path = profile_config_path(&profile_dir);
-        let original = "model = \"gpt-5.6-sol\"\nservice_tier = \"priority\"\n\n[features]\njs_repl = false\n";
+        let original = "model = \"deepseek-v4-pro\"\nservice_tier = \"priority\"\n\n[features]\njs_repl = false\n";
         crate::modules::codex_config_format::write_codex_config_toml_atomic(
             &config_path,
             original,
@@ -1869,7 +1945,7 @@ HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Internet Settings
     }
 
     #[test]
-    fn official_template_catalog_keeps_shell_slug_and_upstream_metadata() {
+    fn official_template_catalog_keeps_deepseek_ids_and_upstream_metadata() {
         let slots = provider_gateway_model_slots(&[
             "deepseek-v4-flash".to_string(),
             "deepseek-v4-pro".to_string(),
@@ -1881,6 +1957,8 @@ HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Internet Settings
                     "display_name": "DeepSeek-V4-Flash",
                     "apply_patch_tool_type": "freeform",
                     "shell_type": "shell_command",
+                    "use_responses_lite": true,
+                    "multi_agent_version": "v1",
                     "base_instructions": "flash-instr"
                 },
                 {
@@ -1888,6 +1966,7 @@ HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Internet Settings
                     "display_name": "DeepSeek-V4-Pro",
                     "apply_patch_tool_type": "freeform",
                     "shell_type": "shell_command",
+                    "tool_mode": "code_mode_only",
                     "base_instructions": "pro-instr"
                 }
             ]
@@ -1899,9 +1978,11 @@ HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Internet Settings
             .get("models")
             .and_then(Value::as_array)
             .expect("models");
+        assert_eq!(models[0]["use_responses_lite"], false);
+        assert_eq!(models[0]["multi_agent_version"], "v1");
         assert_eq!(
             models[0].get("slug").and_then(Value::as_str),
-            Some("gpt-5.5")
+            Some("deepseek-v4-flash")
         );
         assert_eq!(
             models[0].get("display_name").and_then(Value::as_str),
@@ -1915,12 +1996,14 @@ HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Internet Settings
         );
         assert_eq!(
             models[1].get("slug").and_then(Value::as_str),
-            Some("gpt-5.4")
+            Some("deepseek-v4-pro")
         );
         assert_eq!(
             models[1].get("display_name").and_then(Value::as_str),
             Some("DeepSeek-V4-Pro")
         );
+        assert_eq!(models[1]["tool_mode"], "direct");
+        assert_eq!(models[1]["shell_type"], "shell_command");
     }
 
     #[test]
@@ -1940,18 +2023,17 @@ HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Internet Settings
 
         assert!(!account_requires_provider_gateway(&account));
         assert!(!account_requires_bound_oauth_local_gateway(&account));
-        assert!(is_local_access_eligible_account(&account, false));
+        assert!(is_local_access_eligible_account(&account));
 
         account.bound_oauth_use_local_gateway = true;
         assert!(!account_requires_provider_gateway(&account));
-        // 绑定 OAuth：不走本地网关路径（与改前一致）
         assert!(!account_requires_bound_oauth_local_gateway(&account));
-        assert!(is_local_access_eligible_account(&account, false));
+        assert!(is_local_access_eligible_account(&account));
 
         account.bound_oauth_account_id = None;
         assert!(!account_requires_provider_gateway(&account));
         assert!(!account_requires_bound_oauth_local_gateway(&account));
-        assert!(is_local_access_eligible_account(&account, false));
+        assert!(is_local_access_eligible_account(&account));
     }
 
     #[test]
@@ -2019,6 +2101,35 @@ HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Internet Settings
     }
 
     #[test]
+    fn provider_gateway_models_fill_empty_catalog_for_exact_official_endpoints() {
+        for (base_url, expected_model) in [
+            ("https://ark.cn-beijing.volces.com/api/coding/v3", "ark-code-latest"),
+            ("https://ark.cn-beijing.volces.com/api/v3", "doubao-seed-2-1-pro-260915"),
+            ("https://api.xiaomimimo.com/v1", "mimo-v2.6-pro"),
+            ("https://token-plan-cn.xiaomimimo.com/v1/", "mimo-v2.6-pro"),
+        ] {
+            let mut account = CodexAccount::new_api_key(
+                "local-account-id".to_string(),
+                "custom@example.com".to_string(),
+                "sk-test".to_string(),
+                CodexApiProviderMode::Custom,
+                Some(base_url.to_string()),
+                None,
+                None,
+                Vec::new(),
+            );
+            assert_eq!(provider_gateway_default_model_for_account(&account), expected_model);
+
+            account.api_model_catalog = vec!["user-selected-model".to_string()];
+            assert_eq!(provider_gateway_models_for_account(&account), vec!["user-selected-model"]);
+
+            account.api_model_catalog.clear();
+            account.api_base_url = Some(format!("https://relay.example/{base_url}"));
+            assert!(provider_gateway_models_for_account(&account).is_empty());
+        }
+    }
+
+    #[test]
     fn provider_gateway_models_empty_for_unknown_provider_without_catalog() {
         let account = CodexAccount::new_api_key(
             "local-account-id".to_string(),
@@ -2038,10 +2149,10 @@ HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Internet Settings
     #[test]
     fn provider_gateway_model_slots_are_stable_and_bounded() {
         let slots = provider_gateway_model_slots(&[
-            "deepseek-v4-pro".to_string(),
-            "deepseek-v4-flash".to_string(),
-            "deepseek-v4-lite".to_string(),
-            "deepseek-v4-extra".to_string(),
+            "vendor-pro".to_string(),
+            "vendor-flash".to_string(),
+            "vendor-lite".to_string(),
+            "vendor-extra".to_string(),
             "gpt-5.5".to_string(),
             "custom-overflow-a".to_string(),
             "custom-overflow-b".to_string(),
@@ -2057,15 +2168,16 @@ HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Internet Settings
                 .map(|slot| (slot.client_model.as_str(), slot.upstream_model.as_str()))
                 .collect::<Vec<_>>(),
             vec![
+                // Explicit API-key models retain identity ahead of assigned shells.
                 ("gpt-5.5", "gpt-5.5"),
-                ("gpt-5.6-sol", "deepseek-v4-pro"),
-                ("gpt-5.6-terra", "deepseek-v4-flash"),
-                ("gpt-5.6-luna", "deepseek-v4-lite"),
-                ("gpt-5.4", "deepseek-v4-extra"),
-                ("gpt-5.4-mini", "custom-overflow-a"),
-                ("gpt-5.3-codex", "custom-overflow-b"),
-                ("gpt-5.3-codex-spark", "custom-overflow-c"),
-                ("gpt-5.2", "custom-overflow-d"),
+                ("gpt-5.6-sol", "vendor-pro"),
+                ("gpt-5.6-terra", "vendor-flash"),
+                ("gpt-5.6-luna", "vendor-lite"),
+                ("vendor-extra", "vendor-extra"),
+                ("custom-overflow-a", "custom-overflow-a"),
+                ("custom-overflow-b", "custom-overflow-b"),
+                ("custom-overflow-c", "custom-overflow-c"),
+                ("custom-overflow-d", "custom-overflow-d"),
                 // Shell pool exhausted: keep upstream IDs so all models remain listed.
                 ("custom-overflow-e", "custom-overflow-e"),
                 ("custom-overflow-f", "custom-overflow-f"),
@@ -2078,7 +2190,7 @@ HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Internet Settings
     fn provider_gateway_model_slots_keep_identity_for_official_shells() {
         let slots = provider_gateway_model_slots(&[
             "gpt-5.6-sol".to_string(),
-            "gpt-5.5".to_string(),
+            "gpt-5.6-luna".to_string(),
             "grok-4.5".to_string(),
         ]);
         assert_eq!(
@@ -2088,7 +2200,7 @@ HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Internet Settings
                 .collect::<Vec<_>>(),
             vec![
                 ("gpt-5.6-sol", "gpt-5.6-sol"),
-                ("gpt-5.5", "gpt-5.5"),
+                ("gpt-5.6-luna", "gpt-5.6-luna"),
                 ("gpt-5.6-terra", "grok-4.5"),
             ]
         );
@@ -2097,6 +2209,7 @@ HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Internet Settings
     #[test]
     fn provider_gateway_model_slots_keep_identity_for_gpt_6_family() {
         let slots = provider_gateway_model_slots(&[
+            "gpt-6.1-sol".to_string(),
             "gpt-6-astra".to_string(),
             "gpt-6-sol".to_string(),
             "gpt-6-luna".to_string(),
@@ -2104,6 +2217,10 @@ HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Internet Settings
         assert_eq!(
             slots,
             vec![
+                super::ProviderGatewayModelSlot {
+                    client_model: "gpt-6.1-sol".to_string(),
+                    upstream_model: "gpt-6.1-sol".to_string(),
+                },
                 super::ProviderGatewayModelSlot {
                     client_model: "gpt-6-astra".to_string(),
                     upstream_model: "gpt-6-astra".to_string(),
@@ -2137,15 +2254,14 @@ HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Internet Settings
         account.api_sync_model_catalog_to_codex = true;
 
         assert!(account_requires_provider_gateway(&account));
-        assert!(is_local_access_eligible_account(&account, true));
-        assert_eq!(local_access_ineligible_reason(&account, true), None);
+        assert!(is_local_access_eligible_account(&account));
+        assert_eq!(local_access_ineligible_reason(&account), None);
 
         let account_id = account.id.clone();
         let (next_ids, synced_ids, added_ids, skipped) = append_eligible_local_access_account_ids(
             &[],
             vec![account_id.clone()],
             &[account],
-            true,
         );
         assert_eq!(next_ids, vec![account_id.clone()]);
         assert_eq!(synced_ids, vec![account_id.clone()]);
@@ -2163,7 +2279,7 @@ HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Internet Settings
             Some("https://api.apikey.fun/v1".to_string()),
             Some("apikey_fun".to_string()),
             Some("APIKEY.FUN".to_string()),
-            vec!["gpt-5.5".to_string(), "gpt-5.6-sol".to_string()],
+            vec!["gpt-5.6-luna".to_string(), "gpt-5.6-sol".to_string()],
         );
         account.api_wire_api = Some("responses".to_string());
         account.api_sync_model_catalog_to_codex = true;
@@ -2189,7 +2305,7 @@ HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Internet Settings
             .collect::<Vec<_>>();
         backup_current_profile_model_before_provider_gateway(&profile_dir, &client_models)
             .expect("track provider models");
-        write_local_access_profile_model_override(&profile_dir, "gpt-5.5")
+        write_local_access_profile_model_override(&profile_dir, "deepseek-v4-flash")
             .expect("write model override");
         write_provider_gateway_model_catalog(&profile_dir, &slots)
             .expect("write provider model catalog");
@@ -2204,8 +2320,8 @@ HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Internet Settings
             .and_then(Value::as_array)
             .expect("models should be an array");
         for (model_id, display_name) in [
-            ("gpt-5.5", "deepseek-v4-flash"),
-            ("gpt-5.4", "deepseek-v4-pro"),
+            ("deepseek-v4-flash", "deepseek-v4-flash"),
+            ("deepseek-v4-pro", "deepseek-v4-pro"),
         ] {
             assert!(models.iter().any(|model| {
                 model.get("slug").and_then(Value::as_str) == Some(model_id)
@@ -2219,14 +2335,14 @@ HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Internet Settings
             "model_catalog_json = \"{}\"",
             CODEX_PROVIDER_MODEL_CATALOG_FILE
         )));
-        assert!(config.contains("model = \"gpt-5.5\""));
+        assert!(config.contains("model = \"deepseek-v4-flash\""));
 
         cleanup_provider_gateway_profile_model_overrides(&profile_dir).expect("cleanup overrides");
 
         let config =
             fs::read_to_string(profile_dir.join(CODEX_PROFILE_CONFIG_FILE)).expect("read config");
         assert!(!config.contains("model_catalog_json"));
-        assert!(!config.contains("model = \"gpt-5.6-sol\""));
+        assert!(!config.contains("model = \"deepseek-v4-flash\""));
         assert!(!profile_dir
             .join(CODEX_LEGACY_PROVIDER_MODEL_CATALOG_FILE)
             .exists());
@@ -2305,7 +2421,8 @@ HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Internet Settings
             fs::read_to_string(profile_dir.join(CODEX_PROFILE_CONFIG_FILE)).expect("read config");
         assert!(!config.contains("model_catalog_json"));
         assert!(!config.contains("model = \"deepseek-v4-pro\""));
-        assert!(config.contains("model = \"gpt-5.5\""));
+        assert!(config.contains("model = \"gpt-5.6-sol\""));
+        assert!(!config.contains("gpt-5.5"));
 
         let _ = fs::remove_dir_all(&profile_dir);
     }
@@ -2345,7 +2462,8 @@ HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Internet Settings
             fs::read_to_string(profile_dir.join(CODEX_PROFILE_CONFIG_FILE)).expect("read config");
         assert!(!config.contains("model_catalog_json"));
         assert!(!config.contains("model = \"deepseek-v4-pro\""));
-        assert!(config.contains("model = \"gpt-5.5\""));
+        assert!(config.contains("model = \"gpt-5.6-sol\""));
+        assert!(!config.contains("gpt-5.5"));
 
         let _ = fs::remove_dir_all(&profile_dir);
     }
@@ -2378,7 +2496,8 @@ HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Internet Settings
 
         let config =
             fs::read_to_string(profile_dir.join(CODEX_PROFILE_CONFIG_FILE)).expect("read config");
-        assert!(config.contains("model = \"gpt-5.5\""));
+        assert!(config.contains("model = \"gpt-5.6-sol\""));
+        assert!(!config.contains("gpt-5.5"));
         assert!(!config.contains("model_catalog_json"));
 
         let _ = fs::remove_dir_all(&profile_dir);
@@ -2603,7 +2722,8 @@ http_headers = { "x-cockpit-instance-id" = "default" }
         collection.bound_oauth_quota_reserve = Some(CodexLocalAccessQuotaReserve {
             hourly_percent: 20,
             weekly_percent: 30,
-        });
+            strict: false, safety_margin_percent: 3,
+});
 
         let changed = remove_account_refs_from_collection(
             &mut collection,
@@ -2942,269 +3062,10 @@ http_headers = { "x-cockpit-instance-id" = "default" }
         );
     }
 
-    #[test]
-    fn sidecar_fingerprint_ignores_dynamic_quota_snapshot_changes() {
-        let config = r#"{"host":"127.0.0.1","port":58393}"#;
-        let manifest_available_high = r#"{
-          "accounts": [{
-            "id": "account-a",
-            "quotaReserve": {
-              "hourlyThresholdPercent": 10,
-              "weeklyThresholdPercent": 20,
-              "snapshotUpdatedAtUnixSeconds": 100,
-              "hourlyRemainingPercent": 50,
-              "weeklyRemainingPercent": 60,
-              "hourlyWindowPresent": true,
-              "weeklyWindowPresent": true
-            }
-          }]
-        }"#;
-        let manifest_available_low = r#"{
-          "accounts": [{
-            "id": "account-a",
-            "quotaReserve": {
-              "hourlyThresholdPercent": 10,
-              "weeklyThresholdPercent": 20,
-              "snapshotUpdatedAtUnixSeconds": 100,
-              "hourlyRemainingPercent": 11,
-              "weeklyRemainingPercent": 21,
-              "hourlyWindowPresent": true,
-              "weeklyWindowPresent": true
-            }
-          }]
-        }"#;
-        let manifest_new_snapshot = r#"{
-          "accounts": [{
-            "id": "account-a",
-            "quotaReserve": {
-              "hourlyThresholdPercent": 10,
-              "weeklyThresholdPercent": 20,
-              "snapshotUpdatedAtUnixSeconds": 200,
-              "hourlyRemainingPercent": 11,
-              "weeklyRemainingPercent": 21,
-              "hourlyWindowPresent": true,
-              "weeklyWindowPresent": true
-            }
-          }]
-        }"#;
-        let manifest_blocked = r#"{
-          "accounts": [{
-            "id": "account-a",
-            "quotaReserve": {
-              "hourlyThresholdPercent": 10,
-              "weeklyThresholdPercent": 20,
-              "snapshotUpdatedAtUnixSeconds": 100,
-              "hourlyRemainingPercent": 10,
-              "weeklyRemainingPercent": 21,
-              "hourlyWindowPresent": true,
-              "weeklyWindowPresent": true
-            }
-          }]
-        }"#;
-        let manifest_threshold_changed = r#"{
-          "accounts": [{
-            "id": "account-a",
-            "quotaReserve": {
-              "hourlyThresholdPercent": 15,
-              "weeklyThresholdPercent": 20,
-              "snapshotUpdatedAtUnixSeconds": 100,
-              "hourlyRemainingPercent": 50,
-              "weeklyRemainingPercent": 60,
-              "hourlyWindowPresent": true,
-              "weeklyWindowPresent": true
-            }
-          }]
-        }"#;
 
-        assert_eq!(
-            sidecar_config_fingerprint(config, manifest_available_high),
-            sidecar_config_fingerprint(config, manifest_available_low)
-        );
-        assert_eq!(
-            sidecar_config_fingerprint(config, manifest_available_low),
-            sidecar_config_fingerprint(config, manifest_new_snapshot)
-        );
-        assert_eq!(
-            sidecar_config_fingerprint(config, manifest_available_low),
-            sidecar_config_fingerprint(config, manifest_blocked)
-        );
-        assert_ne!(
-            sidecar_config_fingerprint(config, manifest_available_high),
-            sidecar_config_fingerprint(config, manifest_threshold_changed)
-        );
-    }
 
-    #[test]
-    fn bound_oauth_quota_reserve_blocks_at_threshold_and_fails_closed() {
-        let reserve = CodexLocalAccessQuotaReserve {
-            hourly_percent: 20,
-            weekly_percent: 10,
-        };
-        let blocked =
-            test_oauth_account_with_quota("account-bound", 20, 90, Some(true), Some(true));
-        assert!(bound_oauth_quota_reserve_blocks_account(
-            &reserve,
-            Some(&blocked)
-        ));
 
-        let available =
-            test_oauth_account_with_quota("account-bound", 21, 11, Some(true), Some(true));
-        assert!(!bound_oauth_quota_reserve_blocks_account(
-            &reserve,
-            Some(&available)
-        ));
 
-        let ignored_hourly =
-            test_oauth_account_with_quota("account-bound", 0, 11, Some(false), Some(true));
-        assert!(!bound_oauth_quota_reserve_blocks_account(
-            &reserve,
-            Some(&ignored_hourly)
-        ));
-        assert!(bound_oauth_quota_reserve_blocks_account(&reserve, None));
-
-        let mut quota_error = available;
-        quota_error.quota_error = Some(CodexQuotaErrorInfo {
-            code: Some("quota_refresh_failed".to_string()),
-            message: "refresh failed".to_string(),
-            timestamp: 1,
-        });
-        assert!(bound_oauth_quota_reserve_blocks_account(
-            &reserve,
-            Some(&quota_error)
-        ));
-
-        let mut stale =
-            test_oauth_account_with_quota("account-stale", 80, 80, Some(true), Some(true));
-        stale.usage_updated_at = Some(
-            chrono::Utc::now().timestamp() - BOUND_OAUTH_QUOTA_RESERVE_MAX_SNAPSHOT_AGE_SECONDS - 1,
-        );
-        assert!(bound_oauth_quota_reserve_blocks_account(
-            &reserve,
-            Some(&stale)
-        ));
-
-        let mut missing_timestamp =
-            test_oauth_account_with_quota("account-missing", 80, 80, Some(true), Some(true));
-        missing_timestamp.usage_updated_at = None;
-        assert!(bound_oauth_quota_reserve_blocks_account(
-            &reserve,
-            Some(&missing_timestamp)
-        ));
-
-        let mut future_timestamp =
-            test_oauth_account_with_quota("account-future", 80, 80, Some(true), Some(true));
-        future_timestamp.usage_updated_at = Some(chrono::Utc::now().timestamp() + 60);
-        assert!(bound_oauth_quota_reserve_blocks_account(
-            &reserve,
-            Some(&future_timestamp)
-        ));
-
-        let transient =
-            test_oauth_account_with_quota("account-transient", 80, 80, Some(true), Some(true));
-        bound_oauth_quota_refresh_failures()
-            .lock()
-            .unwrap()
-            .insert(transient.id.clone());
-        assert!(bound_oauth_quota_reserve_blocks_account(
-            &reserve,
-            Some(&transient)
-        ));
-        bound_oauth_quota_refresh_failures()
-            .lock()
-            .unwrap()
-            .remove(&transient.id);
-    }
-
-    #[test]
-    fn bound_oauth_quota_reserve_filters_only_the_bound_account() {
-        let reserve = CodexLocalAccessQuotaReserve {
-            hourly_percent: 20,
-            weekly_percent: 10,
-        };
-        let blocked =
-            test_oauth_account_with_quota("account-bound", 20, 90, Some(true), Some(true));
-        let scoped = vec!["account-bound".to_string(), "account-other".to_string()];
-
-        assert_eq!(
-            filter_bound_oauth_quota_reserve_account(
-                scoped,
-                "account-bound",
-                &reserve,
-                Some(&blocked),
-            ),
-            vec!["account-other"]
-        );
-    }
-
-    #[test]
-    fn sidecar_manifest_keeps_thresholds_and_snapshot_state_is_separate() {
-        let mut collection = test_local_access_collection(vec!["account-bound".to_string()]);
-        collection.bound_oauth_account_id = Some("account-bound".to_string());
-        collection.bound_oauth_quota_reserve = Some(CodexLocalAccessQuotaReserve {
-            hourly_percent: 20,
-            weekly_percent: 10,
-        });
-        let account =
-            test_oauth_account_with_quota("account-bound", 75, 40, Some(true), Some(false));
-
-        let manifest = sidecar_account_manifest_value(&account, Some("auth.json"), &collection);
-        let reserve = manifest
-            .get("quotaReserve")
-            .expect("quota reserve should exist");
-        assert_eq!(reserve["hourlyThresholdPercent"], json!(20));
-        assert_eq!(reserve["weeklyThresholdPercent"], json!(10));
-        assert!(reserve.get("snapshotUpdatedAtUnixSeconds").is_none());
-        assert!(reserve.get("hourlyRemainingPercent").is_none());
-
-        let snapshot = sidecar_quota_reserve_snapshot_value(&collection, &account)
-            .expect("quota reserve snapshot should exist");
-        assert_eq!(
-            snapshot["snapshotUpdatedAtUnixSeconds"],
-            json!(account.usage_updated_at)
-        );
-        assert_eq!(snapshot["hourlyRemainingPercent"], json!(75));
-        assert_eq!(snapshot["weeklyRemainingPercent"], json!(40));
-        assert_eq!(snapshot["hourlyWindowPresent"], json!(true));
-        assert_eq!(snapshot["weeklyWindowPresent"], json!(false));
-    }
-
-    #[test]
-    fn sidecar_fingerprint_ignores_all_dynamic_reserve_states() {
-        let config = r#"{"host":"127.0.0.1","port":58393}"#;
-        let manifest = |remaining: Value| {
-            json!({
-                "accounts": [{
-                    "id": "account-a",
-                    "quotaReserve": {
-                        "hourlyThresholdPercent": 20,
-                        "weeklyThresholdPercent": 10,
-                        "hourlyRemainingPercent": remaining,
-                        "weeklyRemainingPercent": 80,
-                        "hourlyWindowPresent": true,
-                        "weeklyWindowPresent": true
-                    }
-                }]
-            })
-            .to_string()
-        };
-        let available_80 = manifest(json!(80));
-        let available_70 = manifest(json!(70));
-        let blocked_20 = manifest(json!(20));
-        let unknown = manifest(Value::Null);
-
-        assert_eq!(
-            sidecar_config_fingerprint(config, &available_80),
-            sidecar_config_fingerprint(config, &available_70)
-        );
-        assert_eq!(
-            sidecar_config_fingerprint(config, &available_70),
-            sidecar_config_fingerprint(config, &blocked_20)
-        );
-        assert_eq!(
-            sidecar_config_fingerprint(config, &blocked_20),
-            sidecar_config_fingerprint(config, &unknown)
-        );
-    }
 
     #[test]
     fn account_model_rules_block_matching_model_only() {
@@ -3559,7 +3420,6 @@ http_headers = { "x-cockpit-instance-id" = "default" }
                 "missing".to_string(),
             ],
             &[existing.clone(), added, free.clone(), chat],
-            true,
         );
 
         assert_eq!(
@@ -3568,23 +3428,21 @@ http_headers = { "x-cockpit-instance-id" = "default" }
                 existing.id.clone(),
                 "preserved".to_string(),
                 "added".to_string(),
+                free.id.clone(),
                 "chat".to_string()
             ]
         );
         assert_eq!(
             synced_ids,
-            vec![existing.id, "added".to_string(), "chat".to_string()]
+            vec![existing.id, "added".to_string(), free.id.clone(), "chat".to_string()]
         );
-        assert_eq!(added_ids, vec!["added".to_string(), "chat".to_string()]);
+        assert_eq!(added_ids, vec!["added".to_string(), free.id, "chat".to_string()]);
         assert_eq!(
             skipped
                 .iter()
                 .map(|item| (item.account_id.as_str(), item.reason.as_str()))
                 .collect::<Vec<_>>(),
-            vec![
-                (free.id.as_str(), "free_restricted"),
-                ("missing", "not_found"),
-            ]
+            vec![("missing", "not_found")]
         );
     }
 
@@ -3597,9 +3455,9 @@ http_headers = { "x-cockpit-instance-id" = "default" }
         pending.tokens.id_token = String::new();
         pending.tokens.refresh_token = None;
 
-        assert!(!is_local_access_eligible_account(&pending, true));
+        assert!(!is_local_access_eligible_account(&pending));
         assert_eq!(
-            local_access_ineligible_reason(&pending, true),
+            local_access_ineligible_reason(&pending),
             Some("pending_oauth")
         );
 
@@ -3607,7 +3465,6 @@ http_headers = { "x-cockpit-instance-id" = "default" }
             &[],
             vec![pending.id.clone()],
             &[pending.clone()],
-            true,
         );
         assert!(next_ids.is_empty());
         assert!(synced_ids.is_empty());
@@ -3636,12 +3493,11 @@ http_headers = { "x-cockpit-instance-id" = "default" }
             chatgpt_account_is_fedramp: false,
         });
 
-        assert!(is_local_access_eligible_account(&account, true));
+        assert!(is_local_access_eligible_account(&account));
         let (_, synced_ids, added_ids, skipped) = append_eligible_local_access_account_ids(
             &[],
             vec![account.id.clone()],
             &[account.clone()],
-            true,
         );
         assert_eq!(synced_ids, vec![account.id.clone()]);
         assert_eq!(added_ids, vec![account.id]);
@@ -3957,10 +3813,12 @@ http_headers = { "x-cockpit-instance-id" = "default" }
     fn provider_gateway_api_key_disables_profile_websockets() {
         let mut collection = test_local_access_collection(Vec::new());
         collection.api_keys.push(CodexLocalAccessApiKey {
+            max_reasoning_effort: None,
             id: "provider_gateway_deepseek".to_string(),
             label: "Provider Gateway: DeepSeek".to_string(),
             key: "deepseek-local-key".to_string(),
             provider_gateway: Some(CodexLocalAccessProviderGateway {
+        auth_scheme: None,
                 base_url: "https://api.deepseek.com/v1".to_string(),
                 api_key: "sk-deepseek".to_string(),
                 upstream_model: "deepseek-v4-pro".to_string(),
@@ -3972,6 +3830,7 @@ http_headers = { "x-cockpit-instance-id" = "default" }
         }),
             model_routing: None,
             inherit_account_pool: Some(false),
+            account_pool_id: None,
             account_ids: vec!["deepseek-account".to_string()],
             priority_account_ids: Vec::new(),
             preferred_account_id: None,
@@ -3980,6 +3839,8 @@ http_headers = { "x-cockpit-instance-id" = "default" }
             excluded_models: Vec::new(),
             token_limit: None,
             token_used: 0,
+            budget: Default::default(),
+            budget_usage: Default::default(),
             enabled: true,
             created_at: 0,
             updated_at: 0,
@@ -4010,6 +3871,7 @@ http_headers = { "x-cockpit-instance-id" = "default" }
                 namespace: "cpa".to_string(),
                 provider_account_id: "cpa-account".to_string(),
                 provider_gateway: CodexLocalAccessProviderGateway {
+        auth_scheme: None,
                     base_url: "https://cpa.example.com/v1".to_string(),
                     api_key: "sk-cpa".to_string(),
                     upstream_model: "gpt-5.5".to_string(),
@@ -4158,6 +4020,8 @@ http_headers = { "x-cockpit-instance-id" = "default" }
                 model_id: "gpt-5.6-luna".to_string(),
                 display_name: "5.6 Luna".to_string(),
                 reasoning_efforts: None,
+                default_reasoning_effort: None,
+                ultra_reasoning_effort: None,
                 context_window: Some(516000),
                 auto_compact_token_limit: Some(460000),
             },
@@ -4165,6 +4029,8 @@ http_headers = { "x-cockpit-instance-id" = "default" }
                 model_id: "gpt-reserve".to_string(),
                 display_name: "GPT-5.6 Reserve".to_string(),
                 reasoning_efforts: None,
+                default_reasoning_effort: None,
+                ultra_reasoning_effort: None,
                 context_window: None,
                 auto_compact_token_limit: None,
             },
@@ -4182,6 +4048,7 @@ http_headers = { "x-cockpit-instance-id" = "default" }
             vec![
                 "deepseek-flash",
                 "deepseek-v4-pro",
+                "grok-4.7",
                 "grok-4.6",
                 "grok-4.5",
                 "grok-4.3",
@@ -4194,8 +4061,11 @@ http_headers = { "x-cockpit-instance-id" = "default" }
         );
 
         let mut with_context = overlaid.clone();
-        with_context[2].context_window = Some(1_000_000);
-        with_context[2].auto_compact_token_limit = Some(900_000);
+        let grok_46 = with_context.iter_mut()
+            .find(|model| model.model_id == "grok-4.6")
+            .expect("grok-4.6 remains in the upgraded default catalog");
+        grok_46.context_window = Some(1_000_000);
+        grok_46.auto_compact_token_limit = Some(900_000);
         let preserved = super::overlay_rendered_pool_models_on_experimental_catalog(
             &profile_dir,
             with_context,
@@ -4209,3 +4079,5 @@ http_headers = { "x-cockpit-instance-id" = "default" }
 
         fs::remove_dir_all(profile_dir).expect("cleanup overlay profile");
     }
+
+    include!("codex_local_access_tests_sidecar_reserve.rs");

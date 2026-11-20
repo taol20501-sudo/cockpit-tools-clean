@@ -129,7 +129,7 @@ pub async fn active_controllers(account_id: &str) -> Vec<(&'static str, EngineCo
         .tunnel
         .as_ref()
         .filter(|tunnel| tunnel.is_running())
-        .map(|tunnel| vec![("account", tunnel.controller())])
+        .map(|tunnel| vec![(if super::codex_client_proxy::route_target(account_id).is_some() { "desktop" } else { "account" }, tunnel.controller())])
         .unwrap_or_default()
 }
 
@@ -492,7 +492,10 @@ async fn read_with_limit<T: Send + 'static>(
     .map_err(|_| "PROXY_RUNTIME_FAILED".to_owned())
 }
 
-async fn load_stored(account_id: &str) -> Result<CodexAccount, String> {
+pub(crate) async fn load_stored(account_id: &str) -> Result<CodexAccount, String> {
+    if let Some(target) = super::codex_client_proxy::route_target(account_id) {
+        return Box::pin(super::codex_client_proxy::load_route(target)).await;
+    }
     let account_id = account_id.to_string();
     read_with_limit(
         READS.clone(),
@@ -502,6 +505,10 @@ async fn load_stored(account_id: &str) -> Result<CodexAccount, String> {
     )
     .await?
     .ok_or_else(|| "PROXY_ACCOUNT_UNSUPPORTED".to_string())
+}
+
+pub(crate) async fn stored_accounts() -> Result<Vec<CodexAccount>, String> {
+    read_with_limit(READS.clone(), READ_QUEUE_TIMEOUT, READ_TOTAL_TIMEOUT, codex_account::list_accounts).await
 }
 
 pub(crate) async fn ensure_account_proxy_state(account: &CodexAccount) -> Result<(), String> {
@@ -673,13 +680,46 @@ async fn ensure_target(
         drop(old);
         super::codex_proxy_activity::attach_if_enabled(
             account_id,
-            "account",
+            if super::codex_client_proxy::route_target(account_id).is_some() { "desktop" } else { "account" },
             candidate.controller(),
         );
         // The stable entry and its observation endpoint survive engine replacement;
         // restarting the API gateway here would interrupt unrelated active requests.
         return Ok(Some((candidate.proxy_url().to_string(), Some(candidate))));
     }
+}
+
+/// Prepare a card-specific client route without mutating ordinary account/upstream state.
+pub(crate) struct ClientBindingCandidate {
+    slot: Option<Arc<tokio::sync::Mutex<Runtime>>>,
+    tunnel: Option<Arc<DesktopTunnel>>,
+}
+pub(crate) async fn prepare_client_binding(id: &str, value: Option<&str>) -> Result<ClientBindingCandidate, String> {
+    let Some(value) = value else { return Ok(ClientBindingCandidate { slot: existing_slot(id)?, tunnel: None }); };
+    super::codex_proxy_engine_preflight::for_url(value, super::codex_proxy_engine_preflight::Usage::Desktop).await?;
+    if is_direct(value) { return Ok(ClientBindingCandidate { slot: existing_slot(id)?, tunnel: None }); }
+    let reserved = slot(id)?;
+    let _permit = tokio::time::timeout(Duration::from_secs(12), STARTS.acquire()).await
+        .map_err(|_| "PROXY_ENGINE_TIMEOUT")?.map_err(|_| "PROXY_RUNTIME_FAILED")?;
+    Ok(ClientBindingCandidate { slot: Some(reserved), tunnel: Some(Arc::new(DesktopTunnel::new(codex_proxy_engine::start(value).await?, value))) })
+}
+
+pub(crate) async fn publish_client_binding(id: &str, value: Option<&str>, candidate: ClientBindingCandidate) -> Result<(), String> {
+    let controller = candidate.tunnel.as_ref().map(|tunnel| tunnel.controller());
+    let shared = candidate.slot.or(existing_slot(id)?);
+    if let Some(shared) = shared {
+        let mut state = shared.lock().await;
+        let old = std::mem::replace(&mut state.tunnel, candidate.tunnel);
+        state.signature = value.map(signature).unwrap_or_default();
+        state.account_start_generation = state.account_start_generation.wrapping_add(1);
+        state.account_starting = false;
+        drop(state);
+        drop(old);
+    }
+    if let Some(controller) = controller {
+        super::codex_proxy_activity::attach_if_enabled(id, "desktop", controller);
+    }
+    Ok(())
 }
 
 /// A new node must start before durable binding replaces the old one. On failure,
@@ -830,6 +870,44 @@ pub async fn clear_binding_if_source(
     Ok(Some(account))
 }
 
+/// Apply source network settings without replacing a frozen account's nodes or choices.
+pub async fn sync_source_network(
+    source_id: &str,
+    network: super::codex_proxy_network::NetworkOptions,
+) -> Result<(), String> {
+    use super::codex_proxy_catalog_binding as binding;
+
+    let source = source_id.to_owned();
+    let account_ids = read_with_limit(READS.clone(), READ_QUEUE_TIMEOUT, READ_TOTAL_TIMEOUT, move || {
+        Ok::<_, String>(codex_account::list_accounts_for_proxy_removal()?
+            .into_iter()
+            .filter(codex_account_proxy::eligible)
+            .filter(|account| account.egress_proxy_url.as_deref().is_some_and(|raw| {
+                binding::belongs_to_source(raw, &source)
+            }))
+            .map(|account| account.id)
+            .collect::<Vec<_>>())
+    }).await??;
+    for account_id in account_ids {
+        let source = source_id.to_owned();
+        let network = network.clone();
+        let token_lock = codex_account::codex_token_lock_for(&account_id);
+        persist_binding_mutation(token_lock, move || {
+            let Some(account) = codex_account::load_account_checked(&account_id)? else { return Ok(()); };
+            let Some(raw) = account.egress_proxy_url.as_deref().filter(|raw| {
+                codex_account_proxy::eligible(&account) && binding::belongs_to_source(raw, &source)
+            }) else { return Ok(()); };
+            let updated = binding::with_network(raw, network)?;
+            if updated != raw {
+                codex_account::update_account_egress_proxy(&account_id, Some(updated), false)?;
+            }
+            // The stable entry picks up the new snapshot on its next connection.
+            Ok(())
+        }).await?;
+    }
+    Ok(())
+}
+
 /// 统一代理开关或出口变化后，让所有已缓存的隧道回到「待重建」状态。
 ///
 /// 只失效、不预启动：真正需要出口的入口（切号、启动、sidecar 组装）会在自己的
@@ -850,13 +928,14 @@ pub async fn invalidate_changed_bindings() {
         };
         let previous_signature = state.signature.clone();
         drop(state);
-        let account = tauri::async_runtime::spawn_blocking({
-            let account_id = account_id.clone();
-            move || codex_account::load_account(&account_id)
-        })
-        .await
-        .ok()
-        .flatten();
+        let account = if super::codex_client_proxy::route_target(&account_id).is_some() {
+            match load(&account_id).await { Ok(account) => Some(account), Err(_) => continue }
+        } else {
+            tauri::async_runtime::spawn_blocking({
+                let account_id = account_id.clone();
+                move || codex_account::load_account(&account_id)
+            }).await.ok().flatten()
+        };
         let desired = match account
             .as_ref()
             .map(codex_account_proxy::configured_url)

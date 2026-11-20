@@ -62,6 +62,14 @@ pub struct NetworkConfig {
     pub global_proxy_no_proxy: String,
 }
 
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NetworkConfigSaveResult {
+    pub needs_restart: bool,
+    pub report_actual_port: Option<u16>,
+    pub report_error: Option<String>,
+}
+
 /// 通用设置配置（前端使用）
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GeneralConfig {
@@ -85,10 +93,13 @@ pub struct GeneralConfig {
     pub auto_refresh_minutes: i32,
     /// Codex 自动刷新间隔（分钟），-1 表示禁用
     pub codex_auto_refresh_minutes: i32,
+    pub codex_auto_refresh_plan_types: Vec<String>,
     /// Codex 切号时是否同步覆盖 WSL 配置 (Windows Only)
     pub codex_sync_wsl: bool,
     /// 是否启用 Codex 客户端中的 API 服务额度显示注入
     pub codex_app_ui_injection_enabled: bool,
+    pub codex_app_api_quota_compat_enabled: bool,
+    pub codex_app_native_predictions_enabled: bool,
     /// Codex WSL 配置目录 (Windows Only)
     pub codex_wsl_config_dir: String,
     /// Zed 自动刷新间隔（分钟），-1 表示禁用
@@ -117,6 +128,8 @@ pub struct GeneralConfig {
     pub codebuddy_cn_auto_refresh_minutes: i32,
     /// WorkBuddy 自动刷新间隔（分钟），-1 表示禁用
     pub workbuddy_auto_refresh_minutes: i32,
+    /// MiniMax Code 自动刷新间隔（分钟），-1 表示禁用
+    pub minimax_code_auto_refresh_minutes: i32,
     /// Qoder 自动刷新间隔（分钟），-1 表示禁用
     pub qoder_auto_refresh_minutes: i32,
     /// ZCode 自动刷新间隔（分钟），-1 表示禁用
@@ -132,14 +145,17 @@ pub struct GeneralConfig {
     pub minimize_behavior: String,
     /// 是否隐藏 Dock 图标（macOS）
     pub hide_dock_icon: bool,
+    pub show_tray_icon: bool,
     /// 菜单栏图标样式（macOS）: "template", "color"
     pub tray_icon_style: String,
+    pub menu_bar_left_click_opens_main_window: bool,
     /// 是否在 macOS 菜单栏显示当前账号剩余额度
     pub menu_bar_quota_enabled: bool,
     /// 是否显示账号标识前 4 位
     pub menu_bar_show_account_prefix: bool,
     /// 菜单栏额度监控平台
     pub menu_bar_quota_platform: String,
+    pub menu_bar_antigravity_metric: String,
     /// 是否在启动时显示悬浮卡片
     pub floating_card_show_on_startup: bool,
     /// 是否在启动后自动最小化主窗口
@@ -150,6 +166,8 @@ pub struct GeneralConfig {
     pub startup_page: String,
     /// 悬浮卡片是否默认置顶
     pub floating_card_always_on_top: bool,
+    pub floating_card_minimal: bool,
+    pub floating_card_background_opacity: f64,
     /// 是否启用应用开机自启动
     pub app_auto_launch_enabled: bool,
     /// 是否启用后台账号授权保活
@@ -170,6 +188,7 @@ pub struct GeneralConfig {
     pub opencode_app_path: String,
     /// Antigravity IDE 启动路径（为空则使用默认路径）
     pub antigravity_app_path: String,
+    pub antigravity_legacy_app_path: String,
     /// Codex 启动路径（为空则使用默认路径）
     pub codex_app_path: String,
     /// OAuth hosted login 使用的官方桌面版本（为空则跟随远端默认值）
@@ -178,6 +197,7 @@ pub struct GeneralConfig {
     pub claude_app_path: String,
     /// Claude 桌面应用扫描范围（每行一个目录）
     pub claude_app_scan_roots: String,
+    pub claude_share_code_sessions_on_switch: bool,
     /// 切换 Codex 后需联动重启的指定应用路径
     pub codex_specified_app_path: String,
     /// Zed 启动路径（为空则使用默认路径）
@@ -218,6 +238,11 @@ pub struct GeneralConfig {
     pub trae_solo_cn_app_scan_roots: String,
     /// WorkBuddy 启动路径（为空则使用默认路径）
     pub workbuddy_app_path: String,
+    pub workbuddy_ai_app_path: String,
+    /// MiniMax Code 启动路径（为空则使用默认路径）
+    pub minimax_code_app_path: String,
+    /// MiniMax Code 区域
+    pub minimax_code_region: String,
     /// 切换 WorkBuddy 账号时是否在本机账号间合并本地会话
     pub workbuddy_share_sessions_on_switch: bool,
     /// 切换 Codex 时是否自动重启 OpenCode
@@ -235,6 +260,9 @@ pub struct GeneralConfig {
     pub hermes_auth_overwrite_on_switch: bool,
     /// 切换 Codex 时是否自动启动/重启 Codex App
     pub codex_launch_on_switch: bool,
+    pub codex_automatic_session_repair: config::CodexAutomaticSessionRepair,
+    pub codex_cli_auto_refresh_on_switch: bool,
+    pub codex_auto_restore_takeover_on_launch: bool,
     /// 切换 Antigravity IDE 时是否自动启动/重启应用
     pub antigravity_launch_on_switch: bool,
     /// 切换 Codex 时是否自动重启指定应用
@@ -255,6 +283,12 @@ pub struct GeneralConfig {
     pub auto_switch_credits_enabled: bool,
     /// Credits 自动切号阈值（剩余值）
     pub auto_switch_credits_threshold: i32,
+    /// 是否按 5h / 周 配额窗口分别设置切号阈值
+    pub auto_switch_window_thresholds_enabled: bool,
+    /// 5h 配额窗口切号阈值（百分比）
+    pub auto_switch_five_hour_threshold: i32,
+    /// 周配额窗口切号阈值（百分比）
+    pub auto_switch_weekly_threshold: i32,
     /// 自动切号触发模式：any_group | selected_groups
     pub auto_switch_scope_mode: String,
     /// 自动切号指定模型分组（分组 ID）
@@ -265,9 +299,9 @@ pub struct GeneralConfig {
     pub auto_switch_selected_account_ids: Vec<String>,
     /// 是否启用 Codex 自动切号
     pub codex_auto_switch_enabled: bool,
-    /// Codex primary_window 自动切号阈值（百分比）
+    /// Codex 短周期自动切号阈值；缺少时长时用于 primary_window（百分比）
     pub codex_auto_switch_primary_threshold: i32,
-    /// Codex secondary_window 自动切号阈值（百分比）
+    /// Codex 周额度自动切号阈值；缺少时长时用于 secondary_window（百分比）
     pub codex_auto_switch_secondary_threshold: i32,
     /// Codex 自动切号账号范围模式：all_accounts | selected_accounts
     pub codex_auto_switch_account_scope_mode: String,
@@ -285,9 +319,9 @@ pub struct GeneralConfig {
     pub zed_quota_alert_enabled: bool,
     /// Zed 配额预警阈值（百分比）
     pub zed_quota_alert_threshold: i32,
-    /// Codex primary_window 配额预警阈值（百分比）
+    /// Codex 短周期预警阈值；缺少时长时用于 primary_window（百分比）
     pub codex_quota_alert_primary_threshold: i32,
-    /// Codex secondary_window 配额预警阈值（百分比）
+    /// Codex 周额度预警阈值；缺少时长时用于 secondary_window（百分比）
     pub codex_quota_alert_secondary_threshold: i32,
     /// 是否启用 GitHub Copilot 配额预警通知
     pub ghcp_quota_alert_enabled: bool,
@@ -341,6 +375,10 @@ pub struct GeneralConfig {
     pub workbuddy_quota_alert_enabled: bool,
     /// WorkBuddy 配额预警阈值（百分比）
     pub workbuddy_quota_alert_threshold: i32,
+    /// 是否启用 MiniMax Code 配额预警通知
+    pub minimax_code_quota_alert_enabled: bool,
+    /// MiniMax Code 配额预警阈值（百分比）
+    pub minimax_code_quota_alert_threshold: i32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -471,11 +509,18 @@ fn normalize_macos_app_root_for_metadata(path: &Path) -> Option<PathBuf> {
 
 #[cfg(target_os = "macos")]
 fn read_macos_plist_string(path: &Path, key: &str) -> Option<String> {
-    let output = std::process::Command::new("plutil")
-        .arg("-p")
-        .arg(path)
-        .output()
-        .ok()?;
+    let mut command = std::process::Command::new("plutil");
+    command.arg("-p").arg(path);
+    let output = modules::process_timeout::output_with_timeout(
+        &mut command,
+        std::time::Duration::from_secs(5),
+    )
+    .map_err(|error| {
+        modules::logger::log_warn(&format!(
+            "[Antigravity] macOS version metadata probe failed: {error}"
+        ))
+    })
+    .ok()?;
     if !output.status.success() {
         return None;
     }
@@ -494,6 +539,10 @@ fn read_macos_plist_string(path: &Path, key: &str) -> Option<String> {
     }
     None
 }
+
+#[cfg(any(target_os = "linux", test))]
+#[path = "antigravity_linux_asar.rs"]
+mod antigravity_linux_asar;
 
 fn antigravity_product_json_candidates(root: &Path) -> Vec<PathBuf> {
     #[cfg(target_os = "macos")]
@@ -638,14 +687,13 @@ fn read_powershell_json_for_antigravity_exe(
     exe_path: &Path,
     script: &str,
 ) -> Option<serde_json::Value> {
-    let _spawn_guard = modules::app_lifecycle::acquire_process_spawn_guard("PowerShell").ok()?;
     let mut command = std::process::Command::new("powershell");
     {
         use std::os::windows::process::CommandExt;
         command.creation_flags(CREATE_NO_WINDOW);
     }
 
-    let output = command
+    command
         .args([
             "-NoProfile",
             "-NonInteractive",
@@ -654,9 +702,17 @@ fn read_powershell_json_for_antigravity_exe(
             "-Command",
             script,
         ])
-        .env("COCKPIT_ANTIGRAVITY_EXE_PATH", exe_path.as_os_str())
-        .output()
-        .ok()?;
+        .env("COCKPIT_ANTIGRAVITY_EXE_PATH", exe_path.as_os_str());
+    let output = modules::process_timeout::output_with_timeout(
+        &mut command,
+        std::time::Duration::from_secs(5),
+    )
+    .map_err(|error| {
+        modules::logger::log_warn(&format!(
+            "[Antigravity] Windows version metadata PowerShell probe failed: {error}"
+        ))
+    })
+    .ok()?;
     if !output.status.success() {
         modules::logger::log_warn(&format!(
             "[Antigravity] Windows version metadata PowerShell probe failed: status={}",
@@ -776,10 +832,15 @@ fn normalize_antigravity_metadata_root(path: &Path) -> Option<PathBuf> {
 }
 
 fn push_unique_antigravity_candidate(candidates: &mut Vec<PathBuf>, path: PathBuf) {
-    let normalized_key = path.to_string_lossy().to_ascii_lowercase();
-    let exists = candidates
-        .iter()
-        .any(|item| item.to_string_lossy().to_ascii_lowercase() == normalized_key);
+    #[cfg(target_os = "linux")]
+    let exists = candidates.contains(&path);
+    #[cfg(not(target_os = "linux"))]
+    let exists = {
+        let normalized_key = path.to_string_lossy().to_ascii_lowercase();
+        candidates
+            .iter()
+            .any(|item| item.to_string_lossy().to_ascii_lowercase() == normalized_key)
+    };
     if !exists {
         candidates.push(path);
     }
@@ -844,6 +905,16 @@ fn antigravity_metadata_root_matches_target_with_product_metadata(
     let Some(target) = normalize_antigravity_metadata_target(target) else {
         return true;
     };
+    #[cfg(target_os = "macos")]
+    if root.extension().is_some_and(|extension| extension.eq_ignore_ascii_case("app")) {
+        let info = plist::Value::from_file(root.join("Contents/Info.plist")).ok();
+        if let Some(kind) = modules::process::antigravity_macos_bundle_target(
+            root,
+            info.as_ref().and_then(plist::Value::as_dictionary),
+        ) {
+            return kind == target;
+        }
+    }
     if prefer_product_metadata {
         if let Some(metadata_target) = antigravity_product_json_target(root) {
             return metadata_target == target;
@@ -879,11 +950,17 @@ fn antigravity_metadata_candidates(
     let _ = scan_mode;
 
     let mut candidates = Vec::new();
-    let config_path = config::get_user_config().antigravity_app_path;
-    let config_path = config_path.trim();
-    if !config_path.is_empty() {
-        let config_path = Path::new(config_path);
-        if let Some(root) = normalize_antigravity_metadata_root(config_path) {
+    let configured = config::get_user_config();
+    for (kind, path) in [
+        ("antigravity", &configured.antigravity_legacy_app_path),
+        ("antigravity_ide", &configured.antigravity_app_path),
+    ] {
+        if path.trim().is_empty()
+            || normalize_antigravity_metadata_target(target).is_some_and(|target| target != kind)
+        {
+            continue;
+        }
+        if let Some(root) = normalize_antigravity_metadata_root(Path::new(path.trim())) {
             if antigravity_metadata_root_matches_target(&root, target) {
                 push_unique_antigravity_candidate(&mut candidates, root);
             }
@@ -911,12 +988,13 @@ fn antigravity_metadata_candidates(
     #[cfg(target_os = "linux")]
     {
         let paths: &[&str] = match normalize_antigravity_metadata_target(target) {
-            Some("antigravity") => &["/usr/share/antigravity", "/opt/antigravity"],
+            Some("antigravity") => &["/usr/share/antigravity", "/opt/antigravity", "/opt/Antigravity"],
             Some("antigravity_ide") => &["/usr/share/antigravity-ide", "/opt/antigravity-ide"],
             _ => &[
                 "/usr/share/antigravity",
                 "/usr/share/antigravity-ide",
                 "/opt/antigravity",
+                "/opt/Antigravity",
                 "/opt/antigravity-ide",
             ],
         };
@@ -974,7 +1052,9 @@ fn antigravity_metadata_candidates(
             }
         }
         for path in roots {
-            if path.exists() {
+            if crate::modules::process::can_probe_passive_windows_path(&path.to_string_lossy())
+                && path.exists()
+            {
                 push_unique_antigravity_candidate(&mut candidates, path);
             }
         }
@@ -1018,6 +1098,28 @@ fn antigravity_metadata_candidates(
     candidates
 }
 
+/// IDE and Electron publish different versions. Only the product's IDE version
+/// determines whether it signs in through the shared App/agy Hub.
+pub(crate) fn antigravity_ide_uses_shared_credentials() -> bool {
+    antigravity_metadata_candidates(Some("antigravity_ide"), AntigravityVersionScanMode::Quick)
+        .into_iter()
+        .flat_map(|root| antigravity_product_json_candidates(&root))
+        .filter_map(|path| fs::read_to_string(path).ok())
+        .filter_map(|content| serde_json::from_str::<serde_json::Value>(&content).ok())
+        .find_map(|product| {
+            json_string_field(&product, &["ideVersion"])
+                .and_then(|version| antigravity_ide_version_uses_shared_credentials(&version))
+        })
+        .unwrap_or(false)
+}
+
+fn antigravity_ide_version_uses_shared_credentials(version: &str) -> Option<bool> {
+    let mut parts = version.trim().trim_start_matches(['v', 'V']).split('.');
+    let major: u32 = parts.next()?.parse().ok()?;
+    let minor: u32 = parts.next()?.parse().ok()?;
+    Some((major, minor) >= (2, 6))
+}
+
 fn resolve_antigravity_installed_version_info_for_target_with_mode(
     target: Option<&str>,
     scan_mode: AntigravityVersionScanMode,
@@ -1025,6 +1127,19 @@ fn resolve_antigravity_installed_version_info_for_target_with_mode(
     for root in antigravity_metadata_candidates(target, scan_mode) {
         if let Some(info) = read_antigravity_product_json_metadata(&root) {
             return Some(info);
+        }
+
+        #[cfg(target_os = "linux")]
+        if normalize_antigravity_metadata_target(target) != Some("antigravity_ide") {
+            let archive = root.join("resources").join("app.asar");
+            if let Some(version) = antigravity_linux_asar::desktop_version_from_asar(&archive) {
+                return Some(AntigravityInstalledVersionInfo {
+                    product_name: "Antigravity".to_string(),
+                    version,
+                    app_path: root.to_string_lossy().to_string(),
+                    source: "app.asar/package.json".to_string(),
+                });
+            }
         }
 
         #[cfg(target_os = "macos")]
@@ -1130,8 +1245,11 @@ fn is_general_config_patch_field(key: &str) -> bool {
             | "ui_scale"
             | "auto_refresh_minutes"
             | "codex_auto_refresh_minutes"
+            | "codex_auto_refresh_plan_types"
             | "codex_sync_wsl"
             | "codex_app_ui_injection_enabled"
+            | "codex_app_api_quota_compat_enabled"
+            | "codex_app_native_predictions_enabled"
             | "codex_wsl_config_dir"
             | "zed_auto_refresh_minutes"
             | "ghcp_auto_refresh_minutes"
@@ -1146,6 +1264,7 @@ fn is_general_config_patch_field(key: &str) -> bool {
             | "codebuddy_auto_refresh_minutes"
             | "codebuddy_cn_auto_refresh_minutes"
             | "workbuddy_auto_refresh_minutes"
+            | "minimax_code_auto_refresh_minutes"
             | "qoder_auto_refresh_minutes"
             | "zcode_auto_refresh_minutes"
             | "trae_auto_refresh_minutes"
@@ -1155,15 +1274,20 @@ fn is_general_config_patch_field(key: &str) -> bool {
             | "close_behavior"
             | "minimize_behavior"
             | "hide_dock_icon"
+            | "show_tray_icon"
             | "tray_icon_style"
+            | "menu_bar_left_click_opens_main_window"
             | "menu_bar_quota_enabled"
             | "menu_bar_show_account_prefix"
             | "menu_bar_quota_platform"
+            | "menu_bar_antigravity_metric"
             | "floating_card_show_on_startup"
             | "startup_minimized"
             | "remember_main_window_state"
             | "startup_page"
             | "floating_card_always_on_top"
+            | "floating_card_minimal"
+            | "floating_card_background_opacity"
             | "app_auto_launch_enabled"
             | "token_keeper_enabled"
             | "auto_import_from_local_enabled"
@@ -1174,10 +1298,12 @@ fn is_general_config_patch_field(key: &str) -> bool {
             | "floating_card_confirm_on_close"
             | "opencode_app_path"
             | "antigravity_app_path"
+            | "antigravity_legacy_app_path"
             | "codex_app_path"
             | "codex_oauth_app_version"
             | "claude_app_path"
             | "claude_app_scan_roots"
+            | "claude_share_code_sessions_on_switch"
             | "codex_specified_app_path"
             | "zed_app_path"
             | "vscode_app_path"
@@ -1203,6 +1329,8 @@ fn is_general_config_patch_field(key: &str) -> bool {
             | "trae_cn_app_scan_roots"
             | "trae_solo_cn_app_scan_roots"
             | "workbuddy_app_path"
+            | "minimax_code_app_path"
+            | "minimax_code_region"
             | "workbuddy_share_sessions_on_switch"
             | "opencode_sync_on_switch"
             | "opencode_auth_overwrite_on_switch"
@@ -1212,6 +1340,9 @@ fn is_general_config_patch_field(key: &str) -> bool {
             | "openclaw_auth_overwrite_on_switch"
             | "hermes_auth_overwrite_on_switch"
             | "codex_launch_on_switch"
+            | "codex_automatic_session_repair"
+            | "codex_cli_auto_refresh_on_switch"
+            | "codex_auto_restore_takeover_on_launch"
             | "antigravity_launch_on_switch"
             | "codex_restart_specified_app_on_switch"
             | "codex_local_access_entry_visible"
@@ -1222,6 +1353,9 @@ fn is_general_config_patch_field(key: &str) -> bool {
             | "auto_switch_threshold"
             | "auto_switch_credits_enabled"
             | "auto_switch_credits_threshold"
+            | "auto_switch_window_thresholds_enabled"
+            | "auto_switch_five_hour_threshold"
+            | "auto_switch_weekly_threshold"
             | "auto_switch_scope_mode"
             | "auto_switch_selected_group_ids"
             | "auto_switch_account_scope_mode"
@@ -1268,6 +1402,8 @@ fn is_general_config_patch_field(key: &str) -> bool {
             | "trae_solo_cn_quota_alert_threshold"
             | "workbuddy_quota_alert_enabled"
             | "workbuddy_quota_alert_threshold"
+            | "minimax_code_quota_alert_enabled"
+            | "minimax_code_quota_alert_threshold"
     )
 }
 
@@ -1320,14 +1456,27 @@ fn apply_general_config_updates(
     if updates.contains_key("startup_page") {
         next.startup_page = config::normalize_startup_page(&next.startup_page);
     }
+    if updates.contains_key("minimax_code_region") {
+        next.minimax_code_region = config::normalize_minimax_code_region(&next.minimax_code_region);
+    }
+    if updates.contains_key("floating_card_background_opacity") {
+        next.floating_card_background_opacity = config::normalize_floating_card_background_opacity(next.floating_card_background_opacity);
+    }
     if updates.contains_key("theme_color") {
         next.theme_color = config::normalize_theme_color(&next.theme_color);
     }
     if updates.contains_key("menu_bar_quota_platform") {
         let platform = next.menu_bar_quota_platform.trim();
-        next.menu_bar_quota_platform = modules::tray::PlatformId::from_str(platform)
-            .map(|value| value.as_str().to_string())
-            .unwrap_or_else(|| "codex".to_string());
+        next.menu_bar_quota_platform = if platform == config::MENU_BAR_QUOTA_CLAUDE_CLI {
+            platform.to_string()
+        } else {
+            modules::tray::PlatformId::from_str(platform)
+                .map(|value| value.as_str().to_string())
+                .unwrap_or_else(|| "codex".to_string())
+        };
+    }
+    if updates.contains_key("menu_bar_antigravity_metric") {
+        next.menu_bar_antigravity_metric = next.menu_bar_antigravity_metric.trim().to_string();
     }
     if updates.contains_key("webdav_allowed_domains") {
         next.webdav_allowed_domains = next
@@ -1355,6 +1504,7 @@ fn apply_general_config_updates(
     }
     normalize_app_path_field!("opencode_app_path", opencode_app_path);
     normalize_app_path_field!("antigravity_app_path", antigravity_app_path);
+    normalize_app_path_field!("antigravity_legacy_app_path", antigravity_legacy_app_path);
     normalize_app_path_field!("codex_app_path", codex_app_path);
     trim_string_field!("codex_oauth_app_version", codex_oauth_app_version);
     normalize_app_path_field!("claude_app_path", claude_app_path);
@@ -1378,6 +1528,7 @@ fn apply_general_config_updates(
     trim_string_field!("trae_cn_app_scan_roots", trae_cn_app_scan_roots);
     trim_string_field!("trae_solo_cn_app_scan_roots", trae_solo_cn_app_scan_roots);
     normalize_app_path_field!("workbuddy_app_path", workbuddy_app_path);
+    normalize_app_path_field!("minimax_code_app_path", minimax_code_app_path);
 
     if updates.contains_key("auto_switch_scope_mode") {
         let normalized = next.auto_switch_scope_mode.trim();

@@ -13,7 +13,22 @@ use std::path::{Path, PathBuf};
 /// 受管模型目录生成逻辑的版本号。改动目录结构或模型能力字段时递增。
 ///
 /// 3：上下文与压缩统一为 90% 口径（压缩阈值不再留空），GPT-6 系列上下文修正为 256K。
-pub(crate) const MANAGED_MODEL_CATALOG_GENERATOR_VERSION: u32 = 3;
+/// 4：加入 GPT-6.1 Sol 客户端目录。
+/// 5：删除退役型号的内置模板与兼容槽位。
+/// 6：Grok 4.7 真实上下文、推理档位与默认推理强度。
+/// 7：GPT-6.1 Sol 与 GPT-6 Astra 声明官方 Ultrafast 速度档位。
+/// 8：Ultrafast 说明回退到官方客户端的内置翻译。
+/// 9：GPT-6.1 Terra 补齐 Ultra 推理档位。
+/// 10：第三方 DeepSeek 模型使用三档推理能力。
+/// 11：自动识别 DeepSeek 新模型的推理档位。
+/// 12：受管目录保留当前网关路由的图片输入能力。
+/// 13：默认清单与能力目录补齐 GPT-6.1 Terra。
+/// 14：Responses Lite 按实际供应商路由生成。
+/// 15：第三方路由的 GPT 壳位使用标准客户端工具。
+/// 16：刷新 GPT-6.1 Sol 的旧默认上下文和压缩阈值。
+/// 17：在自动默认目录中加入 GPT-6.2 Sol 与 Astra。
+/// 18：按官方 Codex 选择器顺序排列默认 GPT 模型。
+pub(crate) const MANAGED_MODEL_CATALOG_GENERATOR_VERSION: u32 = 18;
 
 const META_FILE_NAME: &str = "cockpit-model-catalog.meta.json";
 

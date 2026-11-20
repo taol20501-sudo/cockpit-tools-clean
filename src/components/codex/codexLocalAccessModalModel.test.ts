@@ -3,15 +3,19 @@ import test from 'node:test';
 import type { TFunction } from 'i18next';
 import type { CodexAccount } from '../../types/codex';
 import type { CodexLocalAccessAccountHealth, CodexLocalAccessAccountPoolHealth, CodexLocalAccessUsageStats } from '../../types/codexLocalAccess';
+import type { ChatGptPlanAccount } from '../../services/chatgptPlanService';
+import { projectCodexServiceAccountDisplays } from '../../utils/chatgptPlanOverview';
 import {
   buildLocalAccessSummaryStats,
   formatRequestResultDetail,
   formatUsdCost,
+  getLocalAccessTestModelIds,
   normalizeAccessScope,
   normalizeCustomRoutingPriority,
   normalizeCustomRoutingWeight,
   resolveAccountUsagePriority,
   summarizeAccountPoolHealth,
+  summarizeQuotaPoolsByPlan,
 } from './codexLocalAccessModalModel';
 
 const account = (id: string, patch: Partial<CodexAccount> = {}): CodexAccount => ({
@@ -30,6 +34,37 @@ const pool = (accountStatuses: CodexLocalAccessAccountPoolHealth['accountStatuse
   accountStatuses, lastFailureAt: 1,
 });
 const translate = ((key: string, options: unknown) => typeof options === 'string' ? options : JSON.stringify({ key, ...options as object })) as TFunction;
+
+test('the service test picker includes the configured image model and source variants', () => {
+  const chatModels = ['gpt-5.6-luna', 'gpt-image-2.6'];
+  const settings = {
+    imageGenerationMode: 'images_only' as const,
+    imageGenerationModel: 'gpt-image-2.6',
+    imageGenerationAccountModels: { source: 'gpt-image-2.6-flare' },
+  };
+  assert.deepEqual(getLocalAccessTestModelIds(chatModels, settings), [...chatModels, 'gpt-image-2.6-flare']);
+  assert.deepEqual(getLocalAccessTestModelIds(chatModels, { ...settings, imageGenerationMode: 'disabled' }), chatModels);
+});
+
+test('paused members remain in pool counts without becoming available or recoverable auth failures', () => {
+  const summary = summarizeAccountPoolHealth([account('source')], ['source'], {
+    collection: { pausedAccountIds: ['source'] },
+    accountHealth: [health('source', { available: false, lastFailureCategory: 'auth_unavailable' })],
+    accountPoolHealth: [pool([{ accountId: 'source', available: false, reasonCode: 'unauthorized' } as CodexLocalAccessAccountPoolHealth['accountStatuses'][number]])],
+    recoverySuppressedAccountIds: ['source'],
+  });
+  assert.deepEqual(summary, { total: 1, available: 0, abnormal: 0, cooldown: 0, missing: 0, authError: 0, quotaLimited: 0 });
+});
+
+test('persisted member source identity keeps legacy endpoint counts unified after authorization unlink', () => {
+  const summary = summarizeAccountPoolHealth([account('source'), account('endpoint')], ['source', 'endpoint'], {
+    collection: { pausedAccountIds: [], officialAccountSourceIds: { endpoint: 'source' } },
+    serviceMembers: [{ accountId: 'endpoint', sourceAccountId: 'source', mode: 'official', paused: false }],
+    accountHealth: [], accountPoolHealth: [], recoverySuppressedAccountIds: [],
+  });
+  assert.equal(summary.total, 1);
+  assert.equal(summary.available, 1);
+});
 
 test('routing drafts retain their bounds, explicit LAN scope and preferred-over-backup priority', () => {
   assert.deepEqual([-1, 0, 2.6, 999, NaN, Infinity].map(normalizeCustomRoutingPriority), [0, 0, 3, 100, 0, 0]);
@@ -60,13 +95,44 @@ test('health summary preserves recovery, missing-account, cooldown, quota and au
   assert.equal(JSON.stringify({ accounts, state }), before, 'display aggregation must not mutate account or scheduler state');
 });
 
-test('a pool without member diagnostics retains its existing unavailable summary without inventing auth errors', () => {
-  assert.deepEqual(summarizeAccountPoolHealth([account('a'), account('b')], ['a', 'b'], {
-    accountHealth: [], accountPoolHealth: [pool([])], recoverySuppressedAccountIds: ['b'],
-  }), { total: 2, available: 1, abnormal: 0, cooldown: 0, missing: 0, authError: 0, quotaLimited: 0 });
+test('an unattributed request failure keeps Plus and Free member health independent', () => {
+  const accounts = [account('paid', { plan_type: 'Plus' }), account('free', { plan_type: 'Free' })];
+  const ids = accounts.map(({ id }) => id);
+  const state = { accountHealth: [health('paid'), health('free')], accountPoolHealth: [pool([])] };
+  assert.deepEqual(summarizeAccountPoolHealth(accounts, ids, state), {
+    total: 2, available: 2, abnormal: 0, cooldown: 0, missing: 0, authError: 0, quotaLimited: 0,
+  });
+  assert.equal(summarizeAccountPoolHealth(accounts, ids, {
+    ...state,
+    accountHealth: [health('paid'), health('free', { available: false })],
+  }).available, 1);
+  assert.equal(summarizeAccountPoolHealth(accounts, ids, {
+    ...state,
+    accountPoolHealth: [pool([{ accountId: 'free', accountEmail: '', available: false,
+      reasonCode: 'unavailable', reasonMessage: '' }])],
+  }).available, 1);
   assert.deepEqual(summarizeAccountPoolHealth([account('a')], ['a'], null), {
     total: 1, available: 1, abnormal: 0, cooldown: 0, missing: 0, authError: 0, quotaLimited: 0,
   });
+});
+
+test('bound official members reuse source quota groups while keeping each selected transport health', () => {
+  const source = account('source', { plan_type: 'Plus', quota: { hourly_percentage: 70, weekly_percentage: 40 },
+    quota_error: { message: '401 invalid_token', timestamp: 1 } });
+  const endpoint = account('chatgpt_plan_grant', { auth_mode: 'apikey', api_provider_id: 'cockpit_chatgpt_plan', requires_reauth: false });
+  const grant = { id: 'grant', source_account_id: source.id, source_binding_valid: true } as ChatGptPlanAccount;
+  const accounts = projectCodexServiceAccountDisplays([source, endpoint], [grant]);
+  const pools = summarizeQuotaPoolsByPlan(accounts);
+  assert.equal(pools.PLUS.count, 1);
+  assert.equal(pools.PLUS.windows[0].percentage, 70);
+  const state = { accountHealth: [health(source.id, { available: false, schedulerAvailable: false }), health(endpoint.id)], accountPoolHealth: [] };
+  assert.deepEqual(summarizeAccountPoolHealth(accounts, [source.id, endpoint.id, endpoint.id], state), {
+    total: 1, available: 1, abnormal: 0, cooldown: 0, missing: 0, authError: 0, quotaLimited: 0,
+  }, 'a healthy selected official channel is not blocked by the source OAuth error');
+  assert.equal(summarizeAccountPoolHealth(accounts, [endpoint.id], state).available, 1);
+  assert.equal(summarizeAccountPoolHealth(accounts, [source.id], state).quotaLimited, 1);
+  const failedOfficial = { ...state, accountHealth: [health(endpoint.id, { available: false, schedulerAvailable: false })] };
+  assert.equal(summarizeAccountPoolHealth(accounts, [endpoint.id], failedOfficial).authError, 1, 'source quota metadata cannot hide the official channel failure');
 });
 
 test('request details keep cancellation and upstream failures out of the ordinary failure count', () => {

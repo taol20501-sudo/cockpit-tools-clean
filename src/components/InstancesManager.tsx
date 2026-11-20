@@ -1,3 +1,8 @@
+import { isLaunchPathApp, readMissingLaunchPathApp } from '../utils/appLaunchPath';
+import { useDurableUiSetting } from '../hooks/useDurableUiSetting';
+import { previewDurableUiSetting } from '../utils/durableUiSettings';
+import { isCodexLaunchCancelled } from '../utils/codexLaunchCancellation';
+import { formatAntigravitySwitchError } from '../utils/antigravitySwitchError';
 import {
   useCallback,
   useEffect,
@@ -28,6 +33,8 @@ import {
   ExternalLink,
   Eye,
   EyeOff,
+  ArrowDown,
+  ArrowUp,
 } from "lucide-react";
 import { confirm as confirmDialog, open } from "@tauri-apps/plugin-dialog";
 import md5 from "blueimp-md5";
@@ -87,6 +94,7 @@ import {
 } from "../services/codexInstanceService";
 import { CodexSpeedSelect } from "./codex/CodexSpeedSelect";
 import { SingleSelectDropdown } from "./SingleSelectDropdown";
+import { SingleSelectFilterDropdown } from "./SingleSelectFilterDropdown";
 import type { CodexAppSpeed } from "../types/codex";
 import { getCodexExperimentalModelErrorMessage } from "../utils/codexExperimentalModel";
 import { isCodexInstanceAccountConflict } from "../utils/codexInstanceLaunchConflict";
@@ -204,7 +212,9 @@ interface InstancesManagerProps<TAccount extends AccountLike> {
     | "trae_cn"
     | "trae_solo_cn"
     | "workbuddy"
+    | "minimax_code"
     | "zcode";
+  onLaunchRequest?: (instance: InstanceProfile) => void;
   onInstanceStarted?: (instance: InstanceProfile) => void | Promise<void>;
   onBeforeStart?: (instance: InstanceProfile) => boolean | Promise<boolean>;
   onInstanceStartError?: (
@@ -580,7 +590,7 @@ const resolveInstanceSortStorageKeys = (
 ) => ({
   sortField: `agtools.${appType}.instances.sort_field`,
   sortDirection: `agtools.${appType}.instances.sort_direction`,
-});
+} as const);
 
 const hashDirName = (name: string) => {
   const trimmed = name.trim();
@@ -603,6 +613,8 @@ const resolveFloatingCardPlatformId = (
       return "github-copilot";
     case "claude":
       return "claude_manager";
+    case "minimax_code":
+      return "minimaxcode";
     default:
       return appType;
   }
@@ -617,6 +629,7 @@ export function InstancesManager<TAccount extends AccountLike>({
   getAccountDisplayText,
   getAccountSearchText,
   appType = "antigravity",
+  onLaunchRequest,
   onInstanceStarted,
   onBeforeStart,
   onInstanceStartError,
@@ -624,7 +637,15 @@ export function InstancesManager<TAccount extends AccountLike>({
   isAccountAllowedForLaunchMode,
   toolbarExtraActions,
 }: InstancesManagerProps<TAccount>) {
-  const { t } = useTranslation();
+  const { t, i18n } = useTranslation();
+  const copyTimeoutDuration = useMemo(
+    () => new Intl.NumberFormat(i18n.resolvedLanguage ?? i18n.language, {
+      style: "unit",
+      unit: "minute",
+      unitDisplay: "short",
+    }),
+    [i18n.resolvedLanguage, i18n.language],
+  );
   const {
     instances,
     defaults,
@@ -699,6 +720,7 @@ export function InstancesManager<TAccount extends AccountLike>({
   const [formCodexOpenConfigLoading, setFormCodexOpenConfigLoading] =
     useState(false);
   const [formCopySourceInstanceId, setFormCopySourceInstanceId] = useState("");
+  const [formCopyTimeoutMinutes, setFormCopyTimeoutMinutes] = useState("10");
   const [formError, setFormError] = useState<string | null>(null);
   const formErrorRef = useRef<HTMLDivElement | null>(null);
   const copyAutoNameRef = useRef("");
@@ -710,16 +732,10 @@ export function InstancesManager<TAccount extends AccountLike>({
   const [startingInstanceIds, setStartingInstanceIds] = useState<string[]>([]);
   const [stoppingInstanceIds, setStoppingInstanceIds] = useState<string[]>([]);
   const [searchQuery, setSearchQuery] = useState("");
-  const [sortField, setSortField] = useState<InstanceSortField>(() => {
-    const keys = resolveInstanceSortStorageKeys(appType);
-    const saved = localStorage.getItem(keys.sortField);
-    return saved === "lastLaunchedAt" ? "lastLaunchedAt" : "createdAt";
-  });
-  const [sortDirection, setSortDirection] = useState<SortDirection>(() => {
-    const keys = resolveInstanceSortStorageKeys(appType);
-    const saved = localStorage.getItem(keys.sortDirection);
-    return saved === "desc" ? "desc" : "asc";
-  });
+  const sortKeys = resolveInstanceSortStorageKeys(appType);
+  const sortField: InstanceSortField = useDurableUiSetting(sortKeys.sortField) === "lastLaunchedAt"
+    ? "lastLaunchedAt" : "createdAt";
+  const sortDirection: SortDirection = useDurableUiSetting(sortKeys.sortDirection) === "desc" ? "desc" : "asc";
   const [privacyModeEnabled, setPrivacyModeEnabled] = useState<boolean>(() =>
     isPrivacyModeEnabledByDefault(),
   );
@@ -733,6 +749,7 @@ export function InstancesManager<TAccount extends AccountLike>({
     [stoppingInstanceIds],
   );
   const isGrokApp = appType === "grok";
+  const canBindBeforeInitialization = isGrokApp || appType === "minimax_code" || appType === "qoder";
   const supportsInstanceInitialization = !isGrokApp;
   const isCodexApp = appType === "codex";
   const isClaudeApp = appType === "claude";
@@ -988,16 +1005,6 @@ export function InstancesManager<TAccount extends AccountLike>({
     scrollElementIntoView(formErrorRef.current, { block: "end" });
   }, [formError, formErrorTick, showModal]);
 
-  useEffect(() => {
-    const keys = resolveInstanceSortStorageKeys(appType);
-    localStorage.setItem(keys.sortField, sortField);
-  }, [appType, sortField]);
-
-  useEffect(() => {
-    const keys = resolveInstanceSortStorageKeys(appType);
-    localStorage.setItem(keys.sortDirection, sortDirection);
-  }, [appType, sortDirection]);
-
   const sortedInstances = useMemo(
     () =>
       [...instances].sort((a, b) => {
@@ -1074,6 +1081,7 @@ export function InstancesManager<TAccount extends AccountLike>({
     setFormWorkingDir("");
     setFormExtraArgs("");
     setFormInitMode("empty");
+    setFormCopyTimeoutMinutes("10");
     setFormLaunchMode(isCliOnlyApp ? "cli" : "app");
     setFormAppSpeed("standard");
     setFormBindAccountId("");
@@ -1121,14 +1129,14 @@ export function InstancesManager<TAccount extends AccountLike>({
 
   useEffect(() => {
     if (editing) return;
-    if (formInitMode === "empty") {
+    if (formInitMode === "empty" && !canBindBeforeInitialization) {
       setFormBindAccountId("");
       return;
     }
     if (!formCopySourceInstanceId) {
       setFormCopySourceInstanceId(defaultInstanceId);
     }
-  }, [defaultInstanceId, editing, formCopySourceInstanceId, formInitMode]);
+  }, [defaultInstanceId, editing, formCopySourceInstanceId, formInitMode, canBindBeforeInitialization]);
 
   useEffect(() => {
     if (!isAccountAllowedForLaunchMode || !formBindAccountId) return;
@@ -1379,20 +1387,14 @@ export function InstancesManager<TAccount extends AccountLike>({
       ) {
         setFormError(
           formExperimentalModelUnavailableMessage ||
-            t(
-              "instances.form.modelRouting.catalogUnavailable",
-              "当前实例的可见模型目录不可由 Cockpit 管理，暂不能启用模型路由。",
-            ),
+            t("instances.form.modelRouting.catalogUnavailable"),
         );
         setFormErrorTick((prev) => prev + 1);
         return;
       }
       if (formLaunchMode !== "app") {
         setFormError(
-          t(
-            "instances.form.modelRouting.desktopOnly",
-            "混合模型路由仅支持桌面版实例。",
-          ),
+          t("instances.form.modelRouting.desktopOnly"),
         );
         setFormErrorTick((prev) => prev + 1);
         return;
@@ -1407,10 +1409,7 @@ export function InstancesManager<TAccount extends AccountLike>({
         // 绑定账号不是可直接登录的 OAuth 订阅账号：路由自动关闭（渠道配置保留），
         // 不能用路由拦住这次保存或后续启动。
         setMessage({
-          text: t(
-            "instances.form.modelRouting.oauthRequired",
-            "混合模型路由需要绑定一个直接登录的 OAuth 订阅账号。",
-          ),
+          text: t("instances.form.modelRouting.oauthRequired"),
         });
         setFormModelRoutingEnabled(false);
         routingEnabledForSave = false;
@@ -1419,10 +1418,7 @@ export function InstancesManager<TAccount extends AccountLike>({
       // 仍然启用路由时才校验路由配置；绑定账号不支持路由时只保存关闭状态。
       if (formModelRoutes.length === 0) {
         setFormError(
-          t(
-            "instances.form.modelRouting.routeRequired",
-            "请至少添加一个 API 模型路由。",
-          ),
+          t("instances.form.modelRouting.routeRequired"),
         );
         setFormErrorTick((prev) => prev + 1);
         return;
@@ -1437,20 +1433,14 @@ export function InstancesManager<TAccount extends AccountLike>({
           CODEX_RESERVED_MODEL_ROUTE_NAMESPACES.has(namespace)
         ) {
           setFormError(
-            t(
-              "instances.form.modelRouting.invalidNamespace",
-              "命名空间需为 2-32 位小写字母、数字、下划线或连字符，且不能使用保留名称。",
-            ),
+            t("instances.form.modelRouting.invalidNamespace"),
           );
           setFormErrorTick((prev) => prev + 1);
           return;
         }
         if (namespaces.has(namespace)) {
           setFormError(
-            t(
-              "instances.form.modelRouting.duplicateNamespace",
-              "模型路由命名空间不能重复。",
-            ),
+            t("instances.form.modelRouting.duplicateNamespace"),
           );
           setFormErrorTick((prev) => prev + 1);
           return;
@@ -1461,10 +1451,7 @@ export function InstancesManager<TAccount extends AccountLike>({
         );
         if (!provider) {
           setFormError(
-            t(
-              "instances.form.modelRouting.providerRequired",
-              "每个模型路由都必须选择一个 API 账号。",
-            ),
+            t("instances.form.modelRouting.providerRequired"),
           );
           setFormErrorTick((prev) => prev + 1);
           return;
@@ -1477,10 +1464,7 @@ export function InstancesManager<TAccount extends AccountLike>({
       }
       if (!normalizedRoutes.some((route) => route.enabled)) {
         setFormError(
-          t(
-            "instances.form.modelRouting.enabledRouteRequired",
-            "请至少启用一个 API 模型路由。",
-          ),
+          t("instances.form.modelRouting.enabledRouteRequired"),
         );
         setFormErrorTick((prev) => prev + 1);
         return;
@@ -1574,7 +1558,7 @@ export function InstancesManager<TAccount extends AccountLike>({
           updatePayload.name = formName.trim();
         }
         const canEditBind =
-          isGrokApp || !(editing.initialized === false && !isEditingDefault);
+          canBindBeforeInitialization || !(editing.initialized === false && !isEditingDefault);
         if (canEditBind) {
           const nextBindId = resolveBindAccountValue(formBindAccountId);
           if (nextBindId !== (editing.bindAccountId ?? null)) {
@@ -1651,11 +1635,15 @@ export function InstancesManager<TAccount extends AccountLike>({
           initMode: isGrokApp ? "empty" : formInitMode,
           launchMode: nextLaunchMode,
           appSpeed: isCodexApp ? formAppSpeed : undefined,
-          bindAccountId: isCreateEmpty
+          bindAccountId: isCreateEmpty && !canBindBeforeInitialization
             ? null
             : resolveBindAccountValue(formBindAccountId),
           modelRouting: nextModelRouting,
           copySourceInstanceId: formCopySourceInstanceId || defaultInstanceId,
+          copyTimeoutSeconds:
+            isCodexApp && formInitMode === "copy"
+              ? Number(formCopyTimeoutMinutes) * 60
+              : undefined,
         });
         if (
           created?.id &&
@@ -1670,7 +1658,7 @@ export function InstancesManager<TAccount extends AccountLike>({
           );
         }
         setMessage({
-          text: isCreateEmpty
+          text: isCreateEmpty && !canBindBeforeInitialization
             ? t(
                 "instances.messages.emptyCreated",
                 "空白实例已创建，请先启动一次后再绑定账号",
@@ -1720,43 +1708,27 @@ export function InstancesManager<TAccount extends AccountLike>({
   );
 
   const handleMissingPathError = (error: unknown, instanceId?: string) => {
+    if (isCodexApp && isCodexLaunchCancelled(error)) return true;
     const message = String(error ?? "");
-    const missingPathPrefix = "APP_PATH_NOT_FOUND:";
-    const multiInstanceExePrefix = "CLAUDE_MULTI_INSTANCE_REQUIRES_EXE:";
-    const isMissingPath = message.startsWith(missingPathPrefix);
-    const isMultiInstanceExeRequired = message.startsWith(
-      multiInstanceExePrefix,
-    );
-    if (!isMissingPath && !isMultiInstanceExeRequired) {
-      return false;
-    }
-    const rawApp = isMultiInstanceExeRequired
-      ? message.slice(multiInstanceExePrefix.length)
-      : message.slice(missingPathPrefix.length);
-    const app =
-      rawApp === "codex" ||
-      rawApp === "claude" ||
-      rawApp === "antigravity" ||
-      rawApp === "vscode" ||
-      rawApp === "windsurf" ||
-      rawApp === "kiro" ||
-      rawApp === "cursor" ||
-      rawApp === "grok" ||
-      rawApp === "codebuddy" ||
-      rawApp === "codebuddy_cn" ||
-      rawApp === "qoder" ||
-      rawApp === "zcode"
-        ? rawApp
-        : appType;
+    const app = message === 'APP_PATH_NOT_FOUND:antigravity_legacy'
+      ? 'antigravity'
+      : message.startsWith('CLAUDE_MULTI_INSTANCE_REQUIRES_EXE:')
+        ? 'claude'
+        : readMissingLaunchPathApp(error);
+    if (!app || !isLaunchPathApp(app)) return false;
+    const pathRuntimeTarget = message === 'APP_PATH_NOT_FOUND:antigravity_legacy'
+      ? 'antigravity' : app === 'antigravity' ? 'antigravity_ide' : undefined;
     const runtimeTarget =
       appType === "antigravity" || appType === "antigravity_ide"
         ? appType
         : undefined;
-    const retry = instanceId
+    const retry = message.startsWith('APP_PATH_MISSING_AFTER_SWITCH:')
+      ? { kind: 'launchOnly' as const, instanceId, runtimeTarget }
+      : instanceId
       ? { kind: "instance" as const, instanceId, runtimeTarget }
       : { kind: "default" as const, runtimeTarget };
     window.dispatchEvent(
-      new CustomEvent("app-path-missing", { detail: { app, retry } }),
+      new CustomEvent("app-path-missing", { detail: { app, pathRuntimeTarget, retry } }),
     );
     return true;
   };
@@ -1830,6 +1802,7 @@ export function InstancesManager<TAccount extends AccountLike>({
         }
         return "started";
       } catch (e) {
+        if (isCodexApp && isCodexLaunchCancelled(e)) return "failed";
         if (isCodexApp && isCodexInstanceAccountConflict(e)) {
           return "failed";
         }
@@ -1864,7 +1837,10 @@ export function InstancesManager<TAccount extends AccountLike>({
         if (isCodexApp) {
           return "failed";
         }
-        setMessage({ text: String(e), tone: "error" });
+        const message = appType === "antigravity" || appType === "antigravity_ide"
+          ? formatAntigravitySwitchError(t, e)
+          : String(e);
+        setMessage({ text: message, tone: "error" });
         return "failed";
       } finally {
         if (!preMarkedStarting) {
@@ -1893,6 +1869,10 @@ export function InstancesManager<TAccount extends AccountLike>({
   );
 
   const handleStart = async (instance: InstanceProfile) => {
+    if (onLaunchRequest) {
+      onLaunchRequest(instance);
+      return;
+    }
     await startStoppedInstance(instance, {
       showRunningNotice: supportsStopControl && !usesTerminalLaunch(instance),
       showSuccessMessage: true,
@@ -2203,7 +2183,7 @@ export function InstancesManager<TAccount extends AccountLike>({
       const sourceName = source.isDefault
         ? t("instances.defaultName", "默认实例")
         : source.name?.trim() || source.id;
-      const nextName = t("instances.form.copyName", "{{name}} 副本", {
+      const nextName = t("instances.form.copyName", {
         name: sourceName,
       });
       setFormName((current) => {
@@ -2535,10 +2515,7 @@ export function InstancesManager<TAccount extends AccountLike>({
     if (!nextAccount || nextAccount.auth_mode === "apikey") {
       setFormModelRoutingEnabled(false);
       setMessage({
-        text: t(
-          "instances.form.modelRouting.oauthRequired",
-          "混合模型路由需要绑定一个直接登录的 OAuth 订阅账号。",
-        ),
+        text: t("instances.form.modelRouting.oauthRequired"),
       });
     }
   };
@@ -2565,7 +2542,7 @@ export function InstancesManager<TAccount extends AccountLike>({
     instance: InstanceProfile,
     nextId: string | null,
   ) => {
-    if (!isGrokApp && instance.initialized === false) {
+    if (!canBindBeforeInitialization && instance.initialized === false) {
       setInitGuideInstance(instance);
       return;
     }
@@ -2627,27 +2604,20 @@ export function InstancesManager<TAccount extends AccountLike>({
               onChange={(event) => setSearchQuery(event.target.value)}
             />
           </div>
-          <div className="sort-select">
-            <ArrowDownWideNarrow size={14} className="sort-icon" />
-            <select
-              value={sortField}
-              onChange={(event) =>
-                setSortField(event.target.value as InstanceSortField)
-              }
-              aria-label={t("instances.sort.label", "排序")}
-            >
-              <option value="createdAt">
-                {t("instances.sort.createdAt", "按创建时间")}
-              </option>
-              <option value="lastLaunchedAt">
-                {t("instances.sort.lastLaunchedAt", "按启动时间")}
-              </option>
-            </select>
-          </div>
+          <SingleSelectFilterDropdown
+            value={sortField}
+            options={[
+              { value: "createdAt", label: t("instances.sort.createdAt", "按创建时间") },
+              { value: "lastLaunchedAt", label: t("instances.sort.lastLaunchedAt", "按启动时间") },
+            ]}
+            ariaLabel={t("instances.sort.label", "排序")}
+            icon={<ArrowDownWideNarrow size={14} />}
+            onChange={(value) => previewDurableUiSetting(sortKeys.sortField, value)}
+          />
           <button
             className="sort-direction-btn"
             onClick={() =>
-              setSortDirection((prev) => (prev === "asc" ? "desc" : "asc"))
+              previewDurableUiSetting(sortKeys.sortDirection, sortDirection === "asc" ? "desc" : "asc")
             }
             title={
               sortDirection === "asc"
@@ -2656,7 +2626,7 @@ export function InstancesManager<TAccount extends AccountLike>({
             }
             aria-label={t("instances.sort.toggleDirection", "切换排序方向")}
           >
-            {sortDirection === "asc" ? "⬆" : "⬇"}
+            {sortDirection === "asc" ? <ArrowUp size={15} /> : <ArrowDown size={15} />}
           </button>
           <button
             className="sort-direction-btn"
@@ -2771,7 +2741,7 @@ export function InstancesManager<TAccount extends AccountLike>({
               isApiService: accountIsApiService,
             } = resolveAccount(instance);
             const accountDisabledByInit =
-              !isGrokApp &&
+              !canBindBeforeInitialization &&
               !instance.isDefault &&
               instance.initialized === false;
             const isInstanceStarting = startingInstanceIdSet.has(instance.id);
@@ -2825,7 +2795,14 @@ export function InstancesManager<TAccount extends AccountLike>({
                 </div>
                 <div className="instance-main-info">
                   <div className="instance-title-row">
-                    <span className="instance-name">
+                    <span
+                      className="instance-name"
+                      title={
+                        instance.isDefault
+                          ? t("instances.defaultName", "默认实例")
+                          : instance.name
+                      }
+                    >
                       {instance.isDefault
                         ? t("instances.defaultName", "默认实例")
                         : instance.name}
@@ -2841,10 +2818,7 @@ export function InstancesManager<TAccount extends AccountLike>({
                     )}
                     {isCodexApp && instance.modelRouting?.enabled && (
                       <span className="instance-model-routing-badge">
-                        {t(
-                          "instances.form.modelRouting.statusBadge",
-                          "混合路由",
-                        )}
+                        {t("instances.form.modelRouting.statusBadge")}
                       </span>
                     )}
                   </div>
@@ -2996,7 +2970,7 @@ export function InstancesManager<TAccount extends AccountLike>({
                   )}
                   <button
                     className="icon-button"
-                    title={t("instances.actions.duplicate", "复制实例")}
+                    title={t("instances.actions.duplicate")}
                     onClick={() => openDuplicateModal(instance)}
                     disabled={
                       isInstanceBusy || restartingAll || bulkActionLoading
@@ -3145,8 +3119,11 @@ export function InstancesManager<TAccount extends AccountLike>({
                 className="btn btn-danger"
                 onClick={handleConfirmDelete}
                 disabled={actionLoading === deleteConfirmInstance.id}
+                aria-busy={actionLoading === deleteConfirmInstance.id}
               >
-                {t("common.delete", "删除")}
+                {actionLoading === deleteConfirmInstance.id
+                  ? t("common.processing", "处理中...")
+                  : t("common.delete", "删除")}
               </button>
             </div>
           </div>
@@ -3298,7 +3275,7 @@ export function InstancesManager<TAccount extends AccountLike>({
                       </span>
                     </label>
                   </div>
-                  {formInitMode === "empty" && (
+                  {formInitMode === "empty" && !canBindBeforeInitialization && (
                     <div className="instance-init-note">
                       {t(
                         "instances.form.emptyInitHint",
@@ -3460,6 +3437,21 @@ export function InstancesManager<TAccount extends AccountLike>({
                         "会复制来源实例的目录、绑定账号、启动方式和混合路由，不必重新配一遍。",
                       )}
                     </p>
+                    {isCodexApp && (
+                      <div className="form-group">
+                        <label>{t("instances.form.copyTimeout", "Copy timeout")}</label>
+                        <SingleSelectDropdown
+                          value={formCopyTimeoutMinutes}
+                          onChange={setFormCopyTimeoutMinutes}
+                          options={[2, 10, 30, 60].map((minutes) => ({
+                            value: String(minutes),
+                            label: copyTimeoutDuration.format(minutes),
+                          }))}
+                          ariaLabel={t("instances.form.copyTimeout", "Copy timeout")}
+                          className="instance-copy-source-select"
+                        />
+                      </div>
+                    )}
                     {selectedCopySourceInstance?.running && (
                       <p className="form-hint warning">
                         {t(
@@ -3479,7 +3471,7 @@ export function InstancesManager<TAccount extends AccountLike>({
                       ? `（${t("instances.form.optional", "可选")}）`
                       : ""}
                   </label>
-                  {supportsInstanceInitialization &&
+                  {!canBindBeforeInitialization &&
                   formInitMode === "empty" ? (
                     <>
                       {renderFormAccountSelect({
@@ -3508,7 +3500,7 @@ export function InstancesManager<TAccount extends AccountLike>({
               ) : (
                 <div className="form-group">
                   <label>{t("instances.form.bindAccount", "绑定账号")}</label>
-                  {!isGrokApp &&
+                  {!canBindBeforeInitialization &&
                   editing?.initialized === false &&
                   !editing.isDefault ? (
                     <>
@@ -3553,10 +3545,7 @@ export function InstancesManager<TAccount extends AccountLike>({
                     hint={
                       editing
                         ? undefined
-                        : t(
-                            "instances.form.modelRouting.createHint",
-                            "新建时请复制默认实例，这样不用先走一遍 Codex 安装。空白实例才需要先启动一次。",
-                          )
+                        : t("instances.form.modelRouting.createHint")
                     }
                     onEnabledChange={(enabled) => {
                       setFormModelRoutingEnabled(enabled);
@@ -3573,10 +3562,7 @@ export function InstancesManager<TAccount extends AccountLike>({
                         !formName.trim()
                       ) {
                         setFormName(
-                          t(
-                            "instances.form.modelRouting.defaultInstanceName",
-                            "混合路由",
-                          ),
+                          t("instances.form.modelRouting.statusBadge"),
                         );
                       }
                       setFormExperimentalModels((prevModels) =>
@@ -3696,6 +3682,7 @@ export function InstancesManager<TAccount extends AccountLike>({
                       </div>
                       {(formExperimentalModelCatalogEnabled || formModelRoutingEnabled) && (
                         <CodexExperimentalModelEditor
+                          instanceId={editing.id}
                           models={formExperimentalModels}
                           defaultModelId={formExperimentalDefaultModelId}
                           mode="summary"

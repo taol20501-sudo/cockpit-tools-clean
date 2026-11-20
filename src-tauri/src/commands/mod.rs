@@ -1,14 +1,19 @@
 pub mod account;
+pub(crate) mod cli_launch_path;
 pub mod announcement;
 pub mod antigravity_legacy_instance;
+pub mod antigravity_token_usage;
 pub mod claude;
 pub mod claude_instance;
 pub mod codebuddy;
+pub(crate) mod codebuddy_cli;
 pub mod codebuddy_cn;
 pub mod codebuddy_cn_instance;
 pub mod codebuddy_instance;
 pub mod codebuddy_session;
 pub mod codex;
+pub mod chatgpt_plan;
+pub mod chatgpt_plan_service;
 pub mod codex_proxy_engine;
 pub mod codex_unified_proxy;
 pub mod codex_pelican;
@@ -18,6 +23,7 @@ pub(crate) mod codex_instance_gateway_watchdog;
 mod codex_instance_gateway_watchdog_state;
 mod codex_instance_model_catalog;
 mod codex_instance_routing;
+mod codex_instance_start_runtime;
 pub mod cursor;
 pub mod cursor_instance;
 pub mod data_transfer;
@@ -46,9 +52,17 @@ pub mod wakeup;
 pub mod windsurf;
 pub mod windsurf_instance;
 pub mod workbuddy;
+pub mod workbuddy_ai;
 pub mod workbuddy_instance;
+pub mod minimax_code;
+pub mod minimax_code_instance;
 pub mod zcode;
 pub mod zcode_instance;
 pub mod zed;
 
 pub mod codex_proxy_catalog;
+
+pub mod codex_client_proxy;
+pub mod codex_capability_fallback;
+
+pub mod codex_multi_agent;

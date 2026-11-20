@@ -164,6 +164,15 @@ fn write_string_atomic_internal(
     content: &str,
     create_backup: bool,
 ) -> Result<(), String> {
+    write_string_atomic_with_replace_filter(path, content, create_backup, |_| false).map(|_| ())
+}
+
+fn write_string_atomic_with_replace_filter(
+    path: &Path,
+    content: &str,
+    create_backup: bool,
+    defer_replace: impl FnOnce(&std::io::Error) -> bool,
+) -> Result<bool, String> {
     let parent = path.parent().ok_or("无法定位目标目录")?;
     fs::create_dir_all(parent).map_err(|e| format_io_error("创建目录", parent, &e))?;
 
@@ -192,10 +201,16 @@ fn write_string_atomic_internal(
     }
     if let Err(err) = fs::rename(&temp_path, path) {
         let _ = fs::remove_file(&temp_path);
+        if defer_replace(&err) {
+            crate::modules::logger::log_warn(&format!(
+                "已保留暂无法替换的配置文件: path={}, error={}", path.display(), err
+            ));
+            return Ok(false);
+        }
         return Err(format_io_error("替换文件", path, &err));
     }
 
-    Ok(())
+    Ok(true)
 }
 
 fn remove_secret_backup(path: &Path) -> Result<(), String> {
@@ -215,9 +230,13 @@ fn remove_secret_backup(path: &Path) -> Result<(), String> {
 }
 
 fn write_secret_string_atomic_internal(path: &Path, content: &str) -> Result<(), String> {
+    remove_secret_backup(path)?;
+    write_private_string_atomic_internal(path, content)
+}
+
+fn write_private_string_atomic_internal(path: &Path, content: &str) -> Result<(), String> {
     let parent = path.parent().ok_or("无法定位目标目录")?;
     fs::create_dir_all(parent).map_err(|e| format_io_error("创建目录", parent, &e))?;
-    remove_secret_backup(path)?;
     let temp_path = build_temp_file_path(parent, path, "secret-atomic");
     if let Err(err) = write_secret_temp_file(&temp_path, content) {
         let _ = fs::remove_file(&temp_path);
@@ -234,6 +253,41 @@ pub fn write_string_atomic(path: &Path, content: &str) -> Result<(), String> {
     let lock = path_write_lock(path)?;
     let _guard = lock.lock().map_err(|_| "文件写入锁已损坏".to_string())?;
     write_string_atomic_internal(path, content, true)
+}
+
+/// Write compatibility state without touching its existing backup if replacement is deferred.
+pub(crate) fn write_string_atomic_defer_windows_replace_denial(
+    path: &Path,
+    content: &str,
+) -> Result<bool, String> {
+    let lock = path_write_lock(path)?;
+    let _guard = lock.lock().map_err(|_| "文件写入锁已损坏".to_string())?;
+    write_string_atomic_with_replace_filter(path, content, false, |error| {
+        cfg!(target_os = "windows") && is_windows_replace_denial(error)
+    })
+}
+
+fn is_windows_replace_denial(error: &std::io::Error) -> bool {
+    matches!(error.raw_os_error(), Some(5 | 32 | 33))
+}
+
+/// Read, merge and replace under the same path lock used by ordinary writers.
+pub(crate) fn update_string_atomic<F>(path: &Path, build_content: F) -> Result<(), String>
+where
+    F: FnOnce(Option<&str>) -> Result<String, String>,
+{
+    let lock = path_write_lock(path)?;
+    let _guard = lock.lock().map_err(|_| "文件写入锁已损坏".to_string())?;
+    let current = match fs::read_to_string(path) {
+        Ok(content) => Some(content),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(format_io_error("读取待更新文件", path, &error)),
+    };
+    let content = build_content(current.as_deref())?;
+    if current.as_deref() == Some(content.as_str()) {
+        return Ok(());
+    }
+    write_string_atomic_internal(path, &content, true)
 }
 
 /// Atomically replace credential material without creating a plaintext .bak file.
@@ -265,6 +319,30 @@ pub fn write_string_atomic_if_hash_matches<F>(
 where
     F: FnOnce() -> Result<String, String>,
 {
+    write_string_atomic_if_hash_matches_internal(path, expected_hash, true, build_content)
+}
+
+/// Restore an already validated snapshot without replacing the recovery backup
+/// with the damaged source, even if writing the replacement fails.
+pub(crate) fn restore_string_atomic_if_hash_matches(
+    path: &Path,
+    expected_hash: [u8; 32],
+    content: &str,
+) -> Result<bool, String> {
+    write_string_atomic_if_hash_matches_internal(path, expected_hash, false, || {
+        Ok(content.to_owned())
+    })
+}
+
+fn write_string_atomic_if_hash_matches_internal<F>(
+    path: &Path,
+    expected_hash: [u8; 32],
+    create_backup: bool,
+    build_content: F,
+) -> Result<bool, String>
+where
+    F: FnOnce() -> Result<String, String>,
+{
     let lock = path_write_lock(path)?;
     let _guard = lock.lock().map_err(|_| "文件写入锁已损坏".to_string())?;
     let current = match fs::read(path) {
@@ -277,7 +355,62 @@ where
         return Ok(false);
     }
     let content = build_content()?;
-    write_string_atomic_internal(path, &content, true)?;
+    write_string_atomic_internal(path, &content, create_backup)?;
+    Ok(true)
+}
+
+/// Compare exact bytes under the shared path lock; absence is a real expected state.
+/// Used by recoverable multi-file transactions so rollback cannot replace newer edits.
+pub(crate) fn replace_secret_string_if_matches(
+    path: &Path,
+    expected: Option<&str>,
+    replacement: Option<&str>,
+) -> Result<bool, String> {
+    replace_string_if_matches_internal(path, expected, replacement, write_secret_string_atomic_internal)
+}
+
+/// Replace private settings without touching other tools' recovery backups.
+pub(crate) fn replace_private_string_if_matches(
+    path: &Path,
+    expected: Option<&str>,
+    replacement: Option<&str>,
+) -> Result<bool, String> {
+    replace_string_if_matches_internal(path, expected, replacement, write_private_string_atomic_internal)
+}
+
+/// Conditional ordinary-file replacement, including absent files, without
+/// creating, replacing or removing the application's own recovery backup.
+pub(crate) fn replace_string_if_matches(
+    path: &Path,
+    expected: Option<&str>,
+    replacement: Option<&str>,
+) -> Result<bool, String> {
+    replace_string_if_matches_internal(path, expected, replacement,
+        |path, content| write_string_atomic_internal(path, content, false))
+}
+
+fn replace_string_if_matches_internal(
+    path: &Path,
+    expected: Option<&str>,
+    replacement: Option<&str>,
+    write: impl FnOnce(&Path, &str) -> Result<(), String>,
+) -> Result<bool, String> {
+    let lock = path_write_lock(path)?;
+    let _guard = lock.lock().map_err(|_| "文件写入锁已损坏".to_string())?;
+    let current = match fs::read_to_string(path) {
+        Ok(content) => Some(content),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(format_io_error("读取事务文件", path, &error)),
+    };
+    if current.as_deref() != expected { return Ok(false); }
+    match replacement {
+        Some(content) => write(path, content)?,
+        None => match fs::remove_file(path) {
+            Ok(()) => {},
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {},
+            Err(error) => return Err(format_io_error("回滚事务文件", path, &error)),
+        },
+    }
     Ok(true)
 }
 
@@ -380,7 +513,7 @@ pub fn parse_json_with_auto_restore<T: DeserializeOwned>(
 mod tests {
     use super::{
         build_backup_path, quarantine_file, remove_file_if_hash_matches, remove_file_locked,
-        restore_from_backup, write_secret_string_atomic, write_string_atomic,
+        replace_string_if_matches, restore_from_backup, write_secret_string_atomic, write_string_atomic,
         write_string_atomic_if_hash_matches,
     };
     use sha2::{Digest, Sha256};
@@ -396,6 +529,30 @@ mod tests {
             std::env::temp_dir().join(format!("{}_{}_{}", prefix, std::process::id(), unique));
         fs::create_dir_all(&dir).expect("create temp dir");
         dir
+    }
+
+    #[test]
+    fn deferred_atomic_replace_leaves_the_previous_backup_and_cleans_the_temporary_file() {
+        let dir = make_temp_dir("atomic_deferred_replace");
+        let target = dir.join("state.json");
+        let backup = dir.join("state.json.bak");
+        fs::create_dir(&target).unwrap();
+        fs::write(target.join("existing"), "keep").unwrap();
+        fs::write(&backup, "previous backup").unwrap();
+        assert!(super::write_string_atomic_with_replace_filter(&target, "{}", false, |_| false).is_err());
+        for code in [5, 32, 33] {
+            assert!(super::is_windows_replace_denial(&std::io::Error::from_raw_os_error(code)));
+        }
+        for code in [3, 80, 112] {
+            assert!(!super::is_windows_replace_denial(&std::io::Error::from_raw_os_error(code)));
+        }
+        assert!(!super::write_string_atomic_with_replace_filter(&target, "{}", false, |_| {
+            super::is_windows_replace_denial(&std::io::Error::from_raw_os_error(5))
+        }).unwrap());
+        assert_eq!(fs::read_to_string(&backup).unwrap(), "previous backup");
+        assert_eq!(fs::read_to_string(target.join("existing")).unwrap(), "keep");
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 2);
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
@@ -464,12 +621,40 @@ mod tests {
             r#"{"version":2}"#
         );
 
+        let current_hash = Sha256::digest(r#"{"version":2}"#.as_bytes()).into();
+        assert!(write_string_atomic_if_hash_matches(&path, current_hash, || {
+            Ok(r#"{"version":3}"#.to_string())
+        })
+        .expect("write matching snapshot"));
+        assert_eq!(
+            fs::read_to_string(build_backup_path(&path).unwrap()).unwrap(),
+            r#"{"version":2}"#
+        );
+
         remove_file_locked(&path).expect("delete account");
         assert!(!write_string_atomic_if_hash_matches(&path, expected, || {
             Ok(r#"{"version":3}"#.to_string())
         })
         .expect("reject deleted write"));
         assert!(!path.exists());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn conditional_ordinary_replace_keeps_native_backup_and_newer_edits() {
+        let dir = make_temp_dir("atomic_native_config_cas");
+        let path = dir.join("config.json");
+        let backup = build_backup_path(&path).unwrap();
+        fs::write(&backup, "native backup").unwrap();
+        assert!(replace_string_if_matches(&path, None, Some("initial")).unwrap());
+        assert!(!replace_string_if_matches(&path, None, Some("unexpected")).unwrap());
+        assert!(replace_string_if_matches(&path, Some("initial"), Some("updated")).unwrap());
+        assert!(!replace_string_if_matches(&path, Some("initial"), None).unwrap());
+        assert_eq!(fs::read_to_string(&path).unwrap(), "updated");
+        assert_eq!(fs::read_to_string(&backup).unwrap(), "native backup");
+        assert!(replace_string_if_matches(&path, Some("updated"), None).unwrap());
+        assert!(!path.exists());
+        assert_eq!(fs::read_to_string(&backup).unwrap(), "native backup");
         let _ = fs::remove_dir_all(dir);
     }
 

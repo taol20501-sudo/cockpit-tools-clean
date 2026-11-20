@@ -1,3 +1,10 @@
+import {
+  hasActiveWakeupQuotaReset,
+  loadAntigravityWakeupState,
+  WAKEUP_TASKS_UPDATED,
+} from '../services/antigravityWakeupStateService';
+import { resolveCodexAccountDisplayName } from "../utils/codexAccountDisplayName";
+import { ALL_CODEX_AUTO_REFRESH_PLAN_KEYS, sanitizeCodexAutoRefreshPlanKeys } from '../utils/codexAutoRefreshPlanScope';
 import { useState, useEffect, useMemo, useRef } from 'react';
 import { useTranslation } from 'react-i18next';
 import { openUrl } from '@tauri-apps/plugin-opener';
@@ -21,6 +28,11 @@ import {
   type AutoSwitchScopeAccount,
 } from '../components/AutoSwitchAccountScopeSelector';
 import {
+  SettingsDropdown,
+  SettingsRefreshPresetDropdown,
+  SettingsThresholdPresetDropdown,
+} from './settings/SettingsPresetDropdowns';
+import {
   buildAccountTierCounts,
   buildAccountTierFilterOptions,
 } from '../utils/accountFilters';
@@ -32,9 +44,10 @@ import { applyReducedMotion } from '../utils/reducedMotion';
 import {
   setClaudeQuotaDisplayRemainingEnabled,
 } from '../utils/claudeQuotaDisplayPreference';
-import { getSubscriptionTier } from '../utils/account';
+import { getAntigravityTierBadge, getSubscriptionTier } from '../utils/account';
+import { CodexAccountPlanBadge } from '../components/codex/CodexAccountPlanBadge';
 import type { Account } from '../types/account';
-import type { CodexAccount } from '../types/codex';
+import type { CodexAccount, CodexAutomaticSessionRepair } from '../types/codex';
 import {
   FEATURE_UNLOCK_CHANGED_EVENT,
   type FeatureUnlockChangedDetail,
@@ -46,6 +59,7 @@ import {
   CURRENT_ACCOUNT_REFRESH_PLATFORMS,
   type CurrentAccountRefreshMinutesMap,
   type CurrentAccountRefreshPlatform,
+  CURRENT_ACCOUNT_REFRESH_PREFERENCES_CHANGED_EVENT,
   loadCurrentAccountRefreshMinutesMap,
   saveCurrentAccountRefreshMinutesMap,
   loadAccountRefreshOverrides,
@@ -62,6 +76,7 @@ import { useClaudeAccountStore } from '../stores/useClaudeAccountStore';
 import { useCodebuddyAccountStore } from '../stores/useCodebuddyAccountStore';
 import { useCodebuddyCnAccountStore } from '../stores/useCodebuddyCnAccountStore';
 import { useWorkbuddyAccountStore } from '../stores/useWorkbuddyAccountStore';
+import { useMinimaxCodeAccountStore } from '../stores/useMinimaxCodeAccountStore';
 import { useQoderAccountStore } from '../stores/useQoderAccountStore';
 import { useZcodeAccountStore } from '../stores/useZcodeAccountStore';
 import { useTraeAccountStore } from '../stores/useTraeAccountStore';
@@ -74,6 +89,7 @@ import { getGrokAccountDisplayEmail } from '../types/grok';
 import { getClaudeAccountDisplayEmail } from '../types/claude';
 import { getCodebuddyAccountDisplayEmail } from '../types/codebuddy';
 import { getWorkbuddyAccountDisplayEmail } from '../types/workbuddy';
+import { getMinimaxCodeAccountDisplayEmail } from '../types/minimaxCode';
 import { getQoderAccountDisplayEmail } from '../types/qoder';
 import { getZcodeAccountDisplayEmail } from '../types/zcode';
 import {
@@ -86,6 +102,7 @@ import { useEscClose } from '../hooks/useEscClose';
 import './settings/Settings.css';
 import { RefreshCw } from 'lucide-react';
 import { SettingsPageView } from "./SettingsPageView";
+import { PlatformSettingsSection } from "./settings/PlatformSettingsSection";
 
 
 
@@ -133,6 +150,7 @@ interface GeneralConfig {
   ui_scale: number;
   auto_refresh_minutes: number;
   codex_auto_refresh_minutes: number;
+  codex_auto_refresh_plan_types?: string[];
   claude_auto_refresh_minutes: number;
   codex_sync_wsl: boolean;
   codex_app_ui_injection_enabled?: boolean;
@@ -149,10 +167,13 @@ interface GeneralConfig {
   close_behavior: 'ask' | 'minimize' | 'quit';
   minimize_behavior?: 'dock_and_tray' | 'tray_only';
   hide_dock_icon?: boolean;
+  show_tray_icon?: boolean;
   tray_icon_style?: 'template' | 'color';
+  menu_bar_left_click_opens_main_window?: boolean;
   menu_bar_quota_enabled?: boolean;
   menu_bar_show_account_prefix?: boolean;
-  menu_bar_quota_platform?: PlatformId;
+  menu_bar_quota_platform?: MenuBarQuotaPlatform;
+  menu_bar_antigravity_metric?: string;
   floating_card_show_on_startup?: boolean;
   startup_minimized?: boolean;
   remember_main_window_state?: boolean;
@@ -164,9 +185,11 @@ interface GeneralConfig {
   auto_import_from_local_enabled?: boolean;
   opencode_app_path: string;
   antigravity_app_path: string;
+  antigravity_legacy_app_path: string;
   codex_app_path: string;
   claude_app_path: string;
   claude_app_scan_roots: string;
+  claude_share_code_sessions_on_switch: boolean;
   codex_specified_app_path: string;
   vscode_app_path: string;
   windsurf_app_path: string;
@@ -192,10 +215,12 @@ interface GeneralConfig {
   trae_solo_cn_app_scan_roots: string;
   workbuddy_app_path: string;
   workbuddy_share_sessions_on_switch: boolean;
+  minimax_code_app_path: string;
   zed_app_path: string;
   codebuddy_auto_refresh_minutes: number;
   codebuddy_cn_auto_refresh_minutes: number;
   workbuddy_auto_refresh_minutes: number;
+  minimax_code_auto_refresh_minutes: number;
   qoder_auto_refresh_minutes: number;
   zcode_auto_refresh_minutes: number;
   trae_auto_refresh_minutes: number;
@@ -221,11 +246,15 @@ interface GeneralConfig {
   zed_quota_alert_threshold: number;
   workbuddy_quota_alert_enabled: boolean;
   workbuddy_quota_alert_threshold: number;
+  minimax_code_quota_alert_enabled: boolean;
+  minimax_code_quota_alert_threshold: number;
   opencode_sync_on_switch: boolean;
   opencode_auth_overwrite_on_switch: boolean;
   openclaw_auth_overwrite_on_switch: boolean;
   hermes_auth_overwrite_on_switch?: boolean;
   codex_launch_on_switch: boolean;
+  codex_cli_auto_refresh_on_switch?: boolean;
+  codex_automatic_session_repair?: CodexAutomaticSessionRepair;
   codex_auto_restore_takeover_on_launch?: boolean;
   antigravity_launch_on_switch: boolean;
   codex_restart_specified_app_on_switch: boolean;
@@ -235,6 +264,9 @@ interface GeneralConfig {
   antigravity_dual_switch_no_restart_enabled: boolean;
   auto_switch_enabled: boolean;
   auto_switch_threshold: number;
+  auto_switch_window_thresholds_enabled?: boolean;
+  auto_switch_five_hour_threshold?: number;
+  auto_switch_weekly_threshold?: number;
   auto_switch_credits_enabled?: boolean;
   auto_switch_credits_threshold?: number;
   auto_switch_account_scope_mode?: string;
@@ -247,7 +279,9 @@ interface GeneralConfig {
   quota_alert_enabled: boolean;
   quota_alert_threshold: number;
   codex_quota_alert_enabled: boolean;
-  codex_quota_alert_threshold: number;
+  codex_quota_alert_threshold?: number;
+  codex_quota_alert_primary_threshold?: number;
+  codex_quota_alert_secondary_threshold?: number;
   claude_quota_alert_enabled: boolean;
   claude_quota_alert_threshold: number;
   claude_quota_display_remaining?: boolean;
@@ -265,6 +299,7 @@ interface GeneralConfig {
 
 type AppPathTarget =
   | 'antigravity'
+  | 'antigravity_legacy'
   | 'codex'
   | 'claude'
   | 'vscode'
@@ -281,6 +316,7 @@ type AppPathTarget =
   | 'trae_cn'
   | 'trae_solo_cn'
   | 'workbuddy'
+  | 'minimaxcode'
   | 'zed';
 
 type TraeAppPathTarget = 'trae' | 'trae_solo' | 'trae_cn' | 'trae_solo_cn';
@@ -302,6 +338,8 @@ const UNLOCK_FIREWORKS_VISIBLE_MS = 6000;
 const AUTO_SWITCH_SCOPE_ALL_ACCOUNTS: AutoSwitchAccountScopeMode = 'all_accounts';
 const AUTO_SWITCH_SCOPE_SELECTED_ACCOUNTS: AutoSwitchAccountScopeMode = 'selected_accounts';
 const SETTINGS_PAGE_CONFIG_UPDATE_SOURCE_PREFIX = 'settings-page';
+export type MenuBarQuotaPlatform = PlatformId | "claude_cli";
+
 const FALLBACK_PLATFORM_SETTINGS_ORDER: Record<PlatformId, number> = {
   antigravity: 0,
   antigravity_ide: 1,
@@ -322,7 +360,9 @@ const FALLBACK_PLATFORM_SETTINGS_ORDER: Record<PlatformId, number> = {
   trae_cn: 16,
   trae_solo_cn: 17,
   workbuddy: 18,
+  workbuddy_ai: 22,
   zed: 19,
+  minimaxcode: 20,
 };
 type ConfigUpdatedEventDetail = {
   source?: string;
@@ -487,9 +527,10 @@ export function useSettingsPageController() {
     { value: 'id', label: 'Bahasa Indonesia' },
   ];
 
-  const menuBarQuotaPlatformOptions: Array<{ value: PlatformId; label: string }> = [
+  const menuBarQuotaPlatformOptions: Array<{ value: MenuBarQuotaPlatform; label: string }> = [
     { value: 'codex', label: 'Codex' },
-    { value: 'claude_manager', label: 'Claude' },
+    { value: 'claude_manager', label: t('claude.subPlatform.desktop') },
+    { value: 'claude_cli', label: t('claude.subPlatform.cli') },
     { value: 'antigravity', label: 'Antigravity' },
     { value: 'github-copilot', label: 'GitHub Copilot' },
     { value: 'windsurf', label: 'Windsurf' },
@@ -501,9 +542,9 @@ export function useSettingsPageController() {
     { value: 'qoder', label: 'Qoder' },
     { value: 'zcode', label: 'ZCode' },
     { value: 'trae', label: 'Trae' },
-    { value: 'trae_solo', label: 'TRAE SOLO' },
+    { value: 'trae_solo', label: t('nav.traeSolo') },
     { value: 'trae_cn', label: 'Trae CN' },
-    { value: 'trae_solo_cn', label: 'TRAE SOLO CN' },
+    { value: 'trae_solo_cn', label: t('nav.traeSoloCn') },
     { value: 'workbuddy', label: 'WorkBuddy' },
     { value: 'zed', label: 'Zed' },
   ];
@@ -519,6 +560,7 @@ export function useSettingsPageController() {
   const [uiScale, setUiScale] = useState('1');
   const [autoRefresh, setAutoRefresh] = useState('5');
   const [codexAutoRefresh, setCodexAutoRefresh] = useState('10');
+  const [codexAutoRefreshPlanTypes, setCodexAutoRefreshPlanTypes] = useState<string[]>([...ALL_CODEX_AUTO_REFRESH_PLAN_KEYS]);
   const [claudeAutoRefresh, setClaudeAutoRefresh] = useState('10');
   const [codexSyncWsl, setCodexSyncWsl] = useState(false);
   const [codexAppUiInjectionEnabled, setCodexAppUiInjectionEnabled] = useState(true);
@@ -538,14 +580,18 @@ export function useSettingsPageController() {
   const [closeBehavior, setCloseBehavior] = useState<'ask' | 'minimize' | 'quit'>('ask');
   const [minimizeBehavior, setMinimizeBehavior] = useState<'dock_and_tray' | 'tray_only'>('dock_and_tray');
   const [hideDockIcon, setHideDockIcon] = useState(false);
+  const [showTrayIcon, setShowTrayIcon] = useState(true);
   const [trayIconStyle, setTrayIconStyle] = useState<'template' | 'color'>('template');
   const [menuBarQuotaEnabled, setMenuBarQuotaEnabled] = useState(false);
+  const [menuBarLeftClickOpensMainWindow, setMenuBarLeftClickOpensMainWindow] = useState(false);
   const [menuBarShowAccountPrefix, setMenuBarShowAccountPrefix] = useState(true);
-  const [menuBarQuotaPlatform, setMenuBarQuotaPlatform] = useState<PlatformId>('codex');
+  const [menuBarQuotaPlatform, setMenuBarQuotaPlatform] = useState<MenuBarQuotaPlatform>('codex');
+  const [menuBarAntigravityMetric, setMenuBarAntigravityMetric] = useState('');
+  const [menuBarAntigravityMetricDraft, setMenuBarAntigravityMetricDraft] = useState('');
   const [menuBarQuotaModalOpen, setMenuBarQuotaModalOpen] = useState(false);
   const [menuBarQuotaModalMode, setMenuBarQuotaModalMode] = useState<'enable' | 'edit'>('enable');
   const [menuBarQuotaDraftPlatform, setMenuBarQuotaDraftPlatform] =
-    useState<PlatformId>('codex');
+    useState<MenuBarQuotaPlatform>('codex');
   const [menuBarQuotaDraftShowPrefix, setMenuBarQuotaDraftShowPrefix] = useState(true);
   const [floatingCardShowOnStartup, setFloatingCardShowOnStartup] = useState(false);
   const [startupMinimized, setStartupMinimized] = useState(false);
@@ -562,12 +608,14 @@ export function useSettingsPageController() {
   const [errorReportingSaving, setErrorReportingSaving] = useState(false);
   const [opencodeAppPath, setOpencodeAppPath] = useState('');
   const [antigravityAppPath, setAntigravityAppPath] = useState('');
+  const [antigravityLegacyAppPath, setAntigravityLegacyAppPath] = useState('');
   const [codexAppPath, setCodexAppPath] = useState('');
   const [codexOAuthAppVersion, setCodexOAuthAppVersion] = useState('');
   const [codexLaunchCandidates, setCodexLaunchCandidates] = useState<AppLaunchCandidate[]>([]);
   const [codexAppScanError, setCodexAppScanError] = useState('');
   const [claudeAppPath, setClaudeAppPath] = useState('');
   const [claudeAppScanRoots, setClaudeAppScanRoots] = useState('');
+  const [claudeShareCodeSessionsOnSwitch, setClaudeShareCodeSessionsOnSwitch] = useState(false);
   const [codexSpecifiedAppPath, setCodexSpecifiedAppPath] = useState('');
   const [vscodeAppPath, setVscodeAppPath] = useState('');
   const [windsurfAppPath, setWindsurfAppPath] = useState('');
@@ -585,10 +633,12 @@ export function useSettingsPageController() {
   const [traeSoloCnAppPath, setTraeSoloCnAppPath] = useState('');
   const [workbuddyAppPath, setWorkbuddyAppPath] = useState('');
   const [workbuddyShareSessionsOnSwitch, setWorkbuddyShareSessionsOnSwitch] = useState(false);
+  const [minimaxCodeAppPath, setMinimaxCodeAppPath] = useState('');
   const [zedAppPath, setZedAppPath] = useState('');
   const [codebuddyAutoRefresh, setCodebuddyAutoRefresh] = useState('10');
   const [codebuddyCnAutoRefresh, setCodebuddyCnAutoRefresh] = useState('10');
   const [workbuddyAutoRefresh, setWorkbuddyAutoRefresh] = useState('10');
+  const [minimaxCodeAutoRefresh, setMinimaxCodeAutoRefresh] = useState('10');
   const [qoderAutoRefresh, setQoderAutoRefresh] = useState('10');
   const [zcodeAutoRefresh, setZcodeAutoRefresh] = useState('10');
   const [traeAutoRefresh, setTraeAutoRefresh] = useState('10');
@@ -605,7 +655,7 @@ export function useSettingsPageController() {
     Record<CurrentAccountRefreshPlatform, boolean>
   >(() => buildDefaultCurrentAccountRefreshCustomModeMap());
   const [accountOverrides, setAccountOverrides] = useState<AccountRefreshOverrides>(
-    loadAccountRefreshOverrides(),
+    loadAccountRefreshOverrides,
   );
   const [accountLevelRefreshCustomMode, setAccountLevelRefreshCustomMode] = useState<
     Record<string, boolean>
@@ -628,9 +678,12 @@ export function useSettingsPageController() {
   const [zedQuotaAlertThreshold, setZedQuotaAlertThreshold] = useState('20');
   const [workbuddyQuotaAlertEnabled, setWorkbuddyQuotaAlertEnabled] = useState(false);
   const [workbuddyQuotaAlertThreshold, setWorkbuddyQuotaAlertThreshold] = useState('20');
+  const [minimaxCodeQuotaAlertEnabled, setMinimaxCodeQuotaAlertEnabled] = useState(false);
+  const [minimaxCodeQuotaAlertThreshold, setMinimaxCodeQuotaAlertThreshold] = useState('20');
   const [codebuddyAutoRefreshCustomMode, setCodebuddyAutoRefreshCustomMode] = useState(false);
   const [codebuddyCnAutoRefreshCustomMode, setCodebuddyCnAutoRefreshCustomMode] = useState(false);
   const [workbuddyAutoRefreshCustomMode, setWorkbuddyAutoRefreshCustomMode] = useState(false);
+  const [minimaxCodeAutoRefreshCustomMode, setMinimaxCodeAutoRefreshCustomMode] = useState(false);
   const [codebuddyQuotaAlertThresholdCustomMode, setCodebuddyQuotaAlertThresholdCustomMode] = useState(false);
   const [qoderAutoRefreshCustomMode, setQoderAutoRefreshCustomMode] = useState(false);
   const [zcodeAutoRefreshCustomMode, setZcodeAutoRefreshCustomMode] = useState(false);
@@ -647,6 +700,7 @@ export function useSettingsPageController() {
   const [zedQuotaAlertThresholdCustomMode, setZedQuotaAlertThresholdCustomMode] = useState(false);
   const [codebuddyCnQuotaAlertThresholdCustomMode, setCodebuddyCnQuotaAlertThresholdCustomMode] = useState(false);
   const [workbuddyQuotaAlertThresholdCustomMode, setWorkbuddyQuotaAlertThresholdCustomMode] = useState(false);
+  const [minimaxCodeQuotaAlertThresholdCustomMode, setMinimaxCodeQuotaAlertThresholdCustomMode] = useState(false);
   const [appPathResetDetectingTargets, setAppPathResetDetectingTargets] = useState<Set<AppPathTarget>>(new Set());
   const [claudeLaunchCandidates, setClaudeLaunchCandidates] = useState<ClaudeDesktopLaunchCandidate[]>([]);
   const [traeAppScanRoots, setTraeAppScanRoots] = useState('');
@@ -660,6 +714,8 @@ export function useSettingsPageController() {
   const [openclawAuthOverwriteOnSwitch, setOpenclawAuthOverwriteOnSwitch] = useState(false);
   const [hermesAuthOverwriteOnSwitch, setHermesAuthOverwriteOnSwitch] = useState(false);
   const [codexLaunchOnSwitch, setCodexLaunchOnSwitch] = useState(true);
+  const [codexCliAutoRefreshOnSwitch, setCodexCliAutoRefreshOnSwitch] = useState(false);
+  const [codexAutomaticSessionRepair, setCodexAutomaticSessionRepair] = useState<CodexAutomaticSessionRepair>('quick');
   const [codexAutoRestoreTakeoverOnLaunch, setCodexAutoRestoreTakeoverOnLaunch] = useState(true);
   const [antigravityLaunchOnSwitch, setAntigravityLaunchOnSwitch] = useState(true);
   const [codexRestartSpecifiedAppOnSwitch, setCodexRestartSpecifiedAppOnSwitch] = useState(false);
@@ -669,6 +725,9 @@ export function useSettingsPageController() {
   const [antigravityDualSwitchNoRestartEnabled, setAntigravityDualSwitchNoRestartEnabled] = useState(false);
   const [autoSwitchEnabled, setAutoSwitchEnabled] = useState(false);
   const [autoSwitchThreshold, setAutoSwitchThreshold] = useState('20');
+  const [agWindowThresholdsEnabled, setAgWindowThresholdsEnabled] = useState(false);
+  const [agFiveHourThreshold, setAgFiveHourThreshold] = useState('5');
+  const [agWeeklyThreshold, setAgWeeklyThreshold] = useState('5');
   const [autoSwitchCreditsEnabled, setAutoSwitchCreditsEnabled] = useState(false);
   const [autoSwitchCreditsThreshold, setAutoSwitchCreditsThreshold] = useState('5');
   const [autoSwitchAccountScopeMode, setAutoSwitchAccountScopeMode] =
@@ -683,7 +742,8 @@ export function useSettingsPageController() {
   const [quotaAlertEnabled, setQuotaAlertEnabled] = useState(false);
   const [quotaAlertThreshold, setQuotaAlertThreshold] = useState('20');
   const [codexQuotaAlertEnabled, setCodexQuotaAlertEnabled] = useState(false);
-  const [codexQuotaAlertThreshold, setCodexQuotaAlertThreshold] = useState('20');
+  const [codexQuotaAlertPrimaryThreshold, setCodexQuotaAlertPrimaryThreshold] = useState(20);
+  const [codexQuotaAlertSecondaryThreshold, setCodexQuotaAlertSecondaryThreshold] = useState(20);
   const [claudeQuotaAlertEnabled, setClaudeQuotaAlertEnabled] = useState(false);
   const [claudeQuotaAlertThreshold, setClaudeQuotaAlertThreshold] = useState('20');
   const [claudeQuotaDisplayRemaining, setClaudeQuotaDisplayRemaining] = useState(false);
@@ -707,7 +767,6 @@ export function useSettingsPageController() {
   const [autoSwitchThresholdCustomMode, setAutoSwitchThresholdCustomMode] = useState(false);
   const [autoSwitchCreditsThresholdCustomMode, setAutoSwitchCreditsThresholdCustomMode] = useState(false);
   const [quotaAlertThresholdCustomMode, setQuotaAlertThresholdCustomMode] = useState(false);
-  const [codexQuotaAlertThresholdCustomMode, setCodexQuotaAlertThresholdCustomMode] = useState(false);
   const [claudeQuotaAlertThresholdCustomMode, setClaudeQuotaAlertThresholdCustomMode] = useState(false);
   const [ghcpQuotaAlertThresholdCustomMode, setGhcpQuotaAlertThresholdCustomMode] = useState(false);
   const [windsurfQuotaAlertThresholdCustomMode, setWindsurfQuotaAlertThresholdCustomMode] = useState(false);
@@ -732,7 +791,6 @@ export function useSettingsPageController() {
   const generalConfigLoadInFlightRef = useRef(false);
   const hasHydratedGeneralConfigRef = useRef(false);
   const persistedGeneralPayloadRef = useRef<Record<string, unknown> | null>(null);
-  const currentAccountRefreshPersistReadyRef = useRef(false);
   
   const [appVersion, setAppVersion] = useState('');
   const [updateChecking, setUpdateChecking] = useState(false);
@@ -772,9 +830,11 @@ export function useSettingsPageController() {
             : disabledReason === 'tos_violation'
               ? 'TOS_VIOLATION'
               : getSubscriptionTier(account.quota);
+        const badge = getAntigravityTierBadge(account.quota);
         return {
           id: account.id,
           label: account.email,
+          badge: <span className={`tier-badge ${badge.className}`}>{badge.label}</span>,
           searchableText: account.email,
           tags: account.tags || [],
           type,
@@ -786,11 +846,12 @@ export function useSettingsPageController() {
     () =>
       codexAccounts.map((account) => ({
         id: account.id,
-        label: account.email,
-        searchableText: account.email,
+        label: resolveCodexAccountDisplayName(account, t("common.apiKeyAccount")),
+        badge: <CodexAccountPlanBadge account={account} />,
+        searchableText: [resolveCodexAccountDisplayName(account, t("common.apiKeyAccount")), account.email, account.api_base_url].join(" "),
         tags: account.tags || [],
       })),
-    [codexAccounts],
+    [codexAccounts, t],
   );
 
   useEffect(() => {
@@ -943,13 +1004,14 @@ export function useSettingsPageController() {
   const [reportActualPort, setReportActualPort] = useState<number | null>(null);
   const [reportDefaultPort, setReportDefaultPort] = useState(18081);
   const [reportToken, setReportToken] = useState('');
+  const [reportActiveToken, setReportActiveToken] = useState('');
   const [globalProxyEnabled, setGlobalProxyEnabled] = useState(false);
   const [globalProxyUrl, setGlobalProxyUrl] = useState('');
   const [globalProxyNoProxy, setGlobalProxyNoProxy] = useState('');
-  const reportPreviewPort = reportActualPort ?? (parseInt(reportPort, 10) || reportDefaultPort);
-  const reportPreviewToken = encodeURIComponent((reportToken || 'your-token').trim() || 'your-token');
-  const reportRawPreviewUrl = `http://<当前IP>:${reportPreviewPort}/report?token=${reportPreviewToken}`;
-  const reportRenderedPreviewUrl = `${reportRawPreviewUrl}&render=true`;
+  const reportRawPreviewUrl = reportActualPort && reportActiveToken
+    ? `http://127.0.0.1:${reportActualPort}/report?token=${encodeURIComponent(reportActiveToken)}`
+    : '';
+  const reportRenderedPreviewUrl = reportRawPreviewUrl ? `${reportRawPreviewUrl}&render=true` : '';
   const [needsRestart, setNeedsRestart] = useState(false);
   const [networkSaving, setNetworkSaving] = useState(false);
   
@@ -1006,6 +1068,7 @@ export function useSettingsPageController() {
       !codebuddyAutoRefresh.trim() ||
       !codebuddyCnAutoRefresh.trim() ||
       !workbuddyAutoRefresh.trim() ||
+      !minimaxCodeAutoRefresh.trim() ||
       !qoderAutoRefresh.trim() ||
       !zcodeAutoRefresh.trim() ||
       !traeAutoRefresh.trim() ||
@@ -1028,6 +1091,7 @@ export function useSettingsPageController() {
     const codebuddyAutoRefreshNum = parseInt(codebuddyAutoRefresh, 10) || -1;
     const codebuddyCnAutoRefreshNum = parseInt(codebuddyCnAutoRefresh, 10) || -1;
     const workbuddyAutoRefreshNum = parseInt(workbuddyAutoRefresh, 10) || -1;
+    const minimaxCodeAutoRefreshNum = parseInt(minimaxCodeAutoRefresh, 10) || -1;
     const qoderAutoRefreshNum = parseInt(qoderAutoRefresh, 10) || -1;
     const zcodeAutoRefreshNum = parseInt(zcodeAutoRefresh, 10) || -1;
     const traeAutoRefreshNum = parseInt(traeAutoRefresh, 10) || -1;
@@ -1044,7 +1108,6 @@ export function useSettingsPageController() {
     const parsedAutoSwitchThreshold = Number.parseInt(autoSwitchThreshold, 10);
     const parsedAutoSwitchCreditsThreshold = Number.parseInt(autoSwitchCreditsThreshold, 10);
     const parsedQuotaAlertThreshold = Number.parseInt(quotaAlertThreshold, 10);
-    const parsedCodexQuotaAlertThreshold = Number.parseInt(codexQuotaAlertThreshold, 10);
     const parsedClaudeQuotaAlertThreshold = Number.parseInt(claudeQuotaAlertThreshold, 10);
     const parsedGhcpQuotaAlertThreshold = Number.parseInt(ghcpQuotaAlertThreshold, 10);
     const parsedWindsurfQuotaAlertThreshold = Number.parseInt(windsurfQuotaAlertThreshold, 10);
@@ -1052,6 +1115,7 @@ export function useSettingsPageController() {
     const parsedCodebuddyQuotaAlertThreshold = Number.parseInt(codebuddyQuotaAlertThreshold, 10);
     const parsedCodebuddyCnQuotaAlertThreshold = Number.parseInt(codebuddyCnQuotaAlertThreshold, 10);
     const parsedWorkbuddyQuotaAlertThreshold = Number.parseInt(workbuddyQuotaAlertThreshold, 10);
+    const parsedMinimaxCodeQuotaAlertThreshold = Number.parseInt(minimaxCodeQuotaAlertThreshold, 10);
     const parsedQoderQuotaAlertThreshold = Number.parseInt(qoderQuotaAlertThreshold, 10);
     const parsedTraeQuotaAlertThreshold = Number.parseInt(traeQuotaAlertThreshold, 10);
     const parsedTraeSoloQuotaAlertThreshold = Number.parseInt(traeSoloQuotaAlertThreshold, 10);
@@ -1071,6 +1135,7 @@ export function useSettingsPageController() {
       ui_scale: normalizedUiScale,
       auto_refresh_minutes: autoRefreshNum,
       codex_auto_refresh_minutes: codexAutoRefreshNum,
+      codex_auto_refresh_plan_types: sanitizeCodexAutoRefreshPlanKeys(codexAutoRefreshPlanTypes),
       claude_auto_refresh_minutes: claudeAutoRefreshNum,
       codex_sync_wsl: codexSyncWsl,
       codex_app_ui_injection_enabled: codexAppUiInjectionEnabled,
@@ -1081,6 +1146,7 @@ export function useSettingsPageController() {
       codebuddy_auto_refresh_minutes: codebuddyAutoRefreshNum,
       codebuddy_cn_auto_refresh_minutes: codebuddyCnAutoRefreshNum,
       workbuddy_auto_refresh_minutes: workbuddyAutoRefreshNum,
+      minimax_code_auto_refresh_minutes: minimaxCodeAutoRefreshNum,
       qoder_auto_refresh_minutes: qoderAutoRefreshNum,
       zcode_auto_refresh_minutes: zcodeAutoRefreshNum,
       trae_auto_refresh_minutes: traeAutoRefreshNum,
@@ -1096,10 +1162,13 @@ export function useSettingsPageController() {
       close_behavior: closeBehavior,
       minimize_behavior: minimizeBehavior,
       hide_dock_icon: hideDockIcon,
+      show_tray_icon: showTrayIcon,
       tray_icon_style: isMacOS ? trayIconStyle : undefined,
+      menu_bar_left_click_opens_main_window: isMacOS ? menuBarLeftClickOpensMainWindow : undefined,
       menu_bar_quota_enabled: isMacOS ? menuBarQuotaEnabled : undefined,
       menu_bar_show_account_prefix: isMacOS ? menuBarShowAccountPrefix : undefined,
       menu_bar_quota_platform: isMacOS ? menuBarQuotaPlatform : undefined,
+      menu_bar_antigravity_metric: isMacOS ? menuBarAntigravityMetric : undefined,
       floating_card_show_on_startup: floatingCardShowOnStartup,
       startup_minimized: startupMinimized,
       remember_main_window_state: rememberMainWindowState,
@@ -1110,10 +1179,12 @@ export function useSettingsPageController() {
       auto_import_from_local_enabled: autoImportFromLocalEnabled,
       opencode_app_path: opencodeAppPath,
       antigravity_app_path: antigravityAppPath,
+      antigravity_legacy_app_path: antigravityLegacyAppPath,
       codex_app_path: codexAppPath,
       codex_oauth_app_version: codexOAuthAppVersion.trim(),
       claude_app_path: claudeAppPath,
       claude_app_scan_roots: claudeAppScanRoots,
+      claude_share_code_sessions_on_switch: isMacOS ? claudeShareCodeSessionsOnSwitch : undefined,
       codex_specified_app_path: codexSpecifiedAppPath,
       vscode_app_path: vscodeAppPath,
       windsurf_app_path: windsurfAppPath,
@@ -1140,12 +1211,15 @@ export function useSettingsPageController() {
       trae_solo_cn_app_scan_roots: traeSoloCnAppScanRoots,
       workbuddy_app_path: workbuddyAppPath,
       workbuddy_share_sessions_on_switch: workbuddyShareSessionsOnSwitch,
+      minimax_code_app_path: minimaxCodeAppPath,
       zed_app_path: zedAppPath,
       opencode_sync_on_switch: opencodeSyncOnSwitch,
       opencode_auth_overwrite_on_switch: opencodeAuthOverwriteOnSwitch,
       openclaw_auth_overwrite_on_switch: openclawAuthOverwriteOnSwitch,
       hermes_auth_overwrite_on_switch: hermesAuthOverwriteOnSwitch,
       codex_launch_on_switch: codexLaunchOnSwitch,
+      codex_cli_auto_refresh_on_switch: isMacOS ? codexCliAutoRefreshOnSwitch : undefined,
+      codex_automatic_session_repair: codexAutomaticSessionRepair,
       codex_auto_restore_takeover_on_launch: codexAutoRestoreTakeoverOnLaunch,
       antigravity_launch_on_switch: antigravityLaunchOnSwitch,
       codex_restart_specified_app_on_switch: codexRestartSpecifiedAppOnSwitch,
@@ -1157,6 +1231,9 @@ export function useSettingsPageController() {
       auto_switch_threshold: Number.isNaN(parsedAutoSwitchThreshold)
         ? 20
         : parsedAutoSwitchThreshold,
+      auto_switch_window_thresholds_enabled: agWindowThresholdsEnabled,
+      auto_switch_five_hour_threshold: Number(normalizeNumberInput(agFiveHourThreshold || '5', 0, 100)),
+      auto_switch_weekly_threshold: Number(normalizeNumberInput(agWeeklyThreshold || '5', 0, 100)),
       auto_switch_credits_enabled: autoSwitchCreditsEnabled,
       auto_switch_credits_threshold: Number.isNaN(parsedAutoSwitchCreditsThreshold)
         ? 5
@@ -1170,9 +1247,8 @@ export function useSettingsPageController() {
         ? 20
         : parsedQuotaAlertThreshold,
       codex_quota_alert_enabled: codexQuotaAlertEnabled,
-      codex_quota_alert_threshold: Number.isNaN(parsedCodexQuotaAlertThreshold)
-        ? 20
-        : parsedCodexQuotaAlertThreshold,
+      codex_quota_alert_primary_threshold: codexQuotaAlertPrimaryThreshold,
+      codex_quota_alert_secondary_threshold: codexQuotaAlertSecondaryThreshold,
       claude_quota_alert_enabled: claudeQuotaAlertEnabled,
       claude_quota_alert_threshold: Number.isNaN(parsedClaudeQuotaAlertThreshold)
         ? 20
@@ -1205,6 +1281,10 @@ export function useSettingsPageController() {
       workbuddy_quota_alert_threshold: Number.isNaN(parsedWorkbuddyQuotaAlertThreshold)
         ? 20
         : parsedWorkbuddyQuotaAlertThreshold,
+      minimax_code_quota_alert_enabled: minimaxCodeQuotaAlertEnabled,
+      minimax_code_quota_alert_threshold: Number.isNaN(parsedMinimaxCodeQuotaAlertThreshold)
+        ? 20
+        : parsedMinimaxCodeQuotaAlertThreshold,
       qoder_quota_alert_enabled: qoderQuotaAlertEnabled,
       qoder_quota_alert_threshold: Number.isNaN(parsedQoderQuotaAlertThreshold)
         ? 20
@@ -1275,7 +1355,8 @@ export function useSettingsPageController() {
           dispatchSettingsConfigUpdated(configUpdateSource);
         } catch (err) {
           console.error('保存通用配置失败:', err);
-          alert(`${t('settings.network.saveFailed').replace('{error}', String(err))}`);
+          const message = String(err) === 'common.configSaveTimeout' ? t('common.configSaveTimeout') : String(err);
+          alert(`${t('settings.network.saveFailed').replace('{error}', message)}`);
           if (generalSaveQueueRef.current === operation) {
             await loadGeneralConfig();
           }
@@ -1301,6 +1382,7 @@ export function useSettingsPageController() {
   }, [
     autoRefresh,
     codexAutoRefresh,
+    codexAutoRefreshPlanTypes,
     claudeAutoRefresh,
     codexSyncWsl,
     codexAppUiInjectionEnabled,
@@ -1314,6 +1396,7 @@ export function useSettingsPageController() {
     traeSoloCnAutoRefresh,
     zedAutoRefresh,
     workbuddyAutoRefresh,
+    minimaxCodeAutoRefresh,
     qoderAutoRefresh,
     zcodeAutoRefresh,
     cursorAutoRefresh,
@@ -1324,10 +1407,13 @@ export function useSettingsPageController() {
     closeBehavior,
     minimizeBehavior,
     hideDockIcon,
+    showTrayIcon,
     trayIconStyle,
     menuBarQuotaEnabled,
+    menuBarLeftClickOpensMainWindow,
     menuBarShowAccountPrefix,
     menuBarQuotaPlatform,
+    menuBarAntigravityMetric,
     isMacOS,
     floatingCardShowOnStartup,
     startupMinimized,
@@ -1349,9 +1435,11 @@ export function useSettingsPageController() {
     uiScale,
     opencodeAppPath,
     antigravityAppPath,
+    antigravityLegacyAppPath,
     codexAppPath,
     claudeAppPath,
     claudeAppScanRoots,
+    claudeShareCodeSessionsOnSwitch,
     codexSpecifiedAppPath,
     vscodeAppPath,
     windsurfAppPath,
@@ -1373,12 +1461,16 @@ export function useSettingsPageController() {
     traeSoloCnAppScanRoots,
     workbuddyAppPath,
     workbuddyShareSessionsOnSwitch,
+    minimaxCodeAppPath,
     zedAppPath,
     opencodeSyncOnSwitch,
     opencodeAuthOverwriteOnSwitch,
     openclawAuthOverwriteOnSwitch,
     hermesAuthOverwriteOnSwitch,
     codexLaunchOnSwitch,
+    codexCliAutoRefreshOnSwitch,
+    codexAutomaticSessionRepair,
+    codexAutoRestoreTakeoverOnLaunch,
     antigravityLaunchOnSwitch,
     codexRestartSpecifiedAppOnSwitch,
     codexLocalAccessEntryVisible,
@@ -1387,6 +1479,9 @@ export function useSettingsPageController() {
     antigravityDualSwitchNoRestartEnabled,
     autoSwitchEnabled,
     autoSwitchThreshold,
+    agWindowThresholdsEnabled,
+    agFiveHourThreshold,
+    agWeeklyThreshold,
     autoSwitchCreditsEnabled,
     autoSwitchCreditsThreshold,
     autoSwitchAccountScopeMode,
@@ -1396,7 +1491,8 @@ export function useSettingsPageController() {
     quotaAlertEnabled,
     quotaAlertThreshold,
     codexQuotaAlertEnabled,
-    codexQuotaAlertThreshold,
+    codexQuotaAlertPrimaryThreshold,
+    codexQuotaAlertSecondaryThreshold,
     claudeQuotaAlertEnabled,
     claudeQuotaAlertThreshold,
     claudeQuotaDisplayRemaining,
@@ -1414,6 +1510,8 @@ export function useSettingsPageController() {
     codebuddyCnQuotaAlertThreshold,
     workbuddyQuotaAlertEnabled,
     workbuddyQuotaAlertThreshold,
+    minimaxCodeQuotaAlertEnabled,
+    minimaxCodeQuotaAlertThreshold,
     qoderQuotaAlertEnabled,
     qoderQuotaAlertThreshold,
     traeQuotaAlertEnabled,
@@ -1435,23 +1533,20 @@ export function useSettingsPageController() {
   ]);
 
   useEffect(() => {
-    if (!generalLoaded) {
-      return;
-    }
-
-    if (!currentAccountRefreshPersistReadyRef.current) {
-      currentAccountRefreshPersistReadyRef.current = true;
-      return;
-    }
-
-    const payload = CURRENT_ACCOUNT_REFRESH_PLATFORMS.reduce((result, platform) => {
-      const raw = Number.parseInt(currentAccountRefreshMinutes[platform], 10);
-      result[platform] = Number.isNaN(raw) ? 1 : raw;
-      return result;
-    }, {} as Partial<Record<CurrentAccountRefreshPlatform, number>>);
-    saveCurrentAccountRefreshMinutesMap(payload);
-    dispatchSettingsConfigUpdated(configUpdateSource);
-  }, [configUpdateSource, generalLoaded, currentAccountRefreshMinutes]);
+    const reload = () => {
+      const saved = toCurrentAccountRefreshMinutesStringMap(loadCurrentAccountRefreshMinutesMap());
+      setCurrentAccountRefreshMinutes(previous => {
+        const next = { ...saved };
+        for (const platform of CURRENT_ACCOUNT_REFRESH_PLATFORMS) {
+          if (currentAccountRefreshCustomMode[platform]) next[platform] = previous[platform];
+        }
+        return next;
+      });
+      setAccountOverrides(loadAccountRefreshOverrides());
+    };
+    window.addEventListener(CURRENT_ACCOUNT_REFRESH_PREFERENCES_CHANGED_EVENT, reload);
+    return () => window.removeEventListener(CURRENT_ACCOUNT_REFRESH_PREFERENCES_CHANGED_EVENT, reload);
+  }, [currentAccountRefreshCustomMode]);
 
   useEffect(() => {
     const handleLanguageUpdated = (event: Event) => {
@@ -1533,60 +1628,21 @@ export function useSettingsPageController() {
     updateRemindersLoaded,
   ]);
 
-  // 检测配额重置任务状态
   useEffect(() => {
+    let disposed = false;
     const checkResetTasks = () => {
-      try {
-        // 检查唤醒总开关
-        const wakeupEnabledRaw = localStorage.getItem('agtools.wakeup.enabled');
-        const wakeupEnabled = wakeupEnabledRaw === 'true';
-        
-        // 如果总开关关闭，不需要限制
-        if (!wakeupEnabled) {
-          setHasActiveResetTasks(false);
-          return;
-        }
-        
-        // 检查是否有启用的配额重置任务
-        const tasksJson = localStorage.getItem('agtools.wakeup.tasks');
-        if (!tasksJson) {
-          setHasActiveResetTasks(false);
-          return;
-        }
-        
-        const tasks = JSON.parse(tasksJson);
-        const hasReset = Array.isArray(tasks) && tasks.some(
-          (task: any) => task.enabled && task.schedule?.wakeOnReset
-        );
-        setHasActiveResetTasks(hasReset);
-      } catch (error) {
-        console.error('检测配额重置任务失败:', error);
-        setHasActiveResetTasks(false);
-      }
+      void loadAntigravityWakeupState().then((state) => {
+        if (!disposed) setHasActiveResetTasks(hasActiveWakeupQuotaReset(state));
+      }).catch((error) => console.error('检测配额重置任务失败:', error));
     };
-    
-    // 初始检测
     checkResetTasks();
-    
-    // 监听存储变化
-    const handleStorageChange = (e: StorageEvent) => {
-      if (e.key === 'agtools.wakeup.tasks' || e.key === 'agtools.wakeup.enabled') {
-        checkResetTasks();
-      }
-    };
-    
-    window.addEventListener('storage', handleStorageChange);
-    
-    // 监听自定义事件（同一窗口内的任务变更）
-    const handleTasksUpdated = () => checkResetTasks();
-    window.addEventListener('wakeup-tasks-updated', handleTasksUpdated);
-    
+    window.addEventListener(WAKEUP_TASKS_UPDATED, checkResetTasks);
     return () => {
-      window.removeEventListener('storage', handleStorageChange);
-      window.removeEventListener('wakeup-tasks-updated', handleTasksUpdated);
+      disposed = true;
+      window.removeEventListener(WAKEUP_TASKS_UPDATED, checkResetTasks);
     };
   }, []);
-  
+
   const applyTheme = (newTheme: string) => {
     if (newTheme === 'system') {
       const isDark = window.matchMedia('(prefers-color-scheme: dark)').matches;
@@ -1668,6 +1724,7 @@ export function useSettingsPageController() {
       setUiScale(String(config.ui_scale ?? 1));
       setAutoRefresh(String(config.auto_refresh_minutes));
       setCodexAutoRefresh(String(config.codex_auto_refresh_minutes ?? 10));
+      setCodexAutoRefreshPlanTypes(sanitizeCodexAutoRefreshPlanKeys(config.codex_auto_refresh_plan_types));
       setClaudeAutoRefresh(String(config.claude_auto_refresh_minutes ?? 10));
       setCodexSyncWsl(Boolean(config.codex_sync_wsl ?? false));
       setCodexAppUiInjectionEnabled(Boolean(config.codex_app_ui_injection_enabled ?? false));
@@ -1683,10 +1740,13 @@ export function useSettingsPageController() {
       setCloseBehavior(config.close_behavior || 'ask');
       setMinimizeBehavior(config.minimize_behavior || 'dock_and_tray');
       setHideDockIcon(Boolean(config.hide_dock_icon));
+      setShowTrayIcon(config.show_tray_icon ?? true);
+      setMenuBarLeftClickOpensMainWindow(config.menu_bar_left_click_opens_main_window ?? false);
       setTrayIconStyle(config.tray_icon_style === 'color' ? 'color' : 'template');
       setMenuBarQuotaEnabled(config.menu_bar_quota_enabled ?? false);
       setMenuBarShowAccountPrefix(config.menu_bar_show_account_prefix ?? true);
       setMenuBarQuotaPlatform(config.menu_bar_quota_platform ?? 'codex');
+      setMenuBarAntigravityMetric(config.menu_bar_antigravity_metric ?? '');
       setFloatingCardShowOnStartup(config.floating_card_show_on_startup ?? false);
       setStartupMinimized(config.startup_minimized ?? false);
       setRememberMainWindowState(config.remember_main_window_state ?? false);
@@ -1697,10 +1757,12 @@ export function useSettingsPageController() {
       setAutoImportFromLocalEnabled(config.auto_import_from_local_enabled ?? false);
       setOpencodeAppPath(config.opencode_app_path || '');
       setAntigravityAppPath(config.antigravity_app_path || '');
+      setAntigravityLegacyAppPath(config.antigravity_legacy_app_path || '');
       setCodexAppPath(config.codex_app_path || '');
       setCodexOAuthAppVersion(config.codex_oauth_app_version || '');
       setClaudeAppPath(config.claude_app_path || '');
       setClaudeAppScanRoots(config.claude_app_scan_roots || '');
+      setClaudeShareCodeSessionsOnSwitch(config.claude_share_code_sessions_on_switch ?? false);
       setClaudeLaunchCandidates([]);
       setCodexSpecifiedAppPath(config.codex_specified_app_path || '');
       setVscodeAppPath(config.vscode_app_path || '');
@@ -1725,10 +1787,12 @@ export function useSettingsPageController() {
       setTraeLaunchCandidates([]);
       setWorkbuddyAppPath(config.workbuddy_app_path || '');
       setWorkbuddyShareSessionsOnSwitch(config.workbuddy_share_sessions_on_switch ?? false);
+      setMinimaxCodeAppPath(config.minimax_code_app_path || '');
       setZedAppPath(config.zed_app_path || '');
       setCodebuddyAutoRefresh(String(config.codebuddy_auto_refresh_minutes ?? 10));
       setCodebuddyCnAutoRefresh(String(config.codebuddy_cn_auto_refresh_minutes ?? 10));
       setWorkbuddyAutoRefresh(String(config.workbuddy_auto_refresh_minutes ?? 10));
+      setMinimaxCodeAutoRefresh(String(config.minimax_code_auto_refresh_minutes ?? 10));
       setQoderAutoRefresh(String(config.qoder_auto_refresh_minutes ?? 10));
       setZcodeAutoRefresh(String(config.zcode_auto_refresh_minutes ?? 10));
       setTraeAutoRefresh(String(config.trae_auto_refresh_minutes ?? 10));
@@ -1745,6 +1809,8 @@ export function useSettingsPageController() {
       setCodebuddyCnQuotaAlertThreshold(String(config.codebuddy_cn_quota_alert_threshold ?? 20));
       setWorkbuddyQuotaAlertEnabled(config.workbuddy_quota_alert_enabled ?? false);
       setWorkbuddyQuotaAlertThreshold(String(config.workbuddy_quota_alert_threshold ?? 20));
+      setMinimaxCodeQuotaAlertEnabled(config.minimax_code_quota_alert_enabled ?? false);
+      setMinimaxCodeQuotaAlertThreshold(String(config.minimax_code_quota_alert_threshold ?? 20));
       setQoderQuotaAlertEnabled(config.qoder_quota_alert_enabled ?? false);
       setQoderQuotaAlertThreshold(String(config.qoder_quota_alert_threshold ?? 20));
       setTraeQuotaAlertEnabled(config.trae_quota_alert_enabled ?? false);
@@ -1762,6 +1828,8 @@ export function useSettingsPageController() {
       setOpenclawAuthOverwriteOnSwitch(config.openclaw_auth_overwrite_on_switch ?? false);
       setHermesAuthOverwriteOnSwitch(config.hermes_auth_overwrite_on_switch ?? false);
       setCodexLaunchOnSwitch(config.codex_launch_on_switch ?? true);
+      setCodexCliAutoRefreshOnSwitch(config.codex_cli_auto_refresh_on_switch ?? false);
+      setCodexAutomaticSessionRepair(config.codex_automatic_session_repair ?? 'quick');
       setCodexAutoRestoreTakeoverOnLaunch(config.codex_auto_restore_takeover_on_launch ?? true);
       setAntigravityLaunchOnSwitch(config.antigravity_launch_on_switch ?? true);
       setCodexRestartSpecifiedAppOnSwitch(
@@ -1775,6 +1843,9 @@ export function useSettingsPageController() {
       );
       setAutoSwitchEnabled(config.auto_switch_enabled ?? false);
       setAutoSwitchThreshold(String(config.auto_switch_threshold ?? 20));
+      setAgWindowThresholdsEnabled(config.auto_switch_window_thresholds_enabled ?? false);
+      setAgFiveHourThreshold(String(config.auto_switch_five_hour_threshold ?? 5));
+      setAgWeeklyThreshold(String(config.auto_switch_weekly_threshold ?? 5));
       setAutoSwitchCreditsEnabled(config.auto_switch_credits_enabled ?? false);
       setAutoSwitchCreditsThreshold(String(config.auto_switch_credits_threshold ?? 5));
       setAutoSwitchAccountScopeMode(
@@ -1789,7 +1860,12 @@ export function useSettingsPageController() {
       setQuotaAlertEnabled(config.quota_alert_enabled ?? false);
       setQuotaAlertThreshold(String(config.quota_alert_threshold ?? 20));
       setCodexQuotaAlertEnabled(config.codex_quota_alert_enabled ?? false);
-      setCodexQuotaAlertThreshold(String(config.codex_quota_alert_threshold ?? 20));
+      setCodexQuotaAlertPrimaryThreshold(
+        config.codex_quota_alert_primary_threshold ?? config.codex_quota_alert_threshold ?? 20,
+      );
+      setCodexQuotaAlertSecondaryThreshold(
+        config.codex_quota_alert_secondary_threshold ?? config.codex_quota_alert_threshold ?? 20,
+      );
       setClaudeQuotaAlertEnabled(config.claude_quota_alert_enabled ?? false);
       setClaudeQuotaAlertThreshold(String(config.claude_quota_alert_threshold ?? 20));
       const claudeRemainingDisplay = config.claude_quota_display_remaining ?? false;
@@ -1823,7 +1899,6 @@ export function useSettingsPageController() {
       setCursorAutoRefreshCustomMode(false);      setAutoSwitchThresholdCustomMode(false);
       setAutoSwitchCreditsThresholdCustomMode(false);
       setQuotaAlertThresholdCustomMode(false);
-      setCodexQuotaAlertThresholdCustomMode(false);
       setClaudeQuotaAlertThresholdCustomMode(false);
       setGhcpQuotaAlertThresholdCustomMode(false);
       setWindsurfQuotaAlertThresholdCustomMode(false);
@@ -1838,7 +1913,6 @@ export function useSettingsPageController() {
       setTraeSoloCnQuotaAlertThresholdCustomMode(false);
       setZedQuotaAlertThresholdCustomMode(false);
       setCursorQuotaAlertThresholdCustomMode(false);      setCurrentAccountRefreshCustomMode(buildDefaultCurrentAccountRefreshCustomModeMap());
-      currentAccountRefreshPersistReadyRef.current = false;
       // 同步语言
       changeLanguage(config.language);
       applyTheme(config.theme);
@@ -1882,6 +1956,7 @@ export function useSettingsPageController() {
       setReportActualPort(config.report_actual_port);
       setReportDefaultPort(config.report_default_port);
       setReportToken(config.report_token || '');
+      setReportActiveToken(config.report_enabled ? config.report_token.trim() : '');
       setGlobalProxyEnabled(Boolean(config.global_proxy_enabled));
       setGlobalProxyUrl(config.global_proxy_url || '');
       setGlobalProxyNoProxy(config.global_proxy_no_proxy || '');
@@ -1963,7 +2038,11 @@ export function useSettingsPageController() {
         return;
       }
 
-      const result = await invoke<boolean>('save_network_config', {
+      const result = await invoke<{
+        needsRestart: boolean;
+        reportActualPort: number | null;
+        reportError: string | null;
+      }>('save_network_config', {
         wsEnabled,
         wsPort: portNum,
         reportEnabled,
@@ -1974,14 +2053,19 @@ export function useSettingsPageController() {
         globalProxyNoProxy: normalizedGlobalProxyNoProxy,
       });
       
-      if (result) {
-        setNeedsRestart(true);
+      setReportActualPort(result.reportActualPort);
+      setReportActiveToken(reportEnabled ? normalizedToken : '');
+      if (result.needsRestart) setNeedsRestart(true);
+      if (result.reportError) {
+        alert(t('settings.network.reportApplyFailed', { error: result.reportError }));
+      } else if (result.needsRestart) {
         alert(t('settings.network.saveSuccessRestart'));
       } else {
         alert(t('settings.network.saveSuccess'));
       }
     } catch (err) {
-      alert(t('settings.network.saveFailed').replace('{error}', String(err)));
+      const message = String(err) === 'common.configSaveTimeout' ? t('common.configSaveTimeout') : String(err);
+      alert(t('settings.network.saveFailed').replace('{error}', message));
     } finally {
       setNetworkSaving(false);
     }
@@ -2031,11 +2115,11 @@ export function useSettingsPageController() {
   const getTraeAppDisplayName = (target: TraeAppPathTarget) => {
     switch (target) {
       case 'trae_solo':
-        return 'TRAE SOLO';
+        return t('nav.traeSolo');
       case 'trae_cn':
         return 'Trae CN';
       case 'trae_solo_cn':
-        return 'TRAE SOLO CN';
+        return t('nav.traeSoloCn');
       case 'trae':
       default:
         return 'Trae';
@@ -2045,6 +2129,8 @@ export function useSettingsPageController() {
   const setAppPathForTarget = (target: AppPathTarget, path: string) => {
     if (target === 'antigravity') {
       setAntigravityAppPath(path);
+    } else if (target === 'antigravity_legacy') {
+      setAntigravityLegacyAppPath(path);
     } else if (target === 'codex') {
       setCodexAppPath(path);
       setCodexLaunchCandidates([]);
@@ -2073,6 +2159,8 @@ export function useSettingsPageController() {
       setTraeLaunchCandidates([]);
     } else if (target === 'workbuddy') {
       setWorkbuddyAppPath(path);
+    } else if (target === 'minimaxcode') {
+      setMinimaxCodeAppPath(path);
     } else if (target === 'zed') {
       setZedAppPath(path);
     } else {
@@ -2083,6 +2171,8 @@ export function useSettingsPageController() {
   const getAppPathDisplayName = (target: AppPathTarget) => {
     switch (target) {
       case 'antigravity':
+        return 'Antigravity IDE';
+      case 'antigravity_legacy':
         return 'Antigravity';
       case 'codex':
         return 'ChatGPT / Codex';
@@ -2111,6 +2201,8 @@ export function useSettingsPageController() {
         return getTraeAppDisplayName(target);
       case 'workbuddy':
         return 'WorkBuddy';
+      case 'minimaxcode':
+        return 'MiniMax Code';
       case 'zed':
         return 'Zed';
       case 'opencode':
@@ -2151,6 +2243,9 @@ export function useSettingsPageController() {
     }
     if (target === 'workbuddy') {
       return t('settings.general.workbuddyPathReset', '重置默认');
+    }
+    if (target === 'minimaxcode') {
+      return t('settings.general.minimaxCodePathReset', '重置默认');
     }
     if (target === 'zed') {
       return t('settings.general.zedPathReset', '重置默认');
@@ -2221,11 +2316,7 @@ export function useSettingsPageController() {
             setAppPathForTarget(target, candidates[0].target);
           }
         } else {
-          const message = t(
-            'appPath.missing.scanEmptyGeneric',
-            '未检测到正在运行的 {{app}}，请先启动应用后重试，或手动选择路径。',
-            { app: getAppPathDisplayName(target) },
-          );
+          const message = t('appPath.missing.scanEmptyGeneric', { app: getAppPathDisplayName(target) });
           if (target === 'codex') {
             setCodexAppScanError(message);
           } else {
@@ -2349,11 +2440,15 @@ export function useSettingsPageController() {
   const setCurrentAccountRefreshValue = (
     platform: CurrentAccountRefreshPlatform,
     value: string,
+    commit = true,
   ) => {
-    setCurrentAccountRefreshMinutes((prev) => ({
-      ...prev,
-      [platform]: value,
-    }));
+    setCurrentAccountRefreshMinutes((prev) => ({ ...prev, [platform]: value }));
+    if (commit) {
+      saveCurrentAccountRefreshMinutesMap({
+        ...loadCurrentAccountRefreshMinutesMap(),
+        [platform]: Number.parseInt(value, 10),
+      });
+    }
   };
 
   const setCurrentAccountRefreshCustomModeValue = (
@@ -2393,6 +2488,8 @@ export function useSettingsPageController() {
         return parseRefresh(codebuddyCnAutoRefresh) > 0;
       case 'workbuddy':
         return parseRefresh(workbuddyAutoRefresh) > 0;
+      case 'minimaxcode':
+        return parseRefresh(minimaxCodeAutoRefresh) > 0;
       case 'qoder':
         return parseRefresh(qoderAutoRefresh) > 0;
       case 'zcode':
@@ -2442,7 +2539,7 @@ export function useSettingsPageController() {
                   value={value}
                   placeholder={t('quickSettings.inputMinutes', '输入分钟数')}
                   onChange={(event) =>
-                    setCurrentAccountRefreshValue(platform, sanitizeNumberInput(event.target.value))
+                    setCurrentAccountRefreshValue(platform, sanitizeNumberInput(event.target.value), false)
                   }
                   onBlur={() => {
                     const normalized = normalizeNumberInput(value, 1, 999);
@@ -2462,43 +2559,41 @@ export function useSettingsPageController() {
                 <span className="settings-input-unit">{t('settings.general.minutes')}</span>
               </div>
             ) : (
-              <select
-                className="settings-select"
-                style={{ minWidth: '120px', width: 'auto' }}
+              <SettingsDropdown
                 value={displayValue}
-                onChange={(event) => {
+                ariaLabel={t('settings.general.currentAccountRefreshTitle')}
+                disabled={!currentRefreshAvailable}
+                onChange={(nextValue) => {
                   if (!currentRefreshAvailable) {
                     return;
                   }
-                  const nextValue = event.target.value;
                   if (nextValue === 'custom') {
                     setCurrentAccountRefreshCustomModeValue(platform, true);
                     setCurrentAccountRefreshValue(
                       platform,
                       value || String(CURRENT_ACCOUNT_REFRESH_PRESET_VALUES[0]),
+                      false,
                     );
                     return;
                   }
                   setCurrentAccountRefreshCustomModeValue(platform, false);
                   setCurrentAccountRefreshValue(platform, nextValue);
                 }}
-                disabled={!currentRefreshAvailable}
-              >
-                {!currentRefreshAvailable && (
-                  <option value="-1">{t('settings.general.autoRefreshDisabled')}</option>
-                )}
-                {!isPreset && (
-                  <option value={value}>
-                    {value} {t('settings.general.minutes')}
-                  </option>
-                )}
-                <option value="1">1 {t('settings.general.minutes')}</option>
-                <option value="2">2 {t('settings.general.minutes')}</option>
-                <option value="5">5 {t('settings.general.minutes')}</option>
-                <option value="10">10 {t('settings.general.minutes')}</option>
-                <option value="15">15 {t('settings.general.minutes')}</option>
-                <option value="custom">{t('settings.general.autoRefreshCustom')}</option>
-              </select>
+                options={[
+                  ...(!currentRefreshAvailable
+                    ? [{ value: '-1', label: t('settings.general.autoRefreshDisabled') }]
+                    : []),
+                  ...(!isPreset
+                    ? [{ value, label: `${value} ${t('settings.general.minutes')}` }]
+                    : []),
+                  { value: '1', label: `1 ${t('settings.general.minutes')}` },
+                  { value: '2', label: `2 ${t('settings.general.minutes')}` },
+                  { value: '5', label: `5 ${t('settings.general.minutes')}` },
+                  { value: '10', label: `10 ${t('settings.general.minutes')}` },
+                  { value: '15', label: `15 ${t('settings.general.minutes')}` },
+                  { value: 'custom', label: t('settings.general.autoRefreshCustom') },
+                ]}
+              />
             )}
           </div>
         </div>
@@ -2508,7 +2603,7 @@ export function useSettingsPageController() {
 
   const getAccountsForPlatform = (
     platform: CurrentAccountRefreshPlatform,
-  ): Array<{ id: string; email: string }> => {
+  ): Array<{ id: string; email: string; displayLabel?: string }> => {
     const getProviderAccounts = <T extends { id: string; email?: string | null }>(
       store: { getState: () => { accounts: T[] } },
       getDisplayEmail: (account: T) => string,
@@ -2530,7 +2625,7 @@ export function useSettingsPageController() {
       case 'antigravity':
         return antigravityAccounts.map((a) => ({ id: a.id, email: a.email }));
       case 'codex':
-        return codexAccounts.map((a) => ({ id: a.id, email: a.email }));
+        return codexAccounts.map((a) => ({ id: a.id, email: a.email, displayLabel: resolveCodexAccountDisplayName(a, t("common.apiKeyAccount")) }));
       case 'claude':
         return getProviderAccounts(useClaudeAccountStore, getClaudeAccountDisplayEmail);
       case 'ghcp':
@@ -2549,6 +2644,8 @@ export function useSettingsPageController() {
         return getProviderAccounts(useCodebuddyCnAccountStore, getCodebuddyAccountDisplayEmail);
       case 'workbuddy':
         return getProviderAccounts(useWorkbuddyAccountStore, getWorkbuddyAccountDisplayEmail);
+      case 'minimaxcode':
+        return getProviderAccounts(useMinimaxCodeAccountStore, getMinimaxCodeAccountDisplayEmail);
       case 'qoder':
         return getProviderAccounts(useQoderAccountStore, getQoderAccountDisplayEmail);
       case 'zcode':
@@ -2616,23 +2713,20 @@ export function useSettingsPageController() {
       <div className="settings-row">
         <div className="row-label">
           <div className="row-title">
-            {t('settings.general.accountLevelRefreshTitle', '账号级刷新配置')}
+            {t('settings.general.accountLevelRefreshTitle')}
           </div>
           <div className="row-desc">
-            {t(
-              'settings.general.accountLevelRefreshDesc',
-              '为不同账号设置不同的自动刷新间隔，覆盖平台级默认值。',
-            )}
+            {t('settings.general.accountLevelRefreshDesc')}
           </div>
         </div>
         <div className="row-control">
           <details>
             <summary style={{ cursor: 'pointer', fontSize: '13px', color: 'var(--text-secondary)' }}>
               {hasAnyOverride
-                ? t('settings.general.accountLevelRefreshSummaryActive', '已配置 {{count}} 个账号', {
+                ? t('settings.general.accountLevelRefreshSummaryActive', {
                     count: Object.keys(platformOverrides).length,
                   })
-                : t('settings.general.accountLevelRefreshSummary', '展开配置')}
+                : t('settings.general.accountLevelRefreshSummary')}
             </summary>
             <div style={{ marginTop: '8px', display: 'flex', flexDirection: 'column', gap: '6px' }}>
               {accounts.map((account) => {
@@ -2655,9 +2749,9 @@ export function useSettingsPageController() {
                         textOverflow: 'ellipsis',
                         whiteSpace: 'nowrap',
                       }}
-                      title={account.email}
+                      title={account.displayLabel || account.email}
                     >
-                      {account.email}
+                      {account.displayLabel || account.email}
                     </span>
                     {isCustomMode ? (
                       <div className="settings-inline-input" style={{ minWidth: '100px', width: 'auto' }}>
@@ -2706,32 +2800,30 @@ export function useSettingsPageController() {
                         <span className="settings-input-unit">{t('settings.general.minutes')}</span>
                       </div>
                     ) : (
-                      <select
-                        className="settings-select"
-                        style={{ minWidth: '100px', width: 'auto', fontSize: '12px' }}
+                      <SettingsDropdown
+                        className="settings-dropdown--compact"
                         value={selectValue}
-                        onChange={(e) =>
-                          handleAccountOverrideChange(platform, account.email, e.target.value)
+                        ariaLabel={account.email}
+                        onChange={(nextValue) =>
+                          handleAccountOverrideChange(platform, account.email, nextValue)
                         }
-                      >
-                        <option value="inherit">
-                          {t('settings.general.accountLevelRefreshInherit', '继承平台设置')}
-                        </option>
-                        <option value="-1">
-                          {t('settings.general.accountLevelRefreshDisabled', '禁用')}
-                        </option>
-                        <option value="1">1 {t('settings.general.minutes')}</option>
-                        <option value="2">2 {t('settings.general.minutes')}</option>
-                        <option value="5">5 {t('settings.general.minutes')}</option>
-                        <option value="10">10 {t('settings.general.minutes')}</option>
-                        <option value="15">15 {t('settings.general.minutes')}</option>
-                        {!isPreset && overrideValue !== undefined && overrideValue > 0 && (
-                          <option value={String(overrideValue)}>
-                            {overrideValue} {t('settings.general.minutes')}
-                          </option>
-                        )}
-                        <option value="custom">{t('settings.general.autoRefreshCustom', '自定义')}</option>
-                      </select>
+                        options={[
+                          { value: 'inherit', label: t('settings.general.accountLevelRefreshInherit') },
+                          { value: '-1', label: t('settings.general.autoRefreshDisabled', '禁用') },
+                          { value: '1', label: `1 ${t('settings.general.minutes')}` },
+                          { value: '2', label: `2 ${t('settings.general.minutes')}` },
+                          { value: '5', label: `5 ${t('settings.general.minutes')}` },
+                          { value: '10', label: `10 ${t('settings.general.minutes')}` },
+                          { value: '15', label: `15 ${t('settings.general.minutes')}` },
+                          ...(!isPreset && overrideValue !== undefined && overrideValue > 0
+                            ? [{
+                                value: String(overrideValue),
+                                label: `${overrideValue} ${t('settings.general.minutes')}`,
+                              }]
+                            : []),
+                          { value: 'custom', label: t('settings.general.autoRefreshCustom', '自定义') },
+                        ]}
+                      />
                     )}
                   </div>
                 );
@@ -2792,33 +2884,13 @@ export function useSettingsPageController() {
               <span className="settings-input-unit">{t('settings.general.minutes')}</span>
             </div>
           ) : (
-            <select
-              className="settings-select"
-              style={{ minWidth: '120px', width: 'auto' }}
+            <SettingsRefreshPresetDropdown
               value={value}
-              onChange={(event) => {
-                const nextValue = event.target.value;
-                if (nextValue === 'custom') {
-                  setCustomMode(true);
-                  setValue(value !== '-1' ? value : '1');
-                  return;
-                }
-                setCustomMode(false);
-                setValue(nextValue);
-              }}
-            >
-              {!isPreset && (
-                <option value={value}>
-                  {value} {t('settings.general.minutes')}
-                </option>
-              )}
-              <option value="-1">{t('settings.general.autoRefreshDisabled')}</option>
-              <option value="2">2 {t('settings.general.minutes')}</option>
-              <option value="5">5 {t('settings.general.minutes')}</option>
-              <option value="10">10 {t('settings.general.minutes')}</option>
-              <option value="15">15 {t('settings.general.minutes')}</option>
-              <option value="custom">{t('settings.general.autoRefreshCustom')}</option>
-            </select>
+              isPreset={isPreset}
+              setValue={setValue}
+              setCustomMode={setCustomMode}
+              ariaLabel={title}
+            />
           )}
         </div>
       </div>
@@ -2898,27 +2970,13 @@ export function useSettingsPageController() {
                 <span className="settings-input-unit">%</span>
               </div>
             ) : (
-              <select
-                className="settings-select"
+              <SettingsThresholdPresetDropdown
                 value={threshold}
-                onChange={(event) => {
-                  const nextValue = event.target.value;
-                  if (nextValue === 'custom') {
-                    setCustomMode(true);
-                    setThreshold(threshold || '20');
-                    return;
-                  }
-                  setCustomMode(false);
-                  setThreshold(nextValue);
-                }}
-              >
-                {!isPreset && <option value={threshold}>{threshold}%</option>}
-                <option value="0">0%</option>
-                <option value="20">20%</option>
-                <option value="40">40%</option>
-                <option value="60">60%</option>
-                <option value="custom">{t('settings.general.autoRefreshCustom')}</option>
-              </select>
+                isPreset={isPreset}
+                setValue={setThreshold}
+                setCustomMode={setCustomMode}
+                ariaLabel={t('quickSettings.quotaAlert.threshold', '预警阈值')}
+              />
             )}
           </div>
         </div>
@@ -3001,7 +3059,7 @@ export function useSettingsPageController() {
     const displayName = getTraeAppDisplayName(target);
 
     return (
-      <div style={{ order }}>
+      <PlatformSettingsSection platformId={target} order={order}>
         <div className="group-title">{t(titleKey, titleDefault)}</div>
         <div className="settings-group">
           {renderPlatformAutoRefreshRow({
@@ -3029,7 +3087,7 @@ export function useSettingsPageController() {
             isPreset: quotaAlertThresholdIsPreset,
           })}
         </div>
-      </div>
+      </PlatformSettingsSection>
     );
   };
 
@@ -3042,6 +3100,7 @@ export function useSettingsPageController() {
   const codebuddyAutoRefreshIsPreset = REFRESH_PRESET_VALUES.includes(codebuddyAutoRefresh);
   const codebuddyCnAutoRefreshIsPreset = REFRESH_PRESET_VALUES.includes(codebuddyCnAutoRefresh);
   const workbuddyAutoRefreshIsPreset = REFRESH_PRESET_VALUES.includes(workbuddyAutoRefresh);
+  const minimaxCodeAutoRefreshIsPreset = REFRESH_PRESET_VALUES.includes(minimaxCodeAutoRefresh);
   const qoderAutoRefreshIsPreset = REFRESH_PRESET_VALUES.includes(qoderAutoRefresh);
   const zcodeAutoRefreshIsPreset = REFRESH_PRESET_VALUES.includes(zcodeAutoRefresh);
   const traeAutoRefreshIsPreset = REFRESH_PRESET_VALUES.includes(traeAutoRefresh);
@@ -3054,7 +3113,6 @@ export function useSettingsPageController() {
     autoSwitchCreditsThreshold,
   );
   const quotaAlertThresholdIsPreset = THRESHOLD_PRESET_VALUES.includes(quotaAlertThreshold);
-  const codexQuotaAlertThresholdIsPreset = THRESHOLD_PRESET_VALUES.includes(codexQuotaAlertThreshold);
   const claudeQuotaAlertThresholdIsPreset = THRESHOLD_PRESET_VALUES.includes(claudeQuotaAlertThreshold);
   const ghcpQuotaAlertThresholdIsPreset = THRESHOLD_PRESET_VALUES.includes(ghcpQuotaAlertThreshold);
   const windsurfQuotaAlertThresholdIsPreset = THRESHOLD_PRESET_VALUES.includes(windsurfQuotaAlertThreshold);
@@ -3062,6 +3120,7 @@ export function useSettingsPageController() {
   const codebuddyQuotaAlertThresholdIsPreset = THRESHOLD_PRESET_VALUES.includes(codebuddyQuotaAlertThreshold);
   const codebuddyCnQuotaAlertThresholdIsPreset = THRESHOLD_PRESET_VALUES.includes(codebuddyCnQuotaAlertThreshold);
   const workbuddyQuotaAlertThresholdIsPreset = THRESHOLD_PRESET_VALUES.includes(workbuddyQuotaAlertThreshold);
+  const minimaxCodeQuotaAlertThresholdIsPreset = THRESHOLD_PRESET_VALUES.includes(minimaxCodeQuotaAlertThreshold);
   const qoderQuotaAlertThresholdIsPreset = THRESHOLD_PRESET_VALUES.includes(qoderQuotaAlertThreshold);
   const traeQuotaAlertThresholdIsPreset = THRESHOLD_PRESET_VALUES.includes(traeQuotaAlertThreshold);
   const traeSoloQuotaAlertThresholdIsPreset = THRESHOLD_PRESET_VALUES.includes(traeSoloQuotaAlertThreshold);
@@ -3134,6 +3193,7 @@ export function useSettingsPageController() {
 
   const openMenuBarQuotaModal = (mode: 'enable' | 'edit') => {
     setMenuBarQuotaDraftPlatform(menuBarQuotaPlatform);
+    setMenuBarAntigravityMetricDraft(menuBarAntigravityMetric);
     setMenuBarQuotaDraftShowPrefix(menuBarShowAccountPrefix);
     setMenuBarQuotaModalMode(mode);
     setMenuBarQuotaModalOpen(true);
@@ -3145,6 +3205,7 @@ export function useSettingsPageController() {
 
   const handleConfirmMenuBarQuotaModal = () => {
     setMenuBarQuotaPlatform(menuBarQuotaDraftPlatform);
+    setMenuBarAntigravityMetric(menuBarAntigravityMetricDraft);
     setMenuBarShowAccountPrefix(menuBarQuotaDraftShowPrefix);
     setMenuBarQuotaEnabled(true);
     setMenuBarQuotaModalOpen(false);
@@ -3208,6 +3269,7 @@ export function useSettingsPageController() {
     actualPort,
     antigravityAccountGroups,
     antigravityAppPath,
+    antigravityLegacyAppPath,
     antigravityDualSwitchNoRestartEnabled,
     antigravityLaunchOnSwitch,
     antigravityScopeAccounts,
@@ -3233,6 +3295,9 @@ export function useSettingsPageController() {
     autoSwitchEnabled,
     autoSwitchSelectedAccountIds,
     autoSwitchThreshold,
+    agWindowThresholdsEnabled,
+    agFiveHourThreshold,
+    agWeeklyThreshold,
     autoSwitchThresholdCustomMode,
     autoSwitchThresholdIsPreset,
     claudeAppPath,
@@ -3245,6 +3310,8 @@ export function useSettingsPageController() {
     claudeQuotaAlertThresholdCustomMode,
     claudeQuotaAlertThresholdIsPreset,
     claudeQuotaDisplayRemaining,
+    claudeShareCodeSessionsOnSwitch,
+    setClaudeShareCodeSessionsOnSwitch,
     closeBehavior,
     codebuddyAppPath,
     codebuddyAutoRefresh,
@@ -3269,6 +3336,7 @@ export function useSettingsPageController() {
     codexAppScanError,
     codexAppUiInjectionEnabled,
     codexAutoRefresh,
+    codexAutoRefreshPlanTypes,
     codexAutoRefreshCustomMode,
     codexAutoRefreshIsPreset,
     codexAutoSwitchAccountScopeMode,
@@ -3276,15 +3344,16 @@ export function useSettingsPageController() {
     codexAutoSwitchSelectedAccountIds,
     codexGroups,
     codexHideRelayQuota,
+    codexCliAutoRefreshOnSwitch,
     codexLaunchCandidates,
     codexLaunchOnSwitch,
+    codexAutomaticSessionRepair,
     codexAutoRestoreTakeoverOnLaunch,
     setCodexAutoRestoreTakeoverOnLaunch,
     codexLocalAccessEntryVisible,
     codexQuotaAlertEnabled,
-    codexQuotaAlertThreshold,
-    codexQuotaAlertThresholdCustomMode,
-    codexQuotaAlertThresholdIsPreset,
+    codexQuotaAlertPrimaryThreshold,
+    codexQuotaAlertSecondaryThreshold,
     codexRestartSpecifiedAppOnSwitch,
     codexScopeAccounts,
     codexSpecifiedAppPath,
@@ -3363,12 +3432,24 @@ export function useSettingsPageController() {
     loadGeneralConfig,
     loadUpdateSettings,
     menuBarQuotaDraftPlatform,
+    menuBarAntigravityAccounts: antigravityAccounts,
+    menuBarAntigravityMetricDraft,
+    menuBarLeftClickOpensMainWindow,
+    setMenuBarLeftClickOpensMainWindow,
     menuBarQuotaDraftShowPrefix,
     menuBarQuotaEnabled,
     menuBarQuotaModalMode,
     menuBarQuotaModalOpen,
     menuBarQuotaPlatform,
     menuBarQuotaPlatformOptions,
+    minimaxCodeAppPath,
+    minimaxCodeAutoRefresh,
+    minimaxCodeAutoRefreshCustomMode,
+    minimaxCodeAutoRefreshIsPreset,
+    minimaxCodeQuotaAlertEnabled,
+    minimaxCodeQuotaAlertThreshold,
+    minimaxCodeQuotaAlertThresholdCustomMode,
+    minimaxCodeQuotaAlertThresholdIsPreset,
     needsRestart,
     networkSaving,
     normalizeNumberInput,
@@ -3417,6 +3498,7 @@ export function useSettingsPageController() {
     saveGrokCliPath,
     setActiveTab,
     setAntigravityAppPath,
+    setAntigravityLegacyAppPath,
     setAntigravityDualSwitchNoRestartEnabled,
     setAntigravityLaunchOnSwitch,
     setAppAutoLaunchEnabled,
@@ -3433,6 +3515,9 @@ export function useSettingsPageController() {
     setAutoSwitchEnabled,
     setAutoSwitchSelectedAccountIds,
     setAutoSwitchThreshold,
+    setAgWindowThresholdsEnabled,
+    setAgFiveHourThreshold,
+    setAgWeeklyThreshold,
     setAutoSwitchThresholdCustomMode,
     setClaudeAppPath,
     setClaudeAutoRefresh,
@@ -3461,16 +3546,19 @@ export function useSettingsPageController() {
     setCodexAppScanError,
     setCodexAppUiInjectionEnabled,
     setCodexAutoRefresh,
+    setCodexAutoRefreshPlanTypes,
     setCodexAutoRefreshCustomMode,
     setCodexAutoSwitchAccountScopeMode,
     setCodexAutoSwitchSelectedAccountIds,
     setCodexHideRelayQuota,
     setCodexLaunchCandidates,
     setCodexLaunchOnSwitch,
+    setCodexCliAutoRefreshOnSwitch,
+    setCodexAutomaticSessionRepair,
     setCodexLocalAccessEntryVisible,
     setCodexQuotaAlertEnabled,
-    setCodexQuotaAlertThreshold,
-    setCodexQuotaAlertThresholdCustomMode,
+    setCodexQuotaAlertPrimaryThreshold,
+    setCodexQuotaAlertSecondaryThreshold,
     setCodexRestartSpecifiedAppOnSwitch,
     setCodexSpecifiedAppPath,
     setCodexSyncWsl,
@@ -3503,14 +3591,22 @@ export function useSettingsPageController() {
     setGrokSyncOfficialAuthOnSwitch,
     setHermesAuthOverwriteOnSwitch,
     setHideDockIcon,
+    setShowTrayIcon,
     setKiroAppPath,
     setKiroAutoRefresh,
     setKiroAutoRefreshCustomMode,
     setKiroQuotaAlertEnabled,
     setKiroQuotaAlertThreshold,
     setKiroQuotaAlertThresholdCustomMode,
+    setMinimaxCodeAppPath,
+    setMinimaxCodeAutoRefresh,
+    setMinimaxCodeAutoRefreshCustomMode,
+    setMinimaxCodeQuotaAlertEnabled,
+    setMinimaxCodeQuotaAlertThreshold,
+    setMinimaxCodeQuotaAlertThresholdCustomMode,
     setLanguage,
     setMenuBarQuotaDraftPlatform,
+    setMenuBarAntigravityMetricDraft,
     setMenuBarQuotaDraftShowPrefix,
     setMenuBarQuotaEnabled,
     setOpenclawAuthOverwriteOnSwitch,
@@ -3631,6 +3727,7 @@ export function useSettingsPageController() {
     traeSoloQuotaAlertThresholdCustomMode,
     traeSoloQuotaAlertThresholdIsPreset,
     trayIconStyle,
+    showTrayIcon,
     uiScale,
     updateChecking,
     updateCheckMessage,

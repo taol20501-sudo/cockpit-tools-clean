@@ -29,13 +29,13 @@ body.floating-card-overlay-root,
   border: 1px solid rgba(255, 255, 255, 0.1);
   border-radius: 15px;
   background:
-    radial-gradient(circle at top left, rgba(255, 184, 76, 0.13), transparent 26%),
-    radial-gradient(circle at top right, rgba(84, 199, 255, 0.08), transparent 22%),
-    linear-gradient(180deg, rgba(10, 14, 20, 0.76), rgba(5, 7, 11, 0.68));
+    radial-gradient(circle at top left, rgba(255, 184, 76, calc(0.13 * var(--floating-card-background-opacity, 1))), transparent 26%),
+    radial-gradient(circle at top right, rgba(84, 199, 255, calc(0.08 * var(--floating-card-background-opacity, 1))), transparent 22%),
+    linear-gradient(180deg, rgba(10, 14, 20, calc(0.76 * var(--floating-card-background-opacity, 1))), rgba(5, 7, 11, calc(0.68 * var(--floating-card-background-opacity, 1))));
   box-shadow:
-    0 22px 50px rgba(0, 0, 0, 0.46),
-    0 0 0 1px rgba(255, 255, 255, 0.03),
-    inset 0 1px 0 rgba(255, 255, 255, 0.08);
+    0 22px 50px rgba(0, 0, 0, calc(0.46 * var(--floating-card-background-opacity, 1))),
+    0 0 0 1px rgba(255, 255, 255, calc(0.03 * var(--floating-card-background-opacity, 1))),
+    inset 0 1px 0 rgba(255, 255, 255, calc(0.08 * var(--floating-card-background-opacity, 1)));
   overflow: hidden;
 }
 
@@ -44,11 +44,11 @@ body.floating-card-overlay-root,
   position: absolute;
   inset: 0;
   background:
-    linear-gradient(180deg, rgba(255, 255, 255, 0.04), transparent 16%),
+    linear-gradient(180deg, rgba(255, 255, 255, calc(0.04 * var(--floating-card-background-opacity, 1))), transparent 16%),
     repeating-linear-gradient(
       180deg,
-      rgba(255, 255, 255, 0.01) 0,
-      rgba(255, 255, 255, 0.01) 1px,
+      rgba(255, 255, 255, calc(0.01 * var(--floating-card-background-opacity, 1))) 0,
+      rgba(255, 255, 255, calc(0.01 * var(--floating-card-background-opacity, 1))) 1px,
       transparent 1px,
       transparent 4px
     );
@@ -75,7 +75,7 @@ body.floating-card-overlay-root,
 .floating-card-header-main,
 .floating-card-header-actions,
 .floating-card-icon-button,
-.floating-card-platform-select,
+.floating-card-platform-dropdown,
 .floating-card-nav-button,
 .floating-card-button {
   -webkit-app-region: no-drag;
@@ -84,7 +84,8 @@ body.floating-card-overlay-root,
 .floating-card-header-main {
   display: flex;
   min-width: 0;
-  flex: 0 0 auto;
+  flex: 1;
+  overflow: hidden;
   align-items: center;
   gap: 7px;
 }
@@ -100,44 +101,61 @@ body.floating-card-overlay-root,
 }
 
 .floating-card-header-title {
-  position: absolute;
-  left: 50%;
-  top: 50%;
+  position: static;
   min-width: 0;
-  max-width: calc(100% - 120px);
+  max-width: 100%;
+  flex: 1;
   color: #f5f8fc;
   font-size: 13px;
   font-weight: 800;
   line-height: 1.15;
   letter-spacing: -0.02em;
-  text-align: center;
-  transform: translate(-50%, -50%);
+  text-align: left;
+  transform: none;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
   pointer-events: none;
 }
 
-.floating-card-platform-select {
+.floating-card-platform-dropdown {
   width: 100%;
   min-width: 0;
+  -webkit-app-region: no-drag;
+}
+
+.floating-card-platform-dropdown .single-select-dropdown-trigger {
+  width: 100%;
+  min-height: 24px;
   height: 24px;
-  padding: 0 22px 0 8px;
+  padding: 0 7px 0 8px;
+  gap: 4px;
   border: 1px solid rgba(255, 255, 255, 0.08);
   border-radius: 10px;
   background: rgba(11, 16, 23, 0.74);
-  color: #f3f6fa;
-  font-size: 10px;
-  font-weight: 700;
-  outline: none;
   box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.03);
+  color: #f3f6fa;
 }
 
-.floating-card-platform-select:focus {
-  border-color: rgba(255, 184, 76, 0.48);
+.floating-card-platform-dropdown .single-select-dropdown-trigger:hover:not(:disabled),
+.floating-card-platform-dropdown .single-select-dropdown-trigger.open {
+  border-color: rgba(255, 184, 76, 0.42);
+  background: rgba(18, 25, 34, 0.84);
   box-shadow:
-    inset 0 1px 0 rgba(255, 255, 255, 0.03),
+    inset 0 1px 0 rgba(255, 255, 255, 0.04),
     0 0 0 2px rgba(255, 184, 76, 0.14);
+}
+
+.floating-card-platform-dropdown .single-select-dropdown-value {
+  font-size: 10px;
+  font-weight: 700;
+  color: inherit;
+}
+
+.floating-card-platform-dropdown .single-select-dropdown-arrow {
+  width: 12px;
+  height: 12px;
+  color: #aeb8c4;
 }
 
 .floating-card-platform-lock {
@@ -167,6 +185,11 @@ body.floating-card-overlay-root,
 
 .floating-card-icon-button,
 .floating-card-nav-button {
+  appearance: none;
+  font-family: inherit;
+  font-size: inherit;
+  font-weight: inherit;
+  line-height: inherit;
   width: 22px;
   height: 22px;
   display: inline-flex;
@@ -256,7 +279,7 @@ body.floating-card-overlay-root,
   padding: 3px 6px;
   border: 1px solid rgba(255, 255, 255, 0.08);
   border-radius: 999px;
-  background: rgba(12, 18, 25, 0.72);
+  background: rgba(12, 18, 25, calc(0.72 * var(--floating-card-background-opacity, 1)));
   color: #cbd4df;
   font-size: 9px;
   font-weight: 700;
@@ -275,11 +298,11 @@ body.floating-card-overlay-root,
   border: 1px solid rgba(255, 255, 255, 0.06);
   border-radius: 11px;
   background:
-    linear-gradient(180deg, rgba(17, 24, 33, 0.56), rgba(9, 13, 18, 0.5)),
-    linear-gradient(180deg, rgba(255, 184, 76, 0.03), transparent 40%);
+    linear-gradient(180deg, rgba(17, 24, 33, calc(0.56 * var(--floating-card-background-opacity, 1))), rgba(9, 13, 18, calc(0.5 * var(--floating-card-background-opacity, 1)))),
+    linear-gradient(180deg, rgba(255, 184, 76, calc(0.03 * var(--floating-card-background-opacity, 1))), transparent 40%);
   box-shadow:
-    inset 0 1px 0 rgba(255, 255, 255, 0.03),
-    inset 0 -1px 0 rgba(255, 255, 255, 0.02);
+    inset 0 1px 0 rgba(255, 255, 255, calc(0.03 * var(--floating-card-background-opacity, 1))),
+    inset 0 -1px 0 rgba(255, 255, 255, calc(0.02 * var(--floating-card-background-opacity, 1)));
 }
 
 .floating-card-account-head {
@@ -336,7 +359,7 @@ body.floating-card-overlay-root,
   min-width: 0;
   padding: 4px 6px;
   border-radius: 999px;
-  background: rgba(9, 14, 20, 0.72);
+  background: rgba(9, 14, 20, calc(0.72 * var(--floating-card-background-opacity, 1)));
   border: 1px solid rgba(255, 255, 255, 0.06);
 }
 
@@ -413,10 +436,10 @@ body.floating-card-overlay-root,
 }
 
 .floating-card-plan.codex-pro-max {
-  border-color: rgba(255, 184, 76, 0.34);
-  background: linear-gradient(135deg, rgba(255, 247, 204, 0.95) 0%, rgba(246, 211, 101, 0.94) 42%, rgba(217, 155, 22, 0.94) 100%);
+  border-color: rgba(217, 171, 78, 0.3);
+  background: linear-gradient(135deg, rgba(255, 244, 212, 0.95) 0%, rgba(239, 211, 148, 0.94) 42%, rgba(212, 170, 84, 0.94) 100%);
   color: #5a3700;
-  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.55), 0 1px 4px rgba(217, 155, 22, 0.24);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.38), 0 1px 4px rgba(217, 155, 22, 0.16);
 }
 
 .floating-card-plan--enterprise,
@@ -445,7 +468,7 @@ body.floating-card-overlay-root,
   gap: 4px;
   padding: 5px 6px;
   border-radius: 9px;
-  background: rgba(9, 14, 20, 0.76);
+  background: rgba(9, 14, 20, calc(0.76 * var(--floating-card-background-opacity, 1)));
   border: 1px solid rgba(255, 255, 255, 0.06);
 }
 
@@ -500,7 +523,7 @@ body.floating-card-overlay-root,
   width: 100%;
   height: 4px;
   border-radius: 999px;
-  background: rgba(255, 255, 255, 0.07);
+  background: rgba(255, 255, 255, calc(0.07 * var(--floating-card-background-opacity, 1)));
   overflow: hidden;
 }
 
@@ -543,7 +566,7 @@ body.floating-card-overlay-root,
   padding: 5px 7px;
   border-radius: 9px;
   border: 1px solid rgba(255, 115, 115, 0.2);
-  background: rgba(255, 115, 115, 0.1);
+  background: rgba(255, 115, 115, calc(0.1 * var(--floating-card-background-opacity, 1)));
   color: #ff9f9f;
   font-size: 10px;
   line-height: 1.4;
@@ -576,6 +599,9 @@ body.floating-card-overlay-root,
 }
 
 .floating-card-button {
+  appearance: none;
+  font-family: inherit;
+  line-height: 1.2;
   display: inline-flex;
   align-items: center;
   justify-content: center;
@@ -623,7 +649,8 @@ body.floating-card-overlay-root,
   inset: 0;
   z-index: 4;
   display: flex;
-  align-items: center;
+  align-items: safe center;
+  overflow-y: auto;
   justify-content: center;
   padding: 10px;
   background: rgba(4, 7, 11, 0.72);
@@ -635,6 +662,8 @@ body.floating-card-overlay-root,
   display: flex;
   width: 100%;
   max-width: 214px;
+  max-height: calc(100vh - 20px);
+  min-height: 0;
   flex-direction: column;
   gap: 8px;
   padding: 10px;
@@ -655,6 +684,15 @@ body.floating-card-overlay-root,
   font-weight: 800;
   line-height: 1.3;
 }
+
+.floating-card-close-confirm-body { min-height: 0; overflow-y: auto; display: flex; flex-direction: column; gap: 8px; }
+.floating-card-close-confirm-title, .floating-card-close-confirm-actions { flex-shrink: 0; }
+.floating-card-header { flex-shrink: 0; }
+.floating-card-minimal-body { padding: 8px; min-height: 0; overflow-y: auto; }
+.floating-card-full-body { overflow-y: auto; }
+.floating-card-minimal-quotas { display: flex; flex-direction: column; gap: 8px; }
+.floating-card-window--minimal .floating-card-full-body,
+.floating-card-window--minimal .floating-card-footer { display: none; }
 
 .floating-card-close-confirm-message {
   color: #b5bec9;
@@ -692,6 +730,192 @@ body.floating-card-overlay-root,
 
 .floating-card-spin {
   animation: floating-card-spin 0.9s linear infinite;
+}
+
+[data-theme="light"] .floating-card-window {
+  color: #0f172a;
+}
+
+[data-theme="light"] .floating-card-shell {
+  border-color: rgba(15, 23, 42, 0.14);
+  background:
+    radial-gradient(circle at top left, rgba(245, 158, 11, calc(0.1 * var(--floating-card-background-opacity, 1))), transparent 28%),
+    radial-gradient(circle at top right, rgba(14, 165, 233, calc(0.08 * var(--floating-card-background-opacity, 1))), transparent 24%),
+    linear-gradient(180deg, rgba(255, 255, 255, calc(0.9 * var(--floating-card-background-opacity, 1))), rgba(241, 245, 249, calc(0.86 * var(--floating-card-background-opacity, 1))));
+  box-shadow:
+    0 18px 42px rgba(15, 23, 42, calc(0.16 * var(--floating-card-background-opacity, 1))),
+    0 0 0 1px rgba(15, 23, 42, calc(0.04 * var(--floating-card-background-opacity, 1))),
+    inset 0 1px 0 rgba(255, 255, 255, calc(0.7 * var(--floating-card-background-opacity, 1)));
+}
+
+[data-theme="light"] .floating-card-shell::before {
+  background: linear-gradient(180deg, rgba(255, 255, 255, calc(0.45 * var(--floating-card-background-opacity, 1))), transparent 18%);
+}
+
+[data-theme="light"] .floating-card-header {
+  border-bottom-color: rgba(15, 23, 42, 0.08);
+}
+
+[data-theme="light"] .floating-card-platform-icon,
+[data-theme="light"] .floating-card-header-title,
+[data-theme="light"] .floating-card-account-name {
+  color: #0f172a;
+}
+
+[data-theme="light"] .floating-card-platform-dropdown .single-select-dropdown-trigger,
+[data-theme="light"] .floating-card-platform-lock,
+[data-theme="light"] .floating-card-icon-button,
+[data-theme="light"] .floating-card-nav-button {
+  border-color: rgba(15, 23, 42, 0.12);
+  background: rgba(255, 255, 255, 0.85);
+  color: #334155;
+  box-shadow: 0 1px 2px rgba(15, 23, 42, 0.05);
+}
+
+[data-theme="light"] .floating-card-platform-dropdown .single-select-dropdown-trigger:hover:not(:disabled),
+[data-theme="light"] .floating-card-platform-dropdown .single-select-dropdown-trigger.open,
+[data-theme="light"] .floating-card-icon-button:hover,
+[data-theme="light"] .floating-card-nav-button:hover:not(:disabled),
+[data-theme="light"] .floating-card-button:hover:not(:disabled) {
+  border-color: rgba(37, 99, 235, 0.35);
+  background: #ffffff;
+  color: #0f172a;
+}
+
+[data-theme="light"] .floating-card-platform-dropdown .single-select-dropdown-arrow {
+  color: #64748b;
+}
+
+[data-theme="light"] .floating-card-pager-text,
+[data-theme="light"] .floating-card-inline-value {
+  color: #1e293b;
+}
+
+[data-theme="light"] .floating-card-inline-value--high,
+[data-theme="light"] .floating-card-quota-value--high {
+  color: #15803d;
+}
+
+[data-theme="light"] .floating-card-inline-value--medium,
+[data-theme="light"] .floating-card-quota-value--medium {
+  color: #b45309;
+}
+
+[data-theme="light"] .floating-card-inline-value--low,
+[data-theme="light"] .floating-card-quota-value--low {
+  color: #c2410c;
+}
+
+[data-theme="light"] .floating-card-inline-value--critical,
+[data-theme="light"] .floating-card-quota-value--critical {
+  color: #dc2626;
+}
+
+[data-theme="light"] .floating-card-state-pill,
+[data-theme="light"] .floating-card-meta-pill {
+  border-color: rgba(15, 23, 42, 0.1);
+  background: rgba(255, 255, 255, calc(0.84 * var(--floating-card-background-opacity, 1)));
+  color: #334155;
+}
+
+[data-theme="light"] .floating-card-account,
+[data-theme="light"] .floating-card-empty-state,
+[data-theme="light"] .floating-card-quota-panel {
+  border-color: rgba(15, 23, 42, 0.08);
+  background: rgba(255, 255, 255, calc(0.76 * var(--floating-card-background-opacity, 1)));
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.6);
+}
+
+[data-theme="light"] .floating-card-quota-row + .floating-card-quota-row {
+  border-top-color: rgba(15, 23, 42, 0.07);
+}
+
+[data-theme="light"] .floating-card-section-label,
+[data-theme="light"] .floating-card-quota-reset,
+[data-theme="light"] .floating-card-empty-text {
+  color: #64748b;
+}
+
+[data-theme="light"] .floating-card-quota-label {
+  color: #334155;
+}
+
+[data-theme="light"] .floating-card-progress-track {
+  background: rgba(15, 23, 42, calc(0.1 * var(--floating-card-background-opacity, 1)));
+}
+
+[data-theme="light"] .floating-card-plan--free {
+  background: rgba(22, 163, 74, 0.1);
+  color: #15803d;
+}
+
+[data-theme="light"] .floating-card-plan--pro {
+  background: rgba(37, 99, 235, 0.1);
+  color: #1d4ed8;
+}
+
+[data-theme="light"] .floating-card-plan--pro-plus,
+[data-theme="light"] .floating-card-plan--enterprise,
+[data-theme="light"] .floating-card-plan--team {
+  background: rgba(217, 119, 6, 0.12);
+  color: #b45309;
+}
+
+[data-theme="light"] .floating-card-plan--unknown {
+  border-color: rgba(15, 23, 42, 0.12);
+  background: rgba(15, 23, 42, 0.05);
+  color: #475569;
+}
+
+[data-theme="light"] .floating-card-error {
+  border-color: rgba(220, 38, 38, 0.24);
+  background: rgba(254, 226, 226, calc(0.8 * var(--floating-card-background-opacity, 1)));
+  color: #b91c1c;
+}
+
+[data-theme="light"] .floating-card-footer {
+  border-top-color: rgba(15, 23, 42, 0.08);
+}
+
+[data-theme="light"] .floating-card-button {
+  border-color: rgba(15, 23, 42, 0.12);
+  background: rgba(255, 255, 255, 0.88);
+  color: #1e293b;
+}
+
+[data-theme="light"] .floating-card-button--primary {
+  border-color: rgba(217, 119, 6, 0.36);
+  background: linear-gradient(180deg, #f59e0b, #d97706);
+  color: #ffffff;
+}
+
+[data-theme="light"] .floating-card-button--secondary {
+  background: rgba(241, 245, 249, 0.94);
+  color: #0f172a;
+}
+
+[data-theme="light"] .floating-card-button--ghost {
+  background: rgba(248, 250, 252, 0.82);
+  color: #475569;
+}
+
+[data-theme="light"] .floating-card-close-confirm-backdrop {
+  background: rgba(15, 23, 42, 0.32);
+}
+
+[data-theme="light"] .floating-card-close-confirm {
+  border-color: rgba(15, 23, 42, 0.12);
+  background: rgba(255, 255, 255, 0.96);
+  box-shadow: 0 18px 36px rgba(15, 23, 42, 0.18);
+}
+
+[data-theme="light"] .floating-card-close-confirm-title {
+  color: #0f172a;
+}
+
+[data-theme="light"] .floating-card-close-confirm-message,
+[data-theme="light"] .floating-card-close-confirm-checkbox {
+  color: #475569;
 }
 
 @keyframes floating-card-spin {

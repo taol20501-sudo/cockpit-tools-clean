@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
+import { CodexAccountPlanBadge } from './CodexAccountPlanBadge';
 import { createPortal } from 'react-dom';
 import { useTranslation } from 'react-i18next';
 import { preflightCodexProxyEngine } from '../../services/codexProxyEngineService';
@@ -9,9 +10,7 @@ import { applyCodexUnifiedProxy, previewCodexUnifiedProxy, unifiedProxyErrorKey,
 import { batchBindSummary, batchBindTargets, executeProxyBatch, proxyBatchCompletedSuccessfully, type BatchBindResult } from '../../utils/codexProxyBatch';
 import { proxyAssignmentAccounts } from '../../utils/codexProxyAssignment';
 import { canUseCodexAccountProxy } from '../../utils/codexAccountProxy';
-import { getCodexPlanBadgePresentation } from '../../types/codex';
-import { CODEX_PLAN_BADGE_STYLE_CHANGED_EVENT, getCodexPlanBadgeStyle, withCodexPlanBadgeStyle } from '../../utils/codexPreferences';
-import { useCodexAccountStore } from '../../stores/useCodexAccountStore';
+import { applyCodexProxyAccountSnapshot } from '../../services/codexProxyTargetService';
 import { useCodexProxyWorkspace } from './CodexProxyWorkspaceContext';
 import { useCodexProxyAccountName } from './useCodexProxyExitEditor';
 import { ModalErrorMessage } from '../ModalErrorMessage';
@@ -45,7 +44,6 @@ export function CodexProxyAssignDialog({ choice: initialChoice, onClose }: { cho
   const [scope, setScope] = useState<'accounts' | 'unified'>('accounts');
   const [selectedIds, setSelectedIds] = useState<string[]>([]);
   const [search, setSearch] = useState('');
-  const [planBadgeStyle, setPlanBadgeStyle] = useState(getCodexPlanBadgeStyle);
   const [preview, setPreview] = useState<CodexUnifiedProxyPreview | null>(null);
   const [previewLoading, setPreviewLoading] = useState(false);
   const [previewError, setPreviewError] = useState('');
@@ -71,14 +69,9 @@ export function CodexProxyAssignDialog({ choice: initialChoice, onClose }: { cho
   const summary = batchBindSummary(results);
   const allVisible = visible.length > 0 && visible.every((entry) => selectedIds.includes(entry.id));
 
-  useEscCloseTopmost(true, () => { if (!running.current) onClose(); });
+  useEscCloseTopmost(true, () => { if (!running.current) onClose(); }, dialog);
   useModalScrollLock(true);
   useModalFocusTrap(dialog, true);
-  useEffect(() => {
-    const update = () => setPlanBadgeStyle(getCodexPlanBadgeStyle());
-    window.addEventListener(CODEX_PLAN_BADGE_STYLE_CHANGED_EVENT, update);
-    return () => window.removeEventListener(CODEX_PLAN_BADGE_STYLE_CHANGED_EVENT, update);
-  }, []);
   useEffect(() => {
     mounted.current = true;
     cancelled.current = false;
@@ -135,7 +128,7 @@ export function CodexProxyAssignDialog({ choice: initialChoice, onClose }: { cho
           cancelled: () => cancelled.current,
           bind: (account) => bindProxyCatalog(account.id, choice.sourceId, choice.itemId, selections!, choice.groupId),
           applied: (updated) => {
-            useCodexAccountStore.getState().applyAccountSnapshot(updated);
+            applyCodexProxyAccountSnapshot(updated);
             if (mounted.current) setAppliedIds((old) => [...old, updated.id]);
           },
           errorKey: catalogErrorKey,
@@ -186,12 +179,10 @@ export function CodexProxyAssignDialog({ choice: initialChoice, onClose }: { cho
             }}>{t(allVisible ? 'codex.proxy.batchClearAll' : 'common.selectAll')}</button>
           </div>
           <div className="codex-proxy-assign-accounts">{visible.map((account) => {
-            const plan = account.plan_type?.trim();
-            const planClass = plan ? withCodexPlanBadgeStyle(getCodexPlanBadgePresentation(account).className, planBadgeStyle) : '';
             return <button key={account.id} type="button" className={`btn codex-proxy-assign-account${selectedIds.includes(account.id) ? ' is-active' : ''}`} disabled={busy} aria-pressed={selectedIds.includes(account.id)} onClick={() => toggle(account.id)}>
               {selectedIds.includes(account.id) ? <CheckSquare size={17} /> : <Square size={17} />}
               <span className="codex-proxy-assign-account-name">{name(account)}</span>
-              {plan && <span className={`tier-badge ${planClass}`} title={plan}>{plan}</span>}
+              <CodexAccountPlanBadge account={account} />
             </button>;
           })}</div>
           {!eligible.length && <p className="codex-proxy-page-note">{t('codex.proxy.emptyDescription')}</p>}

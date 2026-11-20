@@ -305,7 +305,7 @@ pub async fn inject_codebuddy_to_vscode(
                     {
                         let _ = app.emit(
                             "app:path_missing",
-                            serde_json::json!({ "app": "codebuddy", "retry": { "kind": "default" } }),
+                            serde_json::json!({ "app": "codebuddy", "retry": { "kind": "launchOnly" } }),
                         );
                     }
                     Some(err)
@@ -314,6 +314,7 @@ pub async fn inject_codebuddy_to_vscode(
                 }
             }
         };
+
 
     let _ = crate::modules::tray::update_tray_menu(&app);
 

@@ -1,3 +1,274 @@
+#[test]
+fn explicit_websocket_sync_updates_only_the_owned_oauth_profile_transport() {
+    let profile = tempfile::tempdir().unwrap();
+    let profile = profile.path();
+    let mut collection = realtime_mixed_test_collection();
+    collection.enabled = true;
+    collection.bound_oauth_account_id = Some("oauth-fixture".to_owned());
+    let mixed_routing = collection.api_keys[0].model_routing.take();
+    let config_path = profile.join(CODEX_PROFILE_CONFIG_FILE);
+    let catalog_path = profile.join(super::CODEX_MANAGED_MODEL_CATALOG_FILE);
+    let auth_path = profile.join(CODEX_PROFILE_AUTH_FILE);
+    let config = format!(
+        r#"model_provider = "codex_local_access"
+model = "saved-model"
+model_catalog_json = "{}"
+[model_providers.codex_local_access]
+base_url = "{}"
+experimental_bearer_token = "{}"
+wire_api = "responses"
+requires_openai_auth = true
+supports_websockets = false
+"#,
+        super::CODEX_MANAGED_MODEL_CATALOG_FILE,
+        super::build_collection_base_url(&collection),
+        collection.api_key
+    );
+    let auth = r#"{"tokens":{"id_token":"fixture-id"}}"#;
+    let catalog = json!({"models":[{"slug":"saved-model","context_window":12345,"prefer_websockets":false}],"revision":1});
+    fs::write(&config_path, &config).unwrap();
+    fs::write(&auth_path, auth).unwrap();
+    fs::write(&catalog_path, catalog.to_string()).unwrap();
+    collection.responses_websockets_enabled = true;
+
+    super::sync_owned_oauth_profile_websockets(profile, &collection).unwrap();
+    assert_eq!(fs::read_to_string(&config_path).unwrap(), config);
+    super::remember_takeover_ownership(profile).unwrap();
+
+    let mut other_service = collection.clone();
+    other_service.port += 1;
+    super::sync_owned_oauth_profile_websockets(profile, &other_service).unwrap();
+    assert_eq!(fs::read_to_string(&config_path).unwrap(), config);
+    let mut wrong_key = collection.clone();
+    wrong_key.api_key = "other-test-key".to_owned();
+    super::sync_owned_oauth_profile_websockets(profile, &wrong_key).unwrap();
+    assert_eq!(fs::read_to_string(&config_path).unwrap(), config);
+
+    let edited = config.replace(&collection.api_key, "externally-edited-key");
+    fs::write(&config_path, &edited).unwrap();
+    super::sync_owned_oauth_profile_websockets(profile, &collection).unwrap();
+    assert_eq!(fs::read_to_string(&config_path).unwrap(), edited);
+    fs::write(&config_path, &config).unwrap();
+
+    let cache = profile.join(super::CODEX_MODEL_CACHE_FILE);
+    fs::write(&cache, "{}").unwrap();
+    super::sync_owned_oauth_profile_websockets(profile, &collection).unwrap();
+    let expected = config.replace("supports_websockets = false", "supports_websockets = true");
+    assert_eq!(fs::read_to_string(&config_path).unwrap(), expected);
+    let mut expected_catalog = catalog.clone();
+    expected_catalog["models"][0]["prefer_websockets"] = json!(true);
+    let actual_catalog: Value =
+        serde_json::from_str(&fs::read_to_string(&catalog_path).unwrap()).unwrap();
+    assert_eq!(actual_catalog, expected_catalog);
+    assert!(!cache.exists());
+    assert_eq!(fs::read_to_string(&auth_path).unwrap(), auth);
+
+    collection.bound_oauth_account_id = None;
+    collection.api_keys[0].model_routing = mixed_routing;
+    super::sync_owned_oauth_profile_websockets(profile, &collection).unwrap();
+    assert_eq!(fs::read_to_string(&config_path).unwrap(), config);
+    let actual_catalog: Value =
+        serde_json::from_str(&fs::read_to_string(&catalog_path).unwrap()).unwrap();
+    assert_eq!(actual_catalog, catalog);
+}
+
+#[tokio::test]
+async fn passive_takeover_repairs_websocket_flags_for_an_absolute_owned_catalog() {
+    for owned in [true, false] {
+        let directory = tempfile::tempdir().unwrap();
+        let profile = directory.path().join("profile");
+        fs::create_dir(&profile).unwrap();
+        let mut collection = test_local_access_collection(Vec::new());
+        collection.enabled = true;
+        collection.responses_websockets_enabled = false;
+        write_local_access_profile_takeover(&profile, &collection, None, true)
+            .await
+            .unwrap();
+        fs::remove_file(profile.join(super::TAKEOVER_OWNERSHIP_FILE)).unwrap();
+
+        let generated_catalog = profile.join(CODEX_LOCAL_ACCESS_MODEL_CATALOG_FILE);
+        let catalog = if owned {
+            generated_catalog.clone()
+        } else {
+            directory.path().join(CODEX_LOCAL_ACCESS_MODEL_CATALOG_FILE)
+        };
+        let stale_catalog = fs::read_to_string(generated_catalog)
+            .unwrap()
+            .replace("\"prefer_websockets\": false", "\"prefer_websockets\": true");
+        fs::write(&catalog, &stale_catalog).unwrap();
+        let config_path = profile.join(CODEX_PROFILE_CONFIG_FILE);
+        let mut doc = fs::read_to_string(&config_path).unwrap().parse::<Document>().unwrap();
+        doc["model_catalog_json"] = value(catalog.to_str().unwrap());
+        doc["model_providers"]["codex_local_access"]["supports_websockets"] = value(true);
+        let original_config = doc.to_string();
+        fs::write(&config_path, &original_config).unwrap();
+
+        assert!(super::local_access_profile_takeover_needs_sync(&profile, &collection));
+        super::ensure_profile_takeover(&profile, &collection).await.unwrap();
+        if owned {
+            assert!(!super::local_access_profile_takeover_needs_sync(&profile, &collection));
+            let repaired = fs::read_to_string(config_path).unwrap().parse::<Document>().unwrap();
+            assert_eq!(
+                repaired["model_providers"]["codex_local_access"]["supports_websockets"].as_bool(),
+                Some(false),
+            );
+        } else {
+            assert_eq!(fs::read_to_string(config_path).unwrap(), original_config);
+            assert_eq!(fs::read_to_string(catalog).unwrap(), stale_catalog);
+        }
+    }
+}
+
+#[tokio::test]
+async fn explicit_routing_sync_repairs_owned_oauth_default_without_claiming_other_profiles() {
+    let directory = tempfile::tempdir().unwrap();
+    let profile = directory.path();
+    let mut collection = test_local_access_collection(Vec::new());
+    collection.enabled = true;
+    collection.responses_websockets_enabled = false;
+    write_local_access_profile_takeover(profile, &collection, None, true)
+        .await
+        .unwrap();
+
+    let config_path = profile.join(CODEX_PROFILE_CONFIG_FILE);
+    let mut doc = fs::read_to_string(&config_path).unwrap().parse::<Document>().unwrap();
+    doc["model_providers"]["codex_local_access"]["requires_openai_auth"] = value(true);
+    fs::write(&config_path, doc.to_string()).unwrap();
+    let auth_path = profile.join(CODEX_PROFILE_AUTH_FILE);
+    let oauth_auth = r#"{"auth_mode":"chatgpt","tokens":{"access_token":"fixture-access","refresh_token":"fixture-refresh","id_token":"fixture-id","account_id":"fixture-account"}}"#;
+    fs::write(&auth_path, oauth_auth).unwrap();
+    collection.bound_oauth_account_id = Some("fixture-account".into());
+    super::remember_takeover_ownership(profile).unwrap();
+
+    let mut dirs = Vec::new();
+    super::add_owned_default_for_routing_sync(&mut dirs, profile.to_path_buf(), true, &collection);
+    assert!(dirs.is_empty(), "development must not maintain the shared default profile");
+    let mut foreign_collection = collection.clone();
+    foreign_collection.api_key = "another-environment".into();
+    super::add_owned_default_for_routing_sync(
+        &mut dirs, profile.to_path_buf(), false, &foreign_collection,
+    );
+    assert!(dirs.is_empty(), "an unrelated gateway must not claim this profile");
+    super::add_owned_default_for_routing_sync(&mut dirs, profile.to_path_buf(), false, &collection);
+    assert_eq!(dirs, vec![profile.to_path_buf()]);
+
+    collection.responses_websockets_enabled = true;
+    super::maintain_local_access_takeover_dirs(dirs, &collection).await.unwrap();
+    let doc = fs::read_to_string(&config_path).unwrap().parse::<Document>().unwrap();
+    assert_eq!(
+        doc["model_providers"]["codex_local_access"]["supports_websockets"].as_bool(),
+        Some(true),
+    );
+    assert!(super::profile_model_catalog_websocket_preference_matches(
+        profile, doc["model_catalog_json"].as_str(), true,
+    ));
+    assert_eq!(fs::read_to_string(&auth_path).unwrap(), oauth_auth);
+}
+
+#[tokio::test]
+async fn passive_takeover_realtime_fills_missing_sideband_for_pool_and_mixed_keys() {
+    for mixed in [false, true] {
+        let profile = make_temp_dir("passive-takeover-realtime-missing");
+        let mut collection = realtime_mixed_test_collection();
+        collection.enabled = true;
+        if !mixed {
+            collection.api_keys[0].model_routing = None;
+        }
+        write_local_access_profile_takeover(&profile, &collection, None, true).await.unwrap();
+        assert!(!super::local_access_profile_takeover_needs_sync(
+            &profile,
+            &collection,
+        ));
+        let config_path = profile.join(CODEX_PROFILE_CONFIG_FILE);
+        let mut doc = fs::read_to_string(&config_path).unwrap().parse::<Document>().unwrap();
+        doc.remove("experimental_realtime_ws_base_url");
+        fs::write(&config_path, doc.to_string()).unwrap();
+        assert!(super::local_access_profile_takeover_needs_sync(
+            &profile,
+            &collection,
+        ));
+        super::maintain_local_access_profile(&profile, &collection).unwrap();
+        let doc = fs::read_to_string(&config_path).unwrap().parse::<Document>().unwrap();
+        assert_eq!(doc["experimental_realtime_ws_base_url"].as_str(), Some(super::build_collection_base_url(&collection).as_str()));
+        assert!(!super::local_access_profile_takeover_needs_sync(
+            &profile,
+            &collection,
+        ));
+        fs::remove_dir_all(profile).unwrap();
+    }
+}
+
+#[tokio::test]
+async fn passive_takeover_realtime_preserves_explicit_call_override() {
+    for mixed in [false, true] {
+        let profile = make_temp_dir("passive-takeover-realtime-call-override");
+        let mut collection = realtime_mixed_test_collection();
+        collection.enabled = true;
+        if !mixed {
+            collection.api_keys[0].model_routing = None;
+        }
+        let config_path = profile.join(CODEX_PROFILE_CONFIG_FILE);
+        fs::write(&config_path, "experimental_realtime_webrtc_call_base_url = \"https://voice.example.test/v1\"\n").unwrap();
+        write_local_access_profile_takeover(&profile, &collection, None, true).await.unwrap();
+        let doc = fs::read_to_string(&config_path).unwrap().parse::<Document>().unwrap();
+        assert_eq!(doc["experimental_realtime_webrtc_call_base_url"].as_str(), Some("https://voice.example.test/v1"));
+        assert!(doc.get("experimental_realtime_ws_base_url").is_none());
+        assert!(!super::local_access_profile_takeover_needs_sync(
+            &profile,
+            &collection,
+        ));
+        collection.port += 1;
+        super::maintain_local_access_profile(&profile, &collection).unwrap();
+        let doc = fs::read_to_string(&config_path).unwrap().parse::<Document>().unwrap();
+        assert_eq!(doc["experimental_realtime_webrtc_call_base_url"].as_str(), Some("https://voice.example.test/v1"));
+        assert!(doc.get("experimental_realtime_ws_base_url").is_none());
+        assert_eq!(doc["model_providers"]["codex_local_access"]["base_url"].as_str(), Some(super::build_collection_base_url(&collection).as_str()));
+        assert!(!super::local_access_profile_takeover_needs_sync(
+            &profile,
+            &collection,
+        ));
+        fs::remove_dir_all(profile).unwrap();
+    }
+}
+
+#[tokio::test]
+async fn passive_takeover_realtime_migrates_only_managed_sideband() {
+    for mixed in [false, true] {
+        for custom in [false, true] {
+            let profile = make_temp_dir("passive-takeover-realtime-migrate");
+            let mut collection = realtime_mixed_test_collection();
+            collection.enabled = true;
+            if !mixed {
+                collection.api_keys[0].model_routing = None;
+            }
+            write_local_access_profile_takeover(&profile, &collection, None, true).await.unwrap();
+            let config_path = profile.join(CODEX_PROFILE_CONFIG_FILE);
+            let mut doc = fs::read_to_string(&config_path).unwrap().parse::<Document>().unwrap();
+            assert_eq!(doc["experimental_realtime_ws_base_url"].as_str(), Some(super::build_collection_base_url(&collection).as_str()));
+            if custom {
+                doc["experimental_realtime_ws_base_url"] = toml_edit::value("https://voice.example.test/v1");
+                fs::write(&config_path, doc.to_string()).unwrap();
+            }
+            assert!(!super::local_access_profile_takeover_needs_sync(
+                &profile,
+                &collection,
+            ));
+            collection.port += 1;
+            super::maintain_local_access_profile(&profile, &collection).unwrap();
+            let doc = fs::read_to_string(&config_path).unwrap().parse::<Document>().unwrap();
+            let next_base = super::build_collection_base_url(&collection);
+            let expected_sideband = if custom { "https://voice.example.test/v1" } else { next_base.as_str() };
+            assert_eq!(doc["experimental_realtime_ws_base_url"].as_str(), Some(expected_sideband));
+            assert_eq!(doc["model_providers"]["codex_local_access"]["base_url"].as_str(), Some(next_base.as_str()));
+            assert!(!super::local_access_profile_takeover_needs_sync(
+                &profile,
+                &collection,
+            ));
+            fs::remove_dir_all(profile).unwrap();
+        }
+    }
+}
+
 #[tokio::test]
 async fn passive_takeover_preserves_user_selection_and_settings() {
     let profile = make_temp_dir("passive-takeover-settings");
@@ -157,13 +428,18 @@ fn passive_takeover_marker_failure_rolls_back_connection() {
     let auth = "{\"OPENAI_API_KEY\":\"original-key\"}";
     fs::write(profile.join(CODEX_PROFILE_CONFIG_FILE), config).unwrap();
     fs::write(profile.join(CODEX_PROFILE_AUTH_FILE), auth).unwrap();
+    let marker_path = profile.join(super::TAKEOVER_OWNERSHIP_FILE);
+    fs::write(&marker_path, "original ownership").unwrap();
     let error = super::persist_takeover_connection(
         &profile,
         config,
         Some(auth),
         "model = \"changed\"\n",
         Some("{}"),
-        || Err("injected marker failure".to_string()),
+        || {
+            fs::write(&marker_path, "partial ownership").unwrap();
+            Err("injected marker failure".to_string())
+        },
     )
     .unwrap_err();
     assert!(error.contains("injected marker failure"));
@@ -175,6 +451,7 @@ fn passive_takeover_marker_failure_rolls_back_connection() {
         fs::read_to_string(profile.join(CODEX_PROFILE_AUTH_FILE)).unwrap(),
         auth
     );
+    assert_eq!(fs::read_to_string(marker_path).unwrap(), "original ownership");
     fs::remove_dir_all(profile).unwrap();
 }
 
@@ -412,4 +689,289 @@ async fn passive_takeover_explicit_oauth_binding_refreshes_only_owned_profiles()
     assert!(!user.join(CODEX_PROFILE_AUTH_FILE).exists());
     fs::remove_dir_all(owned).unwrap();
     fs::remove_dir_all(user).unwrap();
+}
+#[tokio::test]
+async fn realtime_full_retakeover_moves_managed_sideband_with_provider() {
+    let profile = make_temp_dir("realtime-full-retakeover");
+    let mut collection = realtime_mixed_test_collection();
+    write_local_access_profile_takeover(&profile, &collection, None, true)
+        .await
+        .unwrap();
+    collection.port += 1;
+    for _ in 0..2 {
+        write_local_access_profile_takeover(&profile, &collection, None, true)
+            .await
+            .unwrap();
+        let doc = fs::read_to_string(profile.join(CODEX_PROFILE_CONFIG_FILE))
+            .unwrap()
+            .parse::<Document>()
+            .unwrap();
+        let next_base = super::build_collection_base_url(&collection);
+        assert_eq!(
+            doc["model_providers"]["codex_local_access"]["base_url"].as_str(),
+            Some(next_base.as_str())
+        );
+        assert_eq!(
+            doc["experimental_realtime_ws_base_url"].as_str(),
+            Some(next_base.as_str())
+        );
+        let marker: Value = serde_json::from_str(
+            &fs::read_to_string(profile.join(super::TAKEOVER_OWNERSHIP_FILE)).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            marker["managed_realtime_ws_base_url"].as_str(),
+            Some(next_base.as_str())
+        );
+    }
+    fs::remove_dir_all(profile).unwrap();
+}
+
+#[tokio::test]
+async fn realtime_full_retakeover_preserves_user_loopback_remote_and_call_overrides() {
+    for custom in [
+        "http://localhost:19998/v1",
+        "https://voice.example.test/v1",
+        "call",
+    ] {
+        let profile = make_temp_dir("realtime-retakeover-user-voice");
+        let mut collection = realtime_mixed_test_collection();
+        write_local_access_profile_takeover(&profile, &collection, None, true)
+            .await
+            .unwrap();
+        let path = profile.join(CODEX_PROFILE_CONFIG_FILE);
+        let mut doc = fs::read_to_string(&path)
+            .unwrap()
+            .parse::<Document>()
+            .unwrap();
+        let original_sideband = if custom == "call" {
+            doc["experimental_realtime_webrtc_call_base_url"] = value("http://localhost:19997/v1");
+            doc["experimental_realtime_ws_base_url"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        } else {
+            doc["experimental_realtime_ws_base_url"] = value(custom);
+            custom.to_string()
+        };
+        fs::write(&path, doc.to_string()).unwrap();
+        collection.port += 1;
+        write_local_access_profile_takeover(&profile, &collection, None, true)
+            .await
+            .unwrap();
+        super::maintain_local_access_profile(&profile, &collection).unwrap();
+        assert!(!super::local_access_profile_takeover_needs_sync(
+            &profile,
+            &collection
+        ));
+        let doc = fs::read_to_string(&path)
+            .unwrap()
+            .parse::<Document>()
+            .unwrap();
+        assert_eq!(
+            doc["experimental_realtime_ws_base_url"].as_str(),
+            Some(original_sideband.as_str())
+        );
+        if custom == "call" {
+            assert_eq!(
+                doc["experimental_realtime_webrtc_call_base_url"].as_str(),
+                Some("http://localhost:19997/v1")
+            );
+        }
+        let marker: Value = serde_json::from_str(
+            &fs::read_to_string(profile.join(super::TAKEOVER_OWNERSHIP_FILE)).unwrap(),
+        )
+        .unwrap();
+        assert!(marker.get("managed_realtime_ws_base_url").is_none());
+        assert!(super::cleanup_profile_takeover_without_backup(
+            &profile,
+            &collection.api_key,
+            true
+        )
+        .unwrap());
+        let doc = fs::read_to_string(&path)
+            .unwrap()
+            .parse::<Document>()
+            .unwrap();
+        assert_eq!(
+            doc["experimental_realtime_ws_base_url"].as_str(),
+            Some(original_sideband.as_str())
+        );
+        fs::remove_dir_all(profile).unwrap();
+    }
+}
+
+// Simulate a previous partial connection update while preserving the value
+// Cockpit had explicitly recorded as its own. No live profile is used.
+async fn recorded_stale_realtime_fixture(
+    label: &str,
+) -> (PathBuf, CodexLocalAccessCollection, String) {
+    let profile = make_temp_dir(label);
+    let mut collection = realtime_mixed_test_collection();
+    collection.enabled = true;
+    write_local_access_profile_takeover(&profile, &collection, None, true)
+        .await
+        .unwrap();
+    let old_base = super::build_collection_base_url(&collection);
+    collection.port += 1;
+    let path = profile.join(CODEX_PROFILE_CONFIG_FILE);
+    let mut doc = fs::read_to_string(&path)
+        .unwrap()
+        .parse::<Document>()
+        .unwrap();
+    doc["model_providers"]["codex_local_access"]["base_url"] =
+        value(super::build_collection_base_url(&collection));
+    fs::write(&path, doc.to_string()).unwrap();
+    let marker_path = profile.join(super::TAKEOVER_OWNERSHIP_FILE);
+    let mut marker: Value =
+        serde_json::from_str(&fs::read_to_string(&marker_path).unwrap()).unwrap();
+    marker["connection_hash"] = json!(super::takeover_connection_hash(&doc).unwrap());
+    assert_eq!(
+        marker["managed_realtime_ws_base_url"].as_str(),
+        Some(old_base.as_str())
+    );
+    fs::write(marker_path, serde_json::to_string(&marker).unwrap()).unwrap();
+    (profile, collection, old_base)
+}
+
+#[tokio::test]
+async fn realtime_recorded_stale_sideband_reconciles_without_provider_change() {
+    let (profile, collection, _) =
+        recorded_stale_realtime_fixture("realtime-recorded-stale-reconcile").await;
+    assert!(super::local_access_profile_takeover_needs_sync(
+        &profile,
+        &collection
+    ));
+    super::maintain_local_access_profile(&profile, &collection).unwrap();
+    let doc = fs::read_to_string(profile.join(CODEX_PROFILE_CONFIG_FILE))
+        .unwrap()
+        .parse::<Document>()
+        .unwrap();
+    let next_base = super::build_collection_base_url(&collection);
+    assert_eq!(
+        doc["experimental_realtime_ws_base_url"].as_str(),
+        Some(next_base.as_str())
+    );
+    assert!(!super::local_access_profile_takeover_needs_sync(
+        &profile,
+        &collection
+    ));
+    assert_eq!(
+        super::recorded_takeover_ownership_matches(&profile, &doc).unwrap(),
+        Some(true)
+    );
+    fs::remove_dir_all(profile).unwrap();
+}
+
+#[tokio::test]
+async fn realtime_recorded_stale_sideband_full_retakeover_recovers() {
+    let (profile, collection, _) =
+        recorded_stale_realtime_fixture("realtime-recorded-stale-retakeover").await;
+    write_local_access_profile_takeover(&profile, &collection, None, true)
+        .await
+        .unwrap();
+    let doc = fs::read_to_string(profile.join(CODEX_PROFILE_CONFIG_FILE))
+        .unwrap()
+        .parse::<Document>()
+        .unwrap();
+    assert_eq!(
+        doc["experimental_realtime_ws_base_url"].as_str(),
+        Some(super::build_collection_base_url(&collection).as_str())
+    );
+    fs::remove_dir_all(profile).unwrap();
+}
+
+#[tokio::test]
+async fn realtime_legacy_unrecorded_stale_sideband_is_never_claimed() {
+    let (profile, collection, old_base) =
+        recorded_stale_realtime_fixture("realtime-legacy-stale").await;
+    let marker_path = profile.join(super::TAKEOVER_OWNERSHIP_FILE);
+    let mut marker: Value =
+        serde_json::from_str(&fs::read_to_string(&marker_path).unwrap()).unwrap();
+    marker
+        .as_object_mut()
+        .unwrap()
+        .remove("managed_realtime_ws_base_url");
+    fs::write(&marker_path, serde_json::to_string(&marker).unwrap()).unwrap();
+    assert!(!super::local_access_profile_takeover_needs_sync(
+        &profile,
+        &collection
+    ));
+    super::maintain_local_access_profile(&profile, &collection).unwrap();
+    write_local_access_profile_takeover(&profile, &collection, None, true)
+        .await
+        .unwrap();
+    assert!(
+        super::cleanup_profile_takeover_without_backup(&profile, &collection.api_key, true)
+            .unwrap()
+    );
+    let doc = fs::read_to_string(profile.join(CODEX_PROFILE_CONFIG_FILE))
+        .unwrap()
+        .parse::<Document>()
+        .unwrap();
+    assert_eq!(
+        doc["experimental_realtime_ws_base_url"].as_str(),
+        Some(old_base.as_str())
+    );
+    fs::remove_dir_all(profile).unwrap();
+}
+
+#[tokio::test]
+async fn realtime_recorded_stale_disable_cleans_and_restores_only_owned_voice() {
+    for restore in [false, true] {
+        for edited in [false, true] {
+            let (profile, collection, _) =
+                recorded_stale_realtime_fixture("realtime-stale-disable").await;
+            let path = profile.join(CODEX_PROFILE_CONFIG_FILE);
+            if edited {
+                let mut doc = fs::read_to_string(&path)
+                    .unwrap()
+                    .parse::<Document>()
+                    .unwrap();
+                doc["experimental_realtime_ws_base_url"] = value("http://localhost:19996/v1");
+                fs::write(&path, doc.to_string()).unwrap();
+            }
+            if restore {
+                let backup = CodexLocalAccessProfileTakeoverBackup {
+                    profile_dir: profile.to_string_lossy().to_string(),
+                    auth_json: None,
+                    config_toml: Some(
+                        "experimental_realtime_ws_base_url = \"http://localhost:19995/v1\"\n"
+                            .to_string(),
+                    ),
+                    created_at: 0,
+                    updated_at: 0,
+                };
+                assert!(
+                    super::restore_profile_takeover_backup(&backup, &collection.api_key, true)
+                        .unwrap()
+                );
+            } else {
+                assert!(super::cleanup_profile_takeover_without_backup(
+                    &profile,
+                    &collection.api_key,
+                    true
+                )
+                .unwrap());
+            }
+            let doc = fs::read_to_string(&path)
+                .unwrap()
+                .parse::<Document>()
+                .unwrap();
+            let expected = if edited {
+                Some("http://localhost:19996/v1")
+            } else if restore {
+                Some("http://localhost:19995/v1")
+            } else {
+                None
+            };
+            assert_eq!(
+                doc.get("experimental_realtime_ws_base_url")
+                    .and_then(|item| item.as_str()),
+                expected
+            );
+            assert!(!profile.join(super::TAKEOVER_OWNERSHIP_FILE).exists());
+            fs::remove_dir_all(profile).unwrap();
+        }
+    }
 }

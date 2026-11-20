@@ -67,10 +67,11 @@ async fn perform_managed_token_refresh(
     .await
     {
         Ok(new_tokens) => {
-            account.tokens = new_tokens;
-            sync_identity_from_tokens(&mut account);
-            mark_token_chain_updated(&mut account);
-            save_account(&account)?;
+            let (current, saved) = persist_refreshed_account(&account, new_tokens)?;
+            account = current;
+            if !saved {
+                return Ok(account);
+            }
             sync_managed_account_sidecar(&account);
             crate::modules::codex_auth_diagnostic::log_event(
                 "managed_token_refresh_saved",
@@ -89,6 +90,15 @@ async fn perform_managed_token_refresh(
             Ok(account)
         }
         Err(err) => {
+            // Another authorization/import may have replaced the chain while
+            // this request was in flight. A stale failure (including reused)
+            // must neither return old credentials nor invalidate the new chain.
+            let current = load_account(&account.id)
+                .ok_or_else(|| format!("账号已删除或无法读取，拒绝刷新写回: account_id={}", account.id))?;
+            if !account_matches_refresh_snapshot(&current, &account) {
+                return Ok(current);
+            }
+            account = current;
             let user_error = format_refresh_error_for_user(&err);
             crate::modules::codex_auth_diagnostic::log_event(
                 "managed_token_refresh_error",
@@ -112,7 +122,16 @@ async fn perform_managed_token_refresh(
                 return Ok(account);
             }
             if is_reauth_required_refresh_error(&err) {
-                let _ = mark_account_requires_reauth(&mut account, &user_error);
+                let (current, marked) = update_account_after_refresh_if_current(
+                    &account,
+                    |current| {
+                        current.requires_reauth = true;
+                        current.reauth_reason = Some(user_error.clone());
+                    },
+                )?;
+                if !marked {
+                    return Ok(current);
+                }
                 return Err(user_error);
             }
             Err(user_error)
@@ -136,15 +155,26 @@ async fn validate_managed_account_for_client_locked(
             account.id, error
         ));
     }
-    if account.requires_reauth {
+    let access_expired = codex_oauth::is_token_expired(&account.tokens.access_token);
+    // Keep the stored reauthorization status for the next refresh while the
+    // current access token is still usable for this launch.
+    if account.requires_reauth
+        && (access_expired
+            || !account
+                .reauth_reason
+                .as_deref()
+                .is_some_and(is_refresh_grant_only_failure)
+            || account_has_remote_api_auth_rejection(&account))
+    {
         return Err(account
             .reauth_reason
             .clone()
             .unwrap_or_else(|| "账号需要重新授权".to_string()));
     }
-    if codex_oauth::is_token_expired(&account.tokens.access_token) {
+    if access_expired {
         return Err("access_token 已过期，无法启动，请重新授权".to_string());
     }
+    reject_known_access_token_revocation(&account)?;
     logger::log_info(&format!(
         "本地 Codex 启动凭据校验通过: account_id={}, email={}, reason={}",
         account.id, account.email, reason
@@ -363,23 +393,37 @@ pub async fn force_refresh_managed_account_after_observed(
         .await
 }
 
-pub async fn keepalive_managed_account(
+pub(crate) enum CodexKeepaliveOutcome {
+    Unchanged,
+    Updated(CodexAccount),
+    DeferredToDefaultProfile,
+}
+
+fn default_profile_uses_keepalive_token(profile: &Path, refresh_token: &str) -> bool {
+    !refresh_token.trim().is_empty()
+        && read_official_oauth_tokens(profile)
+            .and_then(|tokens| tokens.refresh_token)
+            .as_deref()
+            == Some(refresh_token)
+}
+
+pub(crate) async fn keepalive_managed_account(
     account_id: &str,
     reason: &str,
-) -> Result<CodexAccount, String> {
+) -> Result<CodexKeepaliveOutcome, String> {
     let lock = codex_token_lock_for(account_id);
     let _guard = lock.lock().await;
     let mut account =
         load_account(account_id).ok_or_else(|| format!("账号不存在: {}", account_id))?;
     if account.is_api_key_auth() || account.is_agent_identity_auth() {
-        return Ok(account);
+        return Ok(CodexKeepaliveOutcome::Unchanged);
     }
     if !is_managed_auth_refresh_due(&account) {
-        return Ok(account);
+        return Ok(CodexKeepaliveOutcome::Unchanged);
     }
     let Some(_file_guard) = try_acquire_codex_token_refresh_file_lock(account_id, reason).await?
     else {
-        return Ok(account);
+        return Ok(CodexKeepaliveOutcome::Unchanged);
     };
     let official_runtime_has_account = running_codex_oauth_account_ids()
         .map(|account_ids| account_ids.contains(&account.id))
@@ -389,12 +433,13 @@ pub async fn keepalive_managed_account(
     } else {
         sync_account_from_authority_sources(&mut account)
     };
-    if let Err(err) = sync_result {
+    let synced = sync_result.unwrap_or_else(|err| {
         logger::log_warn(&format!(
             "Codex 保活同步官方凭证失败，继续使用账号库: account_id={}, error={}",
             account.id, err
         ));
-    }
+        false
+    });
     clear_refresh_token_reused_state(&mut account)?;
     if let Err(err) = clear_stale_missing_refresh_token_reauth(&mut account) {
         logger::log_warn(&format!(
@@ -409,10 +454,28 @@ pub async fn keepalive_managed_account(
             .unwrap_or_else(|| "账号需要重新登录".to_string()));
     }
     if !is_managed_auth_refresh_due(&account) {
-        return Ok(account);
+        return Ok(if synced {
+            CodexKeepaliveOutcome::Updated(account)
+        } else {
+            CodexKeepaliveOutcome::Unchanged
+        });
     }
 
-    perform_managed_token_refresh(account, reason, false).await
+    // The default CLI/app-server may start after this job and reuse the token
+    // still in its auth store. Give that client ownership of the shared chain.
+    let refresh_token = account.tokens.refresh_token.clone().unwrap_or_default();
+    let default_profile_owns_token = tauri::async_runtime::spawn_blocking(move || {
+        default_profile_uses_keepalive_token(&get_codex_home(), &refresh_token)
+    })
+    .await
+    .map_err(|err| format!("读取 Codex 默认配置凭据任务失败: {}", err))?;
+    if default_profile_owns_token {
+        return Ok(CodexKeepaliveOutcome::DeferredToDefaultProfile);
+    }
+
+    perform_managed_token_refresh(account, reason, false)
+        .await
+        .map(CodexKeepaliveOutcome::Updated)
 }
 
 pub async fn execute_with_managed_account_projection<R, F>(
@@ -666,6 +729,9 @@ pub async fn prepare_account_for_injection(account_id: &str) -> Result<CodexAcco
 pub async fn prepare_account_for_injection_from_store(
     account_id: &str,
 ) -> Result<CodexAccount, String> {
+    if let Some(account) = load_account(account_id) {
+        reject_chatgpt_plan_client_injection(&account)?;
+    }
     ensure_managed_account_fresh(account_id).await
 }
 
@@ -699,6 +765,7 @@ fn switch_account_with_prepared(
     // 更新账号的 last_used
     let mut updated_account = account_for_write.clone();
     updated_account.update_last_used();
+    updated_account.last_switched_at = Some(updated_account.last_used);
     save_account(&updated_account)?;
 
     logger::log_info(&format!("已切换到 Codex 账号: {}", updated_account.email));
@@ -709,15 +776,21 @@ fn switch_account_with_prepared(
 async fn activate_provider_gateway_after_switch_if_needed(
     base_dir: &Path,
     account: &CodexAccount,
+    prepared_oauth: Option<&CodexAccount>,
 ) -> Result<(), String> {
     if crate::modules::codex_local_access::account_requires_provider_gateway(account) {
         logger::log_info(&format!(
-            "[Codex切号] API Key 账号启用本地供应商网关: account_id={}, target_dir={}",
+            "[Codex切号] 准备实例供应商网关配置: account_id={}, target_dir={}",
             account.id,
             base_dir.display()
         ));
-        crate::modules::codex_local_access::ensure_provider_gateway_for_dir(base_dir, &account.id)
-            .await?;
+        crate::modules::codex_local_access::activate_provider_gateway_for_dir_with_prepared_oauth(
+            base_dir,
+            &account.id,
+            prepared_oauth,
+        )
+        .await?;
+        crate::modules::codex_cli_daemon::after_provider_gateway_profile_write(base_dir, &account.id);
         return Ok(());
     }
 
@@ -856,7 +929,7 @@ async fn commit_account_switch_locked(
         PreparedCodexAccountSwitch::Account(account) => {
             let updated_account = switch_account_with_prepared(account_id, account)?;
             let codex_home = get_codex_home();
-            activate_provider_gateway_after_switch_if_needed(&codex_home, &updated_account).await?;
+            activate_provider_gateway_after_switch_if_needed(&codex_home, &updated_account, None).await?;
             Ok(updated_account)
         }
         PreparedCodexAccountSwitch::ApiKeyWithOauth {
@@ -887,6 +960,7 @@ async fn commit_account_switch_locked(
 
             let mut updated_account = account.clone();
             updated_account.update_last_used();
+    updated_account.last_switched_at = Some(updated_account.last_used);
             save_account(&updated_account)?;
 
             logger::log_info(&format!(
@@ -894,7 +968,12 @@ async fn commit_account_switch_locked(
                 updated_account.email, oauth_account.email
             ));
 
-            activate_provider_gateway_after_switch_if_needed(&codex_home, &updated_account).await?;
+            activate_provider_gateway_after_switch_if_needed(
+                &codex_home,
+                &updated_account,
+                Some(&oauth_account),
+            )
+            .await?;
 
             Ok(updated_account)
         }
@@ -1037,6 +1116,9 @@ where
     Fut: std::future::Future<Output = Result<(), String>>,
 {
     let _switch_guard = CODEX_ACCOUNT_SWITCH_LOCK.lock().await;
+    if let Some(account) = load_account(account_id) {
+        reject_chatgpt_plan_client_injection(&account)?;
+    }
     sync_active_official_account_before_switch().await?;
 
     let switch_lock_account_id = load_account_after_index_repair(account_id)

@@ -88,6 +88,7 @@ struct CopilotTokenResponse {
 #[derive(Debug, Deserialize)]
 struct CopilotUserInfoResponse {
     copilot_plan: Option<String>,
+    token_based_billing: Option<bool>,
     quota_snapshots: Option<serde_json::Value>,
     quota_reset_date: Option<String>,
 }
@@ -99,6 +100,7 @@ pub struct CopilotTokenBundle {
     pub chat_enabled: Option<bool>,
     pub expires_at: Option<i64>,
     pub refresh_in: Option<i64>,
+    pub token_based_billing: Option<bool>,
     pub quota_snapshots: Option<serde_json::Value>,
     pub quota_reset_date: Option<String>,
     pub limited_user_quotas: Option<serde_json::Value>,
@@ -606,14 +608,11 @@ async fn fetch_copilot_token(
 
     if !response.status().is_success() {
         let status = response.status();
-        let body = response
-            .text()
-            .await
-            .unwrap_or_else(|_| "<no-body>".to_string());
-        return Err(format!(
-            "请求 Copilot token 失败: status={}, body_len={}",
+        let body = response.text().await.unwrap_or_default();
+        return Err(copilot_token_status_error(
             status,
-            body.len()
+            &body,
+            github_access_token,
         ));
     }
 
@@ -641,6 +640,7 @@ async fn fetch_copilot_token(
         chat_enabled: payload.chat_enabled,
         expires_at: payload.expires_at,
         refresh_in: payload.refresh_in,
+        token_based_billing: user_info.as_ref().and_then(|info| info.token_based_billing),
         quota_snapshots: user_info
             .as_ref()
             .and_then(|info| info.quota_snapshots.clone()),
@@ -650,6 +650,33 @@ async fn fetch_copilot_token(
         limited_user_quotas: payload.limited_user_quotas,
         limited_user_reset_date: payload.limited_user_reset_date,
     })
+}
+
+fn copilot_token_status_error(
+    status: reqwest::StatusCode,
+    body: &str,
+    github_access_token: &str,
+) -> String {
+    let mut error = format!("请求 Copilot token 失败: status={status}");
+    if let Ok(payload) = serde_json::from_str::<CopilotTokenResponse>(body) {
+        if let Some(message) = payload.message.filter(|message| !message.trim().is_empty()) {
+            let message = if github_access_token.is_empty() {
+                message
+            } else {
+                message.replace(github_access_token, "[redacted]")
+            };
+            error.push_str(", ");
+            error.extend(
+                message
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" ")
+                    .chars()
+                    .take(500),
+            );
+        }
+    }
+    error
 }
 
 async fn fetch_copilot_user_info(
@@ -765,6 +792,7 @@ pub async fn complete_login(login_id: &str) -> Result<GitHubCopilotOAuthComplete
         copilot_chat_enabled: copilot.chat_enabled,
         copilot_expires_at: copilot.expires_at,
         copilot_refresh_in: copilot.refresh_in,
+        copilot_token_based_billing: copilot.token_based_billing,
         copilot_quota_snapshots: copilot.quota_snapshots,
         copilot_quota_reset_date: copilot.quota_reset_date,
         copilot_limited_user_quotas: copilot.limited_user_quotas,
@@ -775,6 +803,25 @@ pub async fn complete_login(login_id: &str) -> Result<GitHubCopilotOAuthComplete
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn copilot_token_failure_keeps_the_upstream_explanation_and_masks_the_request_token() {
+        let error = copilot_token_status_error(
+            reqwest::StatusCode::FORBIDDEN,
+            r#"{"message":"Copilot access is not enabled. Token: test-credential"}"#,
+            "test-credential",
+        );
+        assert!(error.contains("403 Forbidden"));
+        assert!(error.contains("Copilot access is not enabled."));
+        assert!(!error.contains("test-credential"));
+        let fallback = copilot_token_status_error(
+            reqwest::StatusCode::BAD_GATEWAY,
+            "<html>Internal proxy response</html>",
+            "test-credential",
+        );
+        assert!(fallback.contains("502 Bad Gateway"));
+        assert!(!fallback.contains("Internal proxy response"));
+    }
 
     #[test]
     fn github_auth_url_matches_vscode_copilot_login_flow() {
@@ -883,6 +930,7 @@ pub async fn build_payload_from_github_access_token(
         copilot_chat_enabled: copilot.chat_enabled,
         copilot_expires_at: copilot.expires_at,
         copilot_refresh_in: copilot.refresh_in,
+        copilot_token_based_billing: copilot.token_based_billing,
         copilot_quota_snapshots: copilot.quota_snapshots,
         copilot_quota_reset_date: copilot.quota_reset_date,
         copilot_limited_user_quotas: copilot.limited_user_quotas,

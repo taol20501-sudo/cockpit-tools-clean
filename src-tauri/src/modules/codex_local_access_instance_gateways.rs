@@ -279,10 +279,7 @@ async fn live_provider_gateway_endpoints() -> HashMap<String, (u16, String)> {
     let mut endpoints = HashMap::new();
     let mut runtimes = provider_gateway_runtime_store().lock().await;
     for (key, runtime) in runtimes.iter_mut() {
-        let alive = runtime
-            .sidecar_child
-            .as_mut()
-            .is_some_and(|child| matches!(child.try_wait(), Ok(None)));
+        let alive = native_provider_runtime_alive(runtime);
         if !alive {
             continue;
         }
@@ -313,10 +310,7 @@ async fn current_instance_gateway_endpoint(
     {
         let mut runtimes = provider_gateway_runtime_store().lock().await;
         if let Some(runtime) = runtimes.get_mut(&runtime_key) {
-            let alive = runtime
-                .sidecar_child
-                .as_mut()
-                .is_some_and(|child| matches!(child.try_wait(), Ok(None)));
+            let alive = native_provider_runtime_alive(runtime);
             if alive {
                 if let Some(collection) = runtime.collection.as_ref() {
                     return Some((collection.port, collection.api_key.clone()));
@@ -382,6 +376,41 @@ async fn ensure_instance_gateway_started(target: &InstanceGatewayTarget) -> Resu
                 .await
         }
         _ => Ok(()),
+    }
+}
+
+async fn restore_instance_gateways_after_failed_update(
+    runtime_keys: &HashSet<String>,
+    process_entries: &[(u32, Option<String>)],
+) -> Result<(), String> {
+    let targets = collect_instance_gateway_targets()?;
+    let mut errors = Vec::new();
+    for target in targets {
+        let key = provider_gateway_runtime_key(&target.profile_dir, &target.runtime_id);
+        if !runtime_keys.contains(&key) || !instance_target_is_running(&target, process_entries) {
+            continue;
+        }
+        match load_provider_gateway_profile_state(&target.profile_dir, &target.runtime_id) {
+            Ok(Some(_)) => {}
+            // An explicit stop clears the saved instance gateway state.
+            Ok(None) => continue,
+            Err(error) => {
+                errors.push(format!("读取实例网关状态失败 ({}): {error}", target.instance_id));
+                continue;
+            }
+        }
+        if !instance_gateway_runtime_is_healthy(&target.profile_dir, &target.runtime_id).await {
+            let result = ensure_instance_gateway_started(&target).await;
+            set_instance_gateway_recovery_error(&key, result.as_ref().err().cloned());
+            if let Err(error) = result {
+                errors.push(format!("恢复实例网关失败 ({}): {error}", target.instance_id));
+            }
+        }
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("\n"))
     }
 }
 

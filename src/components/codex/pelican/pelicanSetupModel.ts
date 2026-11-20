@@ -11,11 +11,22 @@ export function defaultPelicanConcurrency(accountCount: number): number {
   return Math.min(CODEX_PELICAN_MAX_CONCURRENCY, Math.max(1, Math.floor(accountCount)));
 }
 
-/** Reuse Codex's effective quota windows, but never translate or infer a subscription label. */
+export function pelicanAccountContext(
+  account: Pick<CodexAccount, 'account_name' | 'organization_id' | 'account_id'> | undefined,
+  accountId: string,
+  email: string,
+): string[] {
+  const name = account?.account_name?.trim();
+  const scope = account?.organization_id?.trim() || account?.account_id?.trim() || accountId.trim();
+  return [...new Set([name, scope].filter((value): value is string => Boolean(value && value !== email)))];
+}
+
+/** Pro uses the same tier names as overview; other backend plan values stay verbatim. */
 export function pelicanAccountSummary(account: CodexAccount) {
+  const badge = getCodexPlanBadgePresentation(account, { preserveRawNonProLabel: true });
   return {
-    plan: account.plan_type?.trim() || account.auth_file_plan_type?.trim() || null,
-    planClass: getCodexPlanBadgePresentation(account).className,
+    plan: account.plan_type?.trim() || account.auth_file_plan_type?.trim() ? badge.label : null,
+    planClass: badge.className,
     windows: getCodexQuotaWindows(account.quota).map((window) => {
       const raw = window.id === 'primary' ? account.quota?.hourly_percentage : account.quota?.weekly_percentage;
       const known = typeof raw === 'number' && Number.isFinite(raw);

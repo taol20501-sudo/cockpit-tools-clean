@@ -22,6 +22,75 @@ mod electron_runtime_tests {
             assert!(electron_runtime_download_url(&asset).contains(asset.file_name));
         }
     }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn incomplete_macos_electron_archive_does_not_replace_the_runtime() {
+        use super::extract_electron_runtime_zip;
+        use std::{fs, io::Write};
+        use zip::{write::SimpleFileOptions, ZipWriter};
+
+        let asset = test_electron_runtime_asset_for("macos", "aarch64").unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let archive_path = directory.path().join("electron.zip");
+        let mut archive = ZipWriter::new(fs::File::create(&archive_path).unwrap());
+        archive
+            .start_file(asset.executable_relative, SimpleFileOptions::default())
+            .unwrap();
+        archive.write_all(b"exe").unwrap();
+        archive
+            .start_file(
+                "Electron.app/Contents/Frameworks/Electron Framework.framework/Electron Framework",
+                SimpleFileOptions::default(),
+            )
+            .unwrap();
+        archive.write_all(b"framework binary").unwrap();
+        archive.finish().unwrap();
+
+        let destination = directory.path().join(asset.platform_key);
+        fs::create_dir(&destination).unwrap();
+        fs::write(destination.join("existing-runtime"), b"keep").unwrap();
+        let error = extract_electron_runtime_zip(&asset, &archive_path, &destination, None)
+            .unwrap_err();
+        assert!(error.contains("libffmpeg.dylib"), "{error}");
+        assert!(destination.join("existing-runtime").is_file());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "requires COCKPIT_TEST_ELECTRON_ARCHIVE, the pinned macOS Electron archive"]
+    fn macos_electron_runtime_rebuilds_missing_library_and_launches() {
+        use super::{electron_runtime_asset_for_current_platform, ensure_electron_runtime_in_root};
+        use std::{fs, path::PathBuf, process::Command};
+
+        let asset = electron_runtime_asset_for_current_platform().unwrap();
+        let archive = PathBuf::from(std::env::var_os("COCKPIT_TEST_ELECTRON_ARCHIVE").unwrap());
+        let directory = tempfile::tempdir().unwrap();
+        let cached_archive = directory.path().join(asset.file_name);
+        if fs::hard_link(&archive, &cached_archive).is_err() {
+            fs::copy(&archive, &cached_archive).unwrap();
+        }
+
+        let executable = ensure_electron_runtime_in_root(&asset, directory.path(), None).unwrap();
+        let ffmpeg = executable.parent().unwrap().parent().unwrap().join(
+            "Frameworks/Electron Framework.framework/Libraries/libffmpeg.dylib",
+        );
+        fs::remove_file(&ffmpeg).unwrap();
+        assert!(executable.is_file());
+        assert!(!ffmpeg.exists());
+        assert_eq!(
+            ensure_electron_runtime_in_root(&asset, directory.path(), None).unwrap(),
+            executable
+        );
+        assert!(ffmpeg.is_file());
+        let result = Command::new(executable)
+            .env("ELECTRON_RUN_AS_NODE", "1")
+            .arg("--version")
+            .output()
+            .unwrap();
+        assert!(result.status.success(), "{}", String::from_utf8_lossy(&result.stderr));
+        assert!(result.stdout.starts_with(b"v"));
+    }
 }
 
 #[cfg(target_os = "windows")]
@@ -388,7 +457,7 @@ fn launch_default_claude_desktop() -> Result<(), String> {
         .map_err(|e| format!("Failed to launch Claude Desktop: {}", e))
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", target_os = "linux"))]
 fn launch_default_claude_desktop() -> Result<(), String> {
     let pid = crate::modules::claude_instance::start_claude_default_with_args_with_new_window(
         &[],
@@ -401,7 +470,7 @@ fn launch_default_claude_desktop() -> Result<(), String> {
     Ok(())
 }
 
-#[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
+#[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
 fn launch_default_claude_desktop() -> Result<(), String> {
     Err("APP_PATH_NOT_FOUND:claude".to_string())
 }
@@ -429,6 +498,7 @@ fn import_desktop_profile_snapshot(
     let now = now_ts_ms();
     let desktop_profile = desktop_profile_metadata_json(&metadata, &snapshot_dir, now);
     let mut account = ClaudeAccount {
+        last_switched_at: None,
         id: id.clone(),
         email: label,
         auth_mode: ClaudeAuthMode::DesktopOAuth,
@@ -540,6 +610,20 @@ pub fn sync_cli_account_from_config_dir_if_same(
     account_id: &str,
     config_dir: &Path,
 ) -> Result<Option<ClaudeAccount>, String> {
+    sync_cli_account_from_config_dir(
+        account_id,
+        config_dir,
+        false,
+        read_claude_code_credentials_for_sync,
+    )
+}
+
+fn sync_cli_account_from_config_dir(
+    account_id: &str,
+    config_dir: &Path,
+    require_bound: bool,
+    read_credentials: impl FnOnce(&Path) -> Result<Value, String>,
+) -> Result<Option<ClaudeAccount>, String> {
     let existing = load_account(account_id).ok_or_else(|| "Claude 账号不存在".to_string())?;
     if !matches!(
         existing.auth_mode,
@@ -548,7 +632,19 @@ pub fn sync_cli_account_from_config_dir_if_same(
         return Ok(None);
     }
 
-    let credentials_raw = read_claude_code_credentials_for_sync(config_dir)?;
+    let bound_config = if require_bound {
+        let config_path = get_claude_code_global_config_path(config_dir)?;
+        let Some(config) = read_config_file(&config_path)? else {
+            return Ok(None);
+        };
+        if !cli_config_matches_account(&existing, &config) {
+            return Ok(None);
+        }
+        Some(config)
+    } else {
+        None
+    };
+    let credentials_raw = read_credentials(config_dir)?;
     if credentials_oauth(&credentials_raw).is_none() {
         return Ok(None);
     }
@@ -571,7 +667,12 @@ pub fn sync_cli_account_from_config_dir_if_same(
     let Some(config_raw) = read_config_file(&config_path)? else {
         return Ok(None);
     };
-    if config_oauth_account(&config_raw).is_none() {
+    if config_oauth_account(&config_raw).is_none()
+        || bound_config.as_ref().is_some_and(|before| {
+            config_oauth_account(before) != config_oauth_account(&config_raw)
+                || !cli_config_matches_account(&existing, &config_raw)
+        })
+    {
         return Ok(None);
     }
 
@@ -592,6 +693,17 @@ pub fn sync_cli_account_from_config_dir_if_same(
         return Ok(Some(existing));
     }
 
+    if require_bound
+        && !bound_cli_config_dirs(
+            &crate::modules::claude_instance::load_instance_store()?,
+            account_id,
+            get_default_claude_code_config_dir().ok(),
+        )
+        .contains(config_dir)
+    {
+        return Ok(None);
+    }
+
     logger::log_info(&format!(
         "[Claude CLI] 同步实例目录登录态到账号快照: account_id={}, config_dir={}",
         account_id,
@@ -604,7 +716,8 @@ pub fn sync_cli_account_from_config_dir_if_same(
             Some(current.clone()),
         )?;
         Ok(())
-    }).map(Some)
+    })
+    .map(Some)
 }
 
 pub fn start_desktop_login(
@@ -698,7 +811,7 @@ pub fn open_desktop_verification_window(account_id: &str) -> Result<(), String> 
         .and_then(|value| normalize_non_empty(Some(value)))
         .map(PathBuf::from)
         .ok_or_else(|| "Claude 账号缺少 profile 快照".to_string())?;
-    ensure_desktop_profile_logged_in(&profile_dir)?;
+    ensure_desktop_verification_profile(&profile_dir)?;
     let status_file = profile_dir.join("claude_desktop_verification_status.json");
     let export_file = desktop_auth_export_path(&profile_dir);
     let _ = remove_path_if_exists(&status_file);
@@ -1544,145 +1657,6 @@ fn plan_from_capability_list(caps: &[String], is_enterprise: bool) -> Option<Str
     None
 }
 
-/// 是否企业版：对齐官方 oauth/profile 分支，看 organization.organization_type === "claude_enterprise"。
-fn is_enterprise_from_profile(profile: &Value) -> bool {
-    let Some(endpoints) = profile.get("endpoints") else {
-        return false;
-    };
-    let direct_paths: &[&[&str]] = &[
-        &["accountProfile", "organization", "organization_type"],
-        &["account", "organization", "organization_type"],
-        &[
-            "bootstrapAppStart",
-            "activeOrganization",
-            "organization_type",
-        ],
-        &[
-            "bootstrapAppStart",
-            "active_organization",
-            "organization_type",
-        ],
-        &["bootstrapAppStart", "organization", "organization_type"],
-    ];
-    for path in direct_paths {
-        if let Some(value) = read_string_path(endpoints, path) {
-            if value.eq_ignore_ascii_case("claude_enterprise") {
-                return true;
-            }
-        }
-    }
-    let memberships_paths: &[&[&str]] = &[
-        &["bootstrapAppStart", "account", "memberships"],
-        &["accountProfile", "account", "memberships"],
-        &["account", "account", "memberships"],
-        &["account", "memberships"],
-    ];
-    for path in memberships_paths {
-        let mut current = endpoints;
-        let mut ok = true;
-        for key in *path {
-            match current.get(*key) {
-                Some(next) => current = next,
-                None => {
-                    ok = false;
-                    break;
-                }
-            }
-        }
-        if !ok {
-            continue;
-        }
-        let Some(memberships) = current.as_array() else {
-            continue;
-        };
-        for membership in memberships {
-            if let Some(org_type) = membership
-                .get("organization")
-                .and_then(|org| read_string_path(org, &["organization_type"]))
-            {
-                if org_type.eq_ignore_ascii_case("claude_enterprise") {
-                    return true;
-                }
-            }
-        }
-    }
-    false
-}
-
-fn infer_desktop_plan_from_capabilities(profile: &Value) -> Option<String> {
-    let endpoints = profile.get("endpoints")?;
-    let is_enterprise = is_enterprise_from_profile(profile);
-
-    // 1) accountProfile.organization.capabilities
-    let direct_paths: &[&[&str]] = &[
-        &["accountProfile", "organization", "capabilities"],
-        &["account", "organization", "capabilities"],
-        &["bootstrapAppStart", "activeOrganization", "capabilities"],
-        &["bootstrapAppStart", "active_organization", "capabilities"],
-        &["bootstrapAppStart", "organization", "capabilities"],
-    ];
-    for path in direct_paths {
-        let mut current = endpoints;
-        let mut ok = true;
-        for key in *path {
-            match current.get(*key) {
-                Some(next) => current = next,
-                None => {
-                    ok = false;
-                    break;
-                }
-            }
-        }
-        if ok {
-            let caps = capability_strings(Some(current));
-            if let Some(plan) = plan_from_capability_list(&caps, is_enterprise) {
-                return Some(plan);
-            }
-        }
-    }
-
-    // 2) bootstrapAppStart.account.memberships[*].organization.capabilities
-    let memberships_paths: &[&[&str]] = &[
-        &["bootstrapAppStart", "account", "memberships"],
-        &["accountProfile", "account", "memberships"],
-        &["account", "account", "memberships"],
-        &["account", "memberships"],
-    ];
-    for path in memberships_paths {
-        let mut current = endpoints;
-        let mut ok = true;
-        for key in *path {
-            match current.get(*key) {
-                Some(next) => current = next,
-                None => {
-                    ok = false;
-                    break;
-                }
-            }
-        }
-        if !ok {
-            continue;
-        }
-        let Some(memberships) = current.as_array() else {
-            continue;
-        };
-        let mut all_caps: Vec<String> = Vec::new();
-        for membership in memberships {
-            let caps = capability_strings(
-                membership
-                    .get("organization")
-                    .and_then(|org| org.get("capabilities")),
-            );
-            all_caps.extend(caps);
-        }
-        if let Some(plan) = plan_from_capability_list(&all_caps, is_enterprise) {
-            return Some(plan);
-        }
-    }
-
-    None
-}
-
 fn is_desktop_plan_placeholder(value: &str) -> bool {
     matches!(
         value.trim().to_ascii_lowercase().as_str(),
@@ -1699,103 +1673,94 @@ fn normalize_desktop_usage_percentage(value: f64) -> i32 {
     clamp_percentage(Some(scaled))
 }
 
-/// Claude Web 近期 `/api/organizations/:org/usage` 返回 `limits[]`，
-/// 不再只返回 five_hour / seven_day 这些固定字段。按官方客户端
-/// `plan-usage` 的 schema 将 session、weekly 以及 extra_usage 映射到
-/// 现有账号模型，同时保留原始响应便于后续扩展。
-fn official_usage_limits_to_quota(raw: &Value) -> Option<ClaudeQuota> {
-    let limits = raw.get("limits").and_then(Value::as_array)?;
-    let mut five_hour_percentage = None;
-    let mut five_hour_reset_time = None;
-    let mut seven_day_percentage = None;
-    let mut seven_day_reset_time = None;
-    let mut seven_day_sonnet_percentage = None;
-    let mut seven_day_sonnet_reset_time = None;
+#[derive(Default)]
+struct ParsedUsageLimits {
+    five_hour_percentage: Option<i32>,
+    five_hour_reset_time: Option<i64>,
+    seven_day_percentage: Option<i32>,
+    seven_day_reset_time: Option<i64>,
+    seven_day_sonnet_percentage: Option<i32>,
+    seven_day_sonnet_reset_time: Option<i64>,
+    has_limits_array: bool,
+}
+
+/// Claude Web 近期 `/api/organizations/:org/usage` 与 `/api/oauth/usage` 会返回 `limits[]`
+/// （常用于下发 `weekly_scoped` 模型专属限额，如 Fable / Opus / Sonnet，同时保留顶层
+/// `five_hour` / `seven_day` 汇总窗口）。仅提取无 surface 限定且作用域匹配的窗口，并与
+/// 顶层字段合并，避免子模型限额覆盖全模型周限额或丢弃顶层 5 小时窗口。
+fn parse_official_usage_limits(raw: &Value) -> ParsedUsageLimits {
+    let Some(limits) = raw.get("limits").and_then(Value::as_array) else {
+        return ParsedUsageLimits::default();
+    };
+    let mut parsed = ParsedUsageLimits {
+        has_limits_array: true,
+        ..ParsedUsageLimits::default()
+    };
 
     for limit in limits {
         let Some(object) = limit.as_object() else {
             continue;
         };
+        let scope = object.get("scope").and_then(Value::as_object);
+        // Surface-scoped sub-limits (e.g. claude_code) must not overwrite account-wide windows.
+        if scope
+            .and_then(|s| s.get("surface"))
+            .is_some_and(|v| !v.is_null())
+        {
+            continue;
+        }
+
+        let Some(percent_raw) = read_f64_value(object.get("percent")) else {
+            continue;
+        };
+        if !percent_raw.is_finite() || percent_raw < 0.0 {
+            continue;
+        }
+        // `limits[].percent` is always on a 0..100 percentage scale.
+        let percent = clamp_percentage(Some(percent_raw));
+        let reset_time = parse_reset_seconds(object.get("resets_at"));
+
         let kind = object
             .get("kind")
-            .and_then(|value| value.as_str())
+            .and_then(Value::as_str)
             .unwrap_or_default()
             .to_ascii_lowercase();
         let group = object
             .get("group")
-            .and_then(|value| value.as_str())
+            .and_then(Value::as_str)
             .unwrap_or_default()
             .to_ascii_lowercase();
-        let percent = read_f64_value(object.get("percent"));
-        let reset_time = parse_reset_seconds(object.get("resets_at"));
-        let product_name = object
-            .get("scope")
-            .and_then(|scope| scope.as_object())
-            .and_then(|scope| scope.get("model").or_else(|| scope.get("surface")))
-            .and_then(|model| model.get("display_name"))
-            .and_then(|value| value.as_str())
+        let model_obj = scope
+            .and_then(|s| s.get("model"))
+            .filter(|v| !v.is_null());
+        let has_model_scope = model_obj.is_some();
+        let model_name = model_obj
+            .and_then(|model| model.get("display_name").or_else(|| model.get("id")))
+            .and_then(Value::as_str)
             .unwrap_or_default()
             .to_ascii_lowercase();
 
-        if kind == "session" || group == "session" {
-            if five_hour_percentage.is_none() {
-                five_hour_percentage = percent.map(normalize_desktop_usage_percentage);
-                five_hour_reset_time = reset_time;
+        if (kind == "session" || group == "session") && !has_model_scope {
+            if parsed.five_hour_percentage.is_none() {
+                parsed.five_hour_percentage = Some(percent);
+                parsed.five_hour_reset_time = reset_time;
             }
-        } else if group == "weekly" || kind == "weekly" {
-            if product_name.contains("sonnet") {
-                if seven_day_sonnet_percentage.is_none() {
-                    seven_day_sonnet_percentage = percent.map(normalize_desktop_usage_percentage);
-                    seven_day_sonnet_reset_time = reset_time;
+        } else if group == "weekly" || kind == "weekly" || kind == "weekly_scoped" {
+            if model_name.contains("sonnet") {
+                if parsed.seven_day_sonnet_percentage.is_none() {
+                    parsed.seven_day_sonnet_percentage = Some(percent);
+                    parsed.seven_day_sonnet_reset_time = reset_time;
                 }
-            } else if seven_day_percentage.is_none() {
-                seven_day_percentage = percent.map(normalize_desktop_usage_percentage);
-                seven_day_reset_time = reset_time;
+            } else if !has_model_scope && kind != "weekly_scoped" {
+                if parsed.seven_day_percentage.is_none() {
+                    parsed.seven_day_percentage = Some(percent);
+                    parsed.seven_day_reset_time = reset_time;
+                }
             }
         }
     }
 
-    let extra_usage = raw.get("extra_usage");
-    let extra_enabled = read_bool_value(extra_usage.and_then(|value| value.get("is_enabled")))
-        .unwrap_or(extra_usage.is_some());
-    let has_window = five_hour_percentage.is_some()
-        || seven_day_percentage.is_some()
-        || seven_day_sonnet_percentage.is_some();
-    if !has_window && !extra_enabled {
-        return None;
-    }
-
-    Some(ClaudeQuota {
-        five_hour_percentage: five_hour_percentage.unwrap_or(0),
-        five_hour_reset_time,
-        seven_day_percentage: seven_day_percentage.unwrap_or(0),
-        seven_day_reset_time,
-        seven_day_sonnet_percentage,
-        seven_day_sonnet_reset_time,
-        extra_usage_percentage: extra_enabled.then(|| {
-            read_f64_value(extra_usage.and_then(|value| value.get("utilization")))
-                .map(normalize_desktop_usage_percentage)
-                .unwrap_or(0)
-        }),
-        extra_usage_reset_time: parse_reset_seconds(
-            extra_usage.and_then(|value| value.get("resets_at")),
-        ),
-        extra_usage_used_cents: first_i64_path_candidates(
-            Some(raw),
-            &[
-                &["extra_usage", "used_credits"],
-                &["extra_usage", "used_cents"],
-            ],
-        ),
-        extra_usage_limit_cents: first_i64_path_candidates(
-            Some(raw),
-            &[
-                &["extra_usage", "monthly_limit"],
-                &["extra_usage", "limit_cents"],
-            ],
-        ),
-        raw_data: Some(raw.clone()),
-    })
+    parsed
 }
 
 fn quota_matches(left: &ClaudeQuota, right: &ClaudeQuota) -> bool {
@@ -1831,6 +1796,10 @@ fn slim_organization_object(org: &Value) -> Value {
         "organization_type",
         "rate_limit_tier",
         "capabilities",
+        "plan_display_name",
+        "planDisplayName",
+        "paidAccountTier",
+        "subscription_type",
     ] {
         if let Some(v) = obj.get(key) {
             slim.insert(key.to_string(), v.clone());
@@ -1856,6 +1825,9 @@ fn slim_account_object(value: &Value) -> Option<Value> {
         "uuid",
         "full_name",
         "display_name",
+        "paidAccountTier",
+        "planDisplayName",
+        "plan_display_name",
     ] {
         if let Some(v) = obj.get(key) {
             slim.insert(key.to_string(), v.clone());
@@ -1878,10 +1850,16 @@ fn slim_account_profile_payload(value: &Value) -> Option<Value> {
         "uuid",
         "full_name",
         "display_name",
+        "paidAccountTier",
+        "planDisplayName",
+        "plan_display_name",
     ] {
         if let Some(v) = obj.get(key) {
             slim.insert(key.to_string(), v.clone());
         }
+    }
+    if let Some(memberships) = obj.get("memberships").and_then(Value::as_array) {
+        slim.insert("memberships".to_string(), Value::Array(memberships.iter().map(slim_membership_entry).collect()));
     }
     if let Some(org) = obj.get("organization") {
         slim.insert("organization".to_string(), slim_organization_object(org));
@@ -1898,6 +1876,9 @@ fn slim_account_profile_payload(value: &Value) -> Option<Value> {
 fn slim_bootstrap_payload(value: &Value) -> Option<Value> {
     let obj = value.as_object()?;
     let mut slim = serde_json::Map::new();
+    for key in ["paidAccountTier", "planDisplayName", "plan_display_name"] {
+        if let Some(value) = obj.get(key) { slim.insert(key.to_string(), value.clone()); }
+    }
     for org_key in ["activeOrganization", "active_organization", "organization"] {
         if let Some(org) = obj.get(org_key) {
             slim.insert(org_key.to_string(), slim_organization_object(org));
@@ -1918,7 +1899,7 @@ fn slim_bootstrap_payload(value: &Value) -> Option<Value> {
 /// 生成可安全写入 claude_usage_raw / 导出的 webProfile 瘦身副本。
 fn slim_web_profile_for_storage(profile: &Value) -> Value {
     let mut slim = serde_json::Map::new();
-    for key in ["version", "fetchContext", "fetchedAt"] {
+    for key in ["version", "fetchContext", "fetchedAt", "lastActiveOrg"] {
         if let Some(v) = profile.get(key) {
             slim.insert(key.to_string(), v.clone());
         }
@@ -1961,212 +1942,134 @@ fn slim_web_profile_for_storage(profile: &Value) -> Value {
     Value::Object(slim)
 }
 
+fn resolve_usage_percentage_from_candidates(
+    root: &Value,
+    direct_percentage_paths: &[&[&str]],
+    legacy_ratio_paths: &[&[&str]],
+) -> Option<i32> {
+    if let Some(val) = first_f64_path_candidates(Some(root), direct_percentage_paths) {
+        return Some(clamp_percentage(Some(val)));
+    }
+    first_f64_path_candidates(Some(root), legacy_ratio_paths).map(normalize_desktop_usage_percentage)
+}
+
 fn desktop_web_usage_to_quota(profile: &Value) -> Option<ClaudeQuota> {
     let usage_root = profile
         .get("endpoints")
         .and_then(|value| value.get("organizationUsage"))
         .unwrap_or(profile);
-    if let Some(quota) = official_usage_limits_to_quota(usage_root) {
-        return Some(quota);
-    }
+    let limits_parsed = parse_official_usage_limits(usage_root);
 
-    let five_hour = first_f64_path_candidates(
-        Some(profile),
+    let top_five_hour = resolve_usage_percentage_from_candidates(
+        usage_root,
         &[
-            &["endpoints", "organizationUsage", "five_hour", "utilization"],
-            &["endpoints", "organizationUsage", "five_hour", "percentage"],
-            &[
-                "endpoints",
-                "organizationUsage",
-                "five_hour",
-                "percent_used",
-            ],
-            &["endpoints", "organizationUsage", "fiveHour", "utilization"],
-            &["endpoints", "organizationUsage", "fiveHour", "percentage"],
-            &["endpoints", "organizationUsage", "fiveHour", "percentUsed"],
-            &[
-                "endpoints",
-                "organizationUsage",
-                "usage",
-                "five_hour",
-                "utilization",
-            ],
-            &[
-                "endpoints",
-                "organizationUsage",
-                "usage",
-                "fiveHour",
-                "utilization",
-            ],
-            &[
-                "endpoints",
-                "organizationUsage",
-                "limits",
-                "five_hour",
-                "utilization",
-            ],
-            &[
-                "endpoints",
-                "organizationUsage",
-                "limits",
-                "fiveHour",
-                "utilization",
-            ],
-            &["endpoints", "organizationUsage", "five_hour_percentage"],
-            &["endpoints", "organizationUsage", "fiveHourPercentage"],
-            &["endpoints", "organizationUsage", "five_hour_utilization"],
-            &["endpoints", "organizationUsage", "fiveHourUtilization"],
-            &["endpoints", "organizationUsage", "five_hour_percent_used"],
-            &["endpoints", "organizationUsage", "fiveHourPercentUsed"],
+            &["five_hour", "utilization"],
+            &["five_hour", "percentage"],
+            &["usage", "five_hour", "utilization"],
+            &["limits", "five_hour", "utilization"],
+            &["five_hour_percentage"],
+            &["five_hour_utilization"],
+        ],
+        &[
+            &["five_hour", "percent_used"],
+            &["fiveHour", "utilization"],
+            &["fiveHour", "percentage"],
+            &["fiveHour", "percentUsed"],
+            &["usage", "fiveHour", "utilization"],
+            &["limits", "fiveHour", "utilization"],
+            &["fiveHourPercentage"],
+            &["fiveHourUtilization"],
+            &["five_hour_percent_used"],
+            &["fiveHourPercentUsed"],
         ],
     );
-    let seven_day = first_f64_path_candidates(
-        Some(profile),
+    let top_seven_day = resolve_usage_percentage_from_candidates(
+        usage_root,
         &[
-            &["endpoints", "organizationUsage", "seven_day", "utilization"],
-            &["endpoints", "organizationUsage", "seven_day", "percentage"],
-            &[
-                "endpoints",
-                "organizationUsage",
-                "seven_day",
-                "percent_used",
-            ],
-            &["endpoints", "organizationUsage", "sevenDay", "utilization"],
-            &["endpoints", "organizationUsage", "sevenDay", "percentage"],
-            &["endpoints", "organizationUsage", "sevenDay", "percentUsed"],
-            &[
-                "endpoints",
-                "organizationUsage",
-                "usage",
-                "seven_day",
-                "utilization",
-            ],
-            &[
-                "endpoints",
-                "organizationUsage",
-                "usage",
-                "sevenDay",
-                "utilization",
-            ],
-            &[
-                "endpoints",
-                "organizationUsage",
-                "limits",
-                "seven_day",
-                "utilization",
-            ],
-            &[
-                "endpoints",
-                "organizationUsage",
-                "limits",
-                "sevenDay",
-                "utilization",
-            ],
-            &["endpoints", "organizationUsage", "seven_day_percentage"],
-            &["endpoints", "organizationUsage", "sevenDayPercentage"],
-            &["endpoints", "organizationUsage", "seven_day_utilization"],
-            &["endpoints", "organizationUsage", "sevenDayUtilization"],
-            &["endpoints", "organizationUsage", "seven_day_percent_used"],
-            &["endpoints", "organizationUsage", "sevenDayPercentUsed"],
+            &["seven_day", "utilization"],
+            &["seven_day", "percentage"],
+            &["usage", "seven_day", "utilization"],
+            &["limits", "seven_day", "utilization"],
+            &["seven_day_percentage"],
+            &["seven_day_utilization"],
+        ],
+        &[
+            &["seven_day", "percent_used"],
+            &["sevenDay", "utilization"],
+            &["sevenDay", "percentage"],
+            &["sevenDay", "percentUsed"],
+            &["usage", "sevenDay", "utilization"],
+            &["limits", "sevenDay", "utilization"],
+            &["sevenDayPercentage"],
+            &["sevenDayUtilization"],
+            &["seven_day_percent_used"],
+            &["sevenDayPercentUsed"],
         ],
     );
-    let seven_day_sonnet = first_f64_path_candidates(
-        Some(profile),
+    let top_seven_day_sonnet = resolve_usage_percentage_from_candidates(
+        usage_root,
         &[
-            &[
-                "endpoints",
-                "organizationUsage",
-                "seven_day_sonnet",
-                "utilization",
-            ],
-            &[
-                "endpoints",
-                "organizationUsage",
-                "seven_day_sonnet",
-                "percentage",
-            ],
-            &[
-                "endpoints",
-                "organizationUsage",
-                "seven_day_sonnet",
-                "percent_used",
-            ],
-            &[
-                "endpoints",
-                "organizationUsage",
-                "sevenDaySonnet",
-                "utilization",
-            ],
-            &[
-                "endpoints",
-                "organizationUsage",
-                "sevenDaySonnet",
-                "percentage",
-            ],
-            &[
-                "endpoints",
-                "organizationUsage",
-                "sevenDaySonnet",
-                "percentUsed",
-            ],
-            &[
-                "endpoints",
-                "organizationUsage",
-                "seven_day_sonnet_percentage",
-            ],
-            &["endpoints", "organizationUsage", "sevenDaySonnetPercentage"],
-            &[
-                "endpoints",
-                "organizationUsage",
-                "seven_day_sonnet_utilization",
-            ],
-            &[
-                "endpoints",
-                "organizationUsage",
-                "sevenDaySonnetUtilization",
-            ],
+            &["seven_day_sonnet", "utilization"],
+            &["seven_day_sonnet", "percentage"],
+            &["seven_day_sonnet_percentage"],
+            &["seven_day_sonnet_utilization"],
+        ],
+        &[
+            &["seven_day_sonnet", "percent_used"],
+            &["sevenDaySonnet", "utilization"],
+            &["sevenDaySonnet", "percentage"],
+            &["sevenDaySonnet", "percentUsed"],
+            &["sevenDaySonnetPercentage"],
+            &["sevenDaySonnetUtilization"],
         ],
     );
-    if five_hour.is_none() && seven_day.is_none() && seven_day_sonnet.is_none() {
-        return None;
-    }
 
-    let extra_usage = first_f64_path_candidates(
-        Some(profile),
+    let five_hour = limits_parsed.five_hour_percentage.or(top_five_hour);
+    let seven_day = limits_parsed.seven_day_percentage.or(top_seven_day);
+    let seven_day_sonnet = limits_parsed
+        .seven_day_sonnet_percentage
+        .or(top_seven_day_sonnet);
+
+    let extra_usage_pct = first_f64_path_candidates(
+        Some(usage_root),
         &[
-            &[
-                "endpoints",
-                "organizationUsage",
-                "extra_usage",
-                "utilization",
-            ],
-            &[
-                "endpoints",
-                "organizationUsage",
-                "extraUsage",
-                "utilization",
-            ],
-            &["endpoints", "organizationUsage", "extra_usage_percentage"],
-            &["endpoints", "organizationUsage", "extraUsagePercentage"],
-            &["endpoints", "overageSpendLimit", "utilization"],
-            &["endpoints", "overageSpendLimit", "percentage"],
-            &["endpoints", "overageSpendLimit", "percent_used"],
-            &["endpoints", "overageSpendLimit", "percentUsed"],
+            &["extra_usage", "utilization"],
+            &["extra_usage_percentage"],
         ],
-    );
+    )
+    .map(|val| clamp_percentage(Some(val)))
+    .or_else(|| {
+        first_f64_path_candidates(
+            Some(usage_root),
+            &[
+                &["extraUsage", "utilization"],
+                &["extraUsagePercentage"],
+            ],
+        )
+        .map(normalize_desktop_usage_percentage)
+    })
+    .or_else(|| {
+        first_f64_path_candidates(
+            Some(profile),
+            &[
+                &["endpoints", "overageSpendLimit", "utilization"],
+                &["endpoints", "overageSpendLimit", "percentage"],
+                &["endpoints", "overageSpendLimit", "percent_used"],
+                &["endpoints", "overageSpendLimit", "percentUsed"],
+            ],
+        )
+        .map(normalize_desktop_usage_percentage)
+    });
+
     let extra_enabled = read_bool_value(
-        profile
-            .get("endpoints")
-            .and_then(|value| value.get("organizationUsage"))
-            .and_then(|value| value.get("extra_usage"))
+        usage_root
+            .get("extra_usage")
             .and_then(|value| value.get("is_enabled")),
     )
     .or_else(|| {
         read_bool_value(
-            profile
-                .get("endpoints")
-                .and_then(|value| value.get("organizationUsage"))
-                .and_then(|value| value.get("extraUsage"))
+            usage_root
+                .get("extraUsage")
                 .and_then(|value| value.get("isEnabled")),
         )
     })
@@ -2178,137 +2081,166 @@ fn desktop_web_usage_to_quota(profile: &Value) -> Option<ClaudeQuota> {
                 .and_then(|value| value.get("is_enabled")),
         )
     })
-    .unwrap_or(extra_usage.is_some());
+    .unwrap_or(extra_usage_pct.is_some() || usage_root.get("extra_usage").is_some());
+
+    let has_window = five_hour.is_some() || seven_day.is_some() || seven_day_sonnet.is_some();
+    if !has_window && !(limits_parsed.has_limits_array && extra_enabled) {
+        return None;
+    }
+
+    let top_five_hour_reset = first_reset_path_candidates(
+        Some(usage_root),
+        &[
+            &["five_hour", "resets_at"],
+            &["five_hour", "reset_at"],
+            &["fiveHour", "resetsAt"],
+            &["fiveHour", "resetAt"],
+            &["five_hour_reset_time"],
+            &["fiveHourResetTime"],
+        ],
+    );
+    let top_seven_day_reset = first_reset_path_candidates(
+        Some(usage_root),
+        &[
+            &["seven_day", "resets_at"],
+            &["seven_day", "reset_at"],
+            &["sevenDay", "resetsAt"],
+            &["sevenDay", "resetAt"],
+            &["seven_day_reset_time"],
+            &["sevenDayResetTime"],
+        ],
+    );
+    let top_seven_day_sonnet_reset = first_reset_path_candidates(
+        Some(usage_root),
+        &[
+            &["seven_day_sonnet", "resets_at"],
+            &["seven_day_sonnet", "reset_at"],
+            &["sevenDaySonnet", "resetsAt"],
+            &["sevenDaySonnet", "resetAt"],
+            &["seven_day_sonnet_reset_time"],
+            &["sevenDaySonnetResetTime"],
+        ],
+    );
 
     let endpoints = profile.get("endpoints");
     Some(ClaudeQuota {
-        five_hour_percentage: five_hour
-            .map(normalize_desktop_usage_percentage)
-            .unwrap_or(0),
-        five_hour_reset_time: first_reset_path_candidates(
-            Some(profile),
-            &[
-                &["endpoints", "organizationUsage", "five_hour", "resets_at"],
-                &["endpoints", "organizationUsage", "five_hour", "reset_at"],
-                &["endpoints", "organizationUsage", "fiveHour", "resetsAt"],
-                &["endpoints", "organizationUsage", "fiveHour", "resetAt"],
-                &["endpoints", "organizationUsage", "five_hour_reset_time"],
-                &["endpoints", "organizationUsage", "fiveHourResetTime"],
-            ],
-        ),
-        seven_day_percentage: seven_day
-            .map(normalize_desktop_usage_percentage)
-            .unwrap_or(0),
-        seven_day_reset_time: first_reset_path_candidates(
-            Some(profile),
-            &[
-                &["endpoints", "organizationUsage", "seven_day", "resets_at"],
-                &["endpoints", "organizationUsage", "seven_day", "reset_at"],
-                &["endpoints", "organizationUsage", "sevenDay", "resetsAt"],
-                &["endpoints", "organizationUsage", "sevenDay", "resetAt"],
-                &["endpoints", "organizationUsage", "seven_day_reset_time"],
-                &["endpoints", "organizationUsage", "sevenDayResetTime"],
-            ],
-        ),
-        seven_day_sonnet_percentage: seven_day_sonnet.map(normalize_desktop_usage_percentage),
-        seven_day_sonnet_reset_time: first_reset_path_candidates(
-            Some(profile),
-            &[
-                &[
-                    "endpoints",
-                    "organizationUsage",
-                    "seven_day_sonnet",
-                    "resets_at",
-                ],
-                &[
-                    "endpoints",
-                    "organizationUsage",
-                    "seven_day_sonnet",
-                    "reset_at",
-                ],
-                &[
-                    "endpoints",
-                    "organizationUsage",
-                    "sevenDaySonnet",
-                    "resetsAt",
-                ],
-                &[
-                    "endpoints",
-                    "organizationUsage",
-                    "sevenDaySonnet",
-                    "resetAt",
-                ],
-                &[
-                    "endpoints",
-                    "organizationUsage",
-                    "seven_day_sonnet_reset_time",
-                ],
-                &["endpoints", "organizationUsage", "sevenDaySonnetResetTime"],
-            ],
-        ),
-        extra_usage_percentage: extra_enabled.then(|| {
-            extra_usage
-                .map(normalize_desktop_usage_percentage)
-                .unwrap_or(0)
-        }),
+        five_hour_percentage: five_hour.unwrap_or(0),
+        five_hour_reset_time: if limits_parsed.five_hour_percentage.is_some() {
+            limits_parsed.five_hour_reset_time.or(top_five_hour_reset)
+        } else {
+            top_five_hour_reset
+        },
+        seven_day_percentage: seven_day.unwrap_or(0),
+        seven_day_reset_time: if limits_parsed.seven_day_percentage.is_some() {
+            limits_parsed.seven_day_reset_time.or(top_seven_day_reset)
+        } else {
+            top_seven_day_reset
+        },
+        seven_day_sonnet_percentage: seven_day_sonnet,
+        seven_day_sonnet_reset_time: if limits_parsed.seven_day_sonnet_percentage.is_some() {
+            limits_parsed.seven_day_sonnet_reset_time
+        } else {
+            top_seven_day_sonnet_reset
+        },
+        extra_usage_percentage: extra_enabled.then(|| extra_usage_pct.unwrap_or(0)),
         extra_usage_reset_time: first_reset_path_candidates(
-            Some(profile),
+            Some(usage_root),
             &[
-                &["endpoints", "organizationUsage", "extra_usage", "resets_at"],
-                &["endpoints", "organizationUsage", "extraUsage", "resetsAt"],
-                &["endpoints", "overageSpendLimit", "resets_at"],
-                &["endpoints", "overageSpendLimit", "resetsAt"],
+                &["extra_usage", "resets_at"],
+                &["extraUsage", "resetsAt"],
             ],
-        ),
+        )
+        .or_else(|| {
+            first_reset_path_candidates(
+                Some(profile),
+                &[
+                    &["endpoints", "overageSpendLimit", "resets_at"],
+                    &["endpoints", "overageSpendLimit", "resetsAt"],
+                ],
+            )
+        }),
         extra_usage_used_cents: first_i64_path_candidates(
-            Some(profile),
+            Some(usage_root),
             &[
-                &[
-                    "endpoints",
-                    "organizationUsage",
-                    "extra_usage",
-                    "used_credits",
-                ],
-                &[
-                    "endpoints",
-                    "organizationUsage",
-                    "extraUsage",
-                    "usedCredits",
-                ],
-                &["endpoints", "overageSpendLimit", "used_credits"],
-                &["endpoints", "overageSpendLimit", "usedCredits"],
-                &["endpoints", "overageSpendLimit", "used_cents"],
-                &["endpoints", "overageSpendLimit", "usedCents"],
+                &["extra_usage", "used_credits"],
+                &["extra_usage", "used_cents"],
+                &["extraUsage", "usedCredits"],
             ],
-        ),
+        )
+        .or_else(|| {
+            first_i64_path_candidates(
+                Some(profile),
+                &[
+                    &["endpoints", "overageSpendLimit", "used_credits"],
+                    &["endpoints", "overageSpendLimit", "usedCredits"],
+                    &["endpoints", "overageSpendLimit", "used_cents"],
+                    &["endpoints", "overageSpendLimit", "usedCents"],
+                ],
+            )
+        }),
         extra_usage_limit_cents: first_i64_path_candidates(
-            Some(profile),
+            Some(usage_root),
             &[
-                &[
-                    "endpoints",
-                    "organizationUsage",
-                    "extra_usage",
-                    "monthly_limit",
-                ],
-                &[
-                    "endpoints",
-                    "organizationUsage",
-                    "extraUsage",
-                    "monthlyLimit",
-                ],
-                &["endpoints", "overageSpendLimit", "monthly_limit"],
-                &["endpoints", "overageSpendLimit", "monthlyLimit"],
-                &["endpoints", "overageSpendLimit", "limit_cents"],
-                &["endpoints", "overageSpendLimit", "limitCents"],
+                &["extra_usage", "monthly_limit"],
+                &["extra_usage", "limit_cents"],
+                &["extraUsage", "monthlyLimit"],
             ],
-        ),
-        raw_data: Some(json!({
-            "source": "claude_desktop_web",
-            "organizationUsage": endpoints.and_then(|value| value.get("organizationUsage")).cloned(),
-            "subscriptionDetails": endpoints.and_then(|value| value.get("subscriptionDetails")).cloned(),
-            "overageSpendLimit": endpoints.and_then(|value| value.get("overageSpendLimit")).cloned(),
-        })),
+        )
+        .or_else(|| {
+            first_i64_path_candidates(
+                Some(profile),
+                &[
+                    &["endpoints", "overageSpendLimit", "monthly_limit"],
+                    &["endpoints", "overageSpendLimit", "monthlyLimit"],
+                    &["endpoints", "overageSpendLimit", "limit_cents"],
+                    &["endpoints", "overageSpendLimit", "limitCents"],
+                ],
+            )
+        }),
+        raw_data: Some(if let Some(endpoints) = endpoints {
+            json!({
+                "source": "claude_desktop_web",
+                "organizationUsage": endpoints.get("organizationUsage").cloned(),
+                "subscriptionDetails": endpoints.get("subscriptionDetails").cloned(),
+                "overageSpendLimit": endpoints.get("overageSpendLimit").cloned(),
+            })
+        } else {
+            usage_root.clone()
+        }),
     })
+}
+
+fn normalize_cached_desktop_plan_from_raw(account: &mut ClaudeAccount) -> bool {
+    if account.auth_mode != ClaudeAuthMode::DesktopOAuth {
+        return false;
+    }
+    let Some(raw) = account.claude_usage_raw.as_ref() else {
+        return false;
+    };
+    let (Some(plan_type), raw_plan) = desktop_plan_from_profile(raw) else {
+        return false;
+    };
+    let mut changed = false;
+    if account.plan_type.as_deref() != Some(plan_type.as_str()) {
+        account.plan_type = Some(plan_type.clone());
+        changed = true;
+    }
+    if let Some(summary) = account
+        .claude_config_raw
+        .as_mut()
+        .and_then(Value::as_object_mut)
+        .and_then(|obj| obj.get_mut("desktopProfile"))
+        .and_then(Value::as_object_mut)
+        .and_then(|obj| obj.get_mut("webProfileSummary"))
+        .and_then(Value::as_object_mut)
+    {
+        if summary.get("planType").and_then(Value::as_str) != Some(plan_type.as_str()) {
+            summary.insert("planType".to_string(), json!(plan_type));
+            summary.insert("rawPlan".to_string(), json!(raw_plan));
+            changed = true;
+        }
+    }
+    changed
 }
 
 fn normalize_cached_desktop_quota_from_raw(account: &mut ClaudeAccount) -> bool {
@@ -2381,154 +2313,11 @@ fn desktop_web_profile_summary(profile: &Value) -> Value {
         ],
     )
     .or_else(|| find_string_by_key(profile, &["account_uuid", "accountUuid"]));
-    let organization_uuid = first_string_path_candidates(
-        Some(profile),
-        &[
-            &["endpoints", "accountProfile", "organization", "uuid"],
-            &["endpoints", "account", "organization", "uuid"],
-            &[
-                "endpoints",
-                "bootstrapAppStart",
-                "activeOrganization",
-                "uuid",
-            ],
-            &[
-                "endpoints",
-                "bootstrapAppStart",
-                "active_organization",
-                "uuid",
-            ],
-            &["endpoints", "bootstrapAppStart", "organization", "uuid"],
-        ],
-    )
-    .or_else(|| find_string_by_key(profile, &["organization_uuid", "organizationUuid"]));
-    let organization_name = first_string_path_candidates(
-        Some(profile),
-        &[
-            &["endpoints", "accountProfile", "organization", "name"],
-            &[
-                "endpoints",
-                "accountProfile",
-                "organization",
-                "display_name",
-            ],
-            &["endpoints", "account", "organization", "name"],
-            &[
-                "endpoints",
-                "bootstrapAppStart",
-                "activeOrganization",
-                "name",
-            ],
-            &[
-                "endpoints",
-                "bootstrapAppStart",
-                "active_organization",
-                "name",
-            ],
-            &["endpoints", "bootstrapAppStart", "organization", "name"],
-        ],
-    )
-    .or_else(|| find_string_by_key(profile, &["organization_name", "organizationName"]));
-    let raw_plan = first_string_path_candidates(
-        Some(profile),
-        &[
-            &["endpoints", "subscriptionDetails", "plan_type"],
-            &["endpoints", "subscriptionDetails", "planType"],
-            &["endpoints", "subscriptionDetails", "plan"],
-            &["endpoints", "subscriptionDetails", "tier"],
-            &["endpoints", "subscriptionDetails", "subscription_type"],
-            &["endpoints", "subscriptionDetails", "subscriptionType"],
-            &[
-                "endpoints",
-                "subscriptionDetails",
-                "subscription",
-                "plan_type",
-            ],
-            &[
-                "endpoints",
-                "subscriptionDetails",
-                "subscription",
-                "planType",
-            ],
-            &["endpoints", "subscriptionDetails", "subscription", "plan"],
-            &["endpoints", "subscriptionDetails", "subscription", "tier"],
-            &["endpoints", "organizationUsage", "plan_type"],
-            &["endpoints", "organizationUsage", "planType"],
-            &["endpoints", "organizationUsage", "subscription_type"],
-            &["endpoints", "organizationUsage", "subscriptionType"],
-            &[
-                "endpoints",
-                "accountProfile",
-                "organization",
-                "rate_limit_tier",
-            ],
-            &[
-                "endpoints",
-                "accountProfile",
-                "organization",
-                "organization_type",
-            ],
-            &[
-                "endpoints",
-                "accountProfile",
-                "organization",
-                "billing_type",
-            ],
-            &["endpoints", "account", "organization", "rate_limit_tier"],
-            &["endpoints", "account", "organization", "organization_type"],
-            &[
-                "endpoints",
-                "bootstrapAppStart",
-                "activeOrganization",
-                "rate_limit_tier",
-            ],
-            &[
-                "endpoints",
-                "bootstrapAppStart",
-                "activeOrganization",
-                "organization_type",
-            ],
-            &[
-                "endpoints",
-                "bootstrapAppStart",
-                "active_organization",
-                "rate_limit_tier",
-            ],
-            &[
-                "endpoints",
-                "bootstrapAppStart",
-                "active_organization",
-                "organization_type",
-            ],
-        ],
-    )
-    .or_else(|| {
-        find_string_by_key(
-            profile,
-            &[
-                "rate_limit_tier",
-                "rateLimitTier",
-                "subscription_type",
-                "subscriptionType",
-                "billing_type",
-                "billingType",
-                "organization_type",
-                "organizationType",
-                "plan_type",
-                "planType",
-                "plan_name",
-                "planName",
-                "subscription_tier",
-                "subscriptionTier",
-                "plan",
-                "tier",
-            ],
-        )
-    });
-    // 严格对齐官方：仅 capabilities 识别、OAuth profile organization_type 识别。
-    // 拿不到时返回 None，与官方 "没值则不显示" 一致。
-    let plan_type = infer_desktop_plan_from_capabilities(profile)
-        .or_else(|| normalize_desktop_plan_value(raw_plan.clone()));
+    let organization = desktop_plan_organization(profile);
+    let organization_uuid = read_string_path(profile, &["lastActiveOrg"])
+        .or_else(|| organization.and_then(|org| read_string_path(org, &["uuid"])));
+    let organization_name = organization.and_then(|org| read_string_path(org, &["name"]));
+    let (plan_type, raw_plan) = desktop_plan_from_profile(profile);
     json!({
         "fetchedAt": read_string_path(profile, &["fetchedAt"]),
         "email": email,
@@ -2914,18 +2703,12 @@ fn inject_api_key_to_claude_code_settings(
 
     fs::create_dir_all(&config_dir).map_err(|e| format!("创建 Claude Code 配置目录失败: {}", e))?;
     let mut settings = read_config_file(&settings_path)?.unwrap_or_else(|| json!({}));
-    if !settings.is_object() {
-        settings = json!({});
-    }
 
     let keys_to_clear = managed_env_keys_for_settings(&settings_path);
     let object = settings
         .as_object_mut()
         .ok_or_else(|| "Claude settings.json 结构非法".to_string())?;
     let env_value = object.entry("env".to_string()).or_insert_with(|| json!({}));
-    if !env_value.is_object() {
-        *env_value = json!({});
-    }
     let env_object = env_value
         .as_object_mut()
         .ok_or_else(|| "Claude settings.json env 结构非法".to_string())?;
@@ -3156,14 +2939,23 @@ fn inject_oauth_account_to_claude_code(
     Ok(())
 }
 
-pub fn inject_to_claude_config(account_id: &str, config_dir: Option<&Path>) -> Result<(), String> {
+pub fn inject_to_claude_config(
+    account_id: &str,
+    config_dir: Option<&Path>,
+) -> Result<Option<String>, String> {
     let account = load_account(account_id).ok_or_else(|| "Claude 账号不存在".to_string())?;
     if account.auth_mode == ClaudeAuthMode::DesktopGateway {
         if let Some(target_dir) = config_dir {
             restore_desktop_gateway_account_to_profile(account_id, target_dir, false)?;
-            return Ok(());
+            return Ok(None);
         }
         quit_claude_desktop_for_profile_write()?;
+        #[cfg(target_os = "macos")]
+        if let Err(error) = get_default_claude_desktop_user_data_dir()
+            .and_then(|target_dir| write_back_default_desktop_login(&target_dir, None))
+        {
+            logger::log_warn(&format!("[Claude Switch] 回写原账号登录态失败: {error}"));
+        }
         write_default_desktop_gateway_profile(&account)?;
         crate::modules::claude_instance::ensure_claude_launch_path_configured()?;
         launch_default_claude_desktop()?;
@@ -3171,7 +2963,7 @@ pub fn inject_to_claude_config(account_id: &str, config_dir: Option<&Path>) -> R
         let mut updated = account.clone();
         updated.last_used = now_ts_ms();
         save_account_and_index(updated)?;
-        return Ok(());
+        return Ok(None);
     }
     if account.auth_mode == ClaudeAuthMode::DesktopOAuth {
         if config_dir.is_some() {
@@ -3185,23 +2977,46 @@ pub fn inject_to_claude_config(account_id: &str, config_dir: Option<&Path>) -> R
             .ok_or_else(|| "Claude 账号缺少 profile 快照".to_string())?;
         let target_dir = get_default_claude_desktop_user_data_dir()?;
         quit_claude_desktop_for_profile_write()?;
-        let _backup_dir = backup_current_desktop_profile(&target_dir)?;
+        let backup = backup_current_desktop_profile(&target_dir)?;
+        #[cfg(target_os = "macos")]
+        if let Some(backup) = backup {
+            if let Err(error) = write_back_default_desktop_login(&target_dir, Some(&backup)) {
+                logger::log_warn(&format!(
+                    "[Claude Switch] 回写原账号登录态失败，已保留切换前备份: {error}"
+                ));
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
+        let _ = backup;
         restore_default_desktop_gateway_official_config()?;
-        restore_desktop_profile_snapshot(&snapshot_dir, &target_dir)?;
+        restore_desktop_profile_snapshot(&snapshot_dir, &target_dir, account.account_uuid.as_deref())?;
         restore_default_desktop_gateway_official_config()?;
+        #[cfg(target_os = "macos")]
+        let sync_warning = if crate::modules::config::get_user_config().claude_share_code_sessions_on_switch {
+            desktop_code_sessions::sync_before_launch(&target_dir, &account).err()
+                .map(|error| {
+                    let message = format!("同步 Code 会话列表失败：{error}");
+                    logger::log_warn(&format!("[Claude Switch] {message}"));
+                    message
+                })
+        } else {
+            None
+        };
+        #[cfg(not(target_os = "macos"))]
+        let sync_warning = None;
 
         let mut updated = account.clone();
         updated.last_used = now_ts_ms();
         save_account_and_index(updated)?;
         launch_default_claude_desktop()?;
-        return Ok(());
+        return Ok(sync_warning);
     }
     if account.auth_mode == ClaudeAuthMode::ApiKey {
         inject_api_key_to_claude_code_settings(&account, config_dir)?;
         let mut updated = account.clone();
         updated.last_used = now_ts_ms();
         save_account_and_index(updated)?;
-        return Ok(());
+        return Ok(None);
     }
     let config_dir_path = get_effective_claude_code_config_dir(config_dir)?;
     clear_api_key_env_from_claude_code_settings(&config_dir_path)?;
@@ -3211,10 +3026,10 @@ pub fn inject_to_claude_config(account_id: &str, config_dir: Option<&Path>) -> R
         current.last_used = now_ts_ms();
         Ok(())
     })?;
-    Ok(())
+    Ok(None)
 }
 
-pub fn inject_to_claude(account_id: &str) -> Result<(), String> {
+pub fn inject_to_claude(account_id: &str) -> Result<Option<String>, String> {
     inject_to_claude_config(account_id, None)
 }
 
@@ -3341,6 +3156,7 @@ pub fn update_account_note(account_id: &str, note: Option<&str>) -> Result<Claud
 }
 
 fn usage_to_quota(raw: &Value) -> ClaudeQuota {
+    let limits_parsed = parse_official_usage_limits(raw);
     let five_hour = raw.get("five_hour");
     let seven_day = raw.get("seven_day");
     let seven_day_sonnet = raw
@@ -3354,31 +3170,50 @@ fn usage_to_quota(raw: &Value) -> ClaudeQuota {
         .and_then(|item| item.as_bool())
         .unwrap_or(false);
     let extra_usage_percentage = extra_enabled.then(|| {
-        clamp_percentage(
-            extra_usage
-                .and_then(|item| item.get("utilization"))
-                .and_then(|item| item.as_f64()),
-        )
+        clamp_percentage(read_f64_value(extra_usage.and_then(|item| item.get("utilization"))))
     });
 
+    let top_five_hour = five_hour
+        .and_then(|item| read_f64_value(item.get("utilization")))
+        .map(|val| clamp_percentage(Some(val)));
+    let top_five_hour_reset = parse_reset_seconds(five_hour.and_then(|item| item.get("resets_at")));
+    let top_seven_day = seven_day
+        .and_then(|item| read_f64_value(item.get("utilization")))
+        .map(|val| clamp_percentage(Some(val)));
+    let top_seven_day_reset = parse_reset_seconds(seven_day.and_then(|item| item.get("resets_at")));
+    let top_seven_day_sonnet = seven_day_sonnet
+        .and_then(|item| read_f64_value(item.get("utilization")))
+        .map(|val| clamp_percentage(Some(val)));
+    let top_seven_day_sonnet_reset =
+        parse_reset_seconds(seven_day_sonnet.and_then(|item| item.get("resets_at")));
+
     ClaudeQuota {
-        five_hour_percentage: clamp_percentage(
-            five_hour
-                .and_then(|item| item.get("utilization"))
-                .and_then(|item| item.as_f64()),
-        ),
-        five_hour_reset_time: parse_reset_seconds(five_hour.and_then(|item| item.get("resets_at"))),
-        seven_day_percentage: clamp_percentage(
-            seven_day
-                .and_then(|item| item.get("utilization"))
-                .and_then(|item| item.as_f64()),
-        ),
-        seven_day_reset_time: parse_reset_seconds(seven_day.and_then(|item| item.get("resets_at"))),
-        seven_day_sonnet_percentage: seven_day_sonnet
-            .map(|item| clamp_percentage(item.get("utilization").and_then(|value| value.as_f64()))),
-        seven_day_sonnet_reset_time: parse_reset_seconds(
-            seven_day_sonnet.and_then(|item| item.get("resets_at")),
-        ),
+        five_hour_percentage: limits_parsed
+            .five_hour_percentage
+            .or(top_five_hour)
+            .unwrap_or(0),
+        five_hour_reset_time: if limits_parsed.five_hour_percentage.is_some() {
+            limits_parsed.five_hour_reset_time.or(top_five_hour_reset)
+        } else {
+            top_five_hour_reset
+        },
+        seven_day_percentage: limits_parsed
+            .seven_day_percentage
+            .or(top_seven_day)
+            .unwrap_or(0),
+        seven_day_reset_time: if limits_parsed.seven_day_percentage.is_some() {
+            limits_parsed.seven_day_reset_time.or(top_seven_day_reset)
+        } else {
+            top_seven_day_reset
+        },
+        seven_day_sonnet_percentage: limits_parsed
+            .seven_day_sonnet_percentage
+            .or(top_seven_day_sonnet),
+        seven_day_sonnet_reset_time: if limits_parsed.seven_day_sonnet_percentage.is_some() {
+            limits_parsed.seven_day_sonnet_reset_time
+        } else {
+            top_seven_day_sonnet_reset
+        },
         extra_usage_percentage,
         extra_usage_reset_time: parse_reset_seconds(
             extra_usage.and_then(|item| item.get("resets_at")),
@@ -3589,13 +3424,45 @@ pub async fn refresh_account_quota(account_id: &str) -> Result<ClaudeAccount, St
         return save_account_and_index(account);
     }
 
+    if account.auth_mode == ClaudeAuthMode::OAuth
+        && account
+            .claude_credentials_raw
+            .as_ref()
+            .is_some_and(token_is_expired)
+    {
+        account = read_bound_cli_oauth_before_refresh(account_id).await?;
+        if account.auth_mode != ClaudeAuthMode::OAuth {
+            return Ok(account);
+        }
+    }
+
     let mut credentials = account
         .claude_credentials_raw
         .clone()
         .ok_or_else(|| "Claude 账号缺少 credentials 快照".to_string())?;
 
     if token_is_expired(&credentials) {
-        match refresh_oauth_credentials(&credentials).await {
+        let mut result = refresh_oauth_credentials(&credentials).await;
+        if account.auth_mode == ClaudeAuthMode::OAuth
+            && result.as_ref().is_err_and(|error| error.contains("\"invalid_grant\""))
+        {
+            account = read_bound_cli_oauth_before_refresh(account_id).await?;
+            if account.auth_mode != ClaudeAuthMode::OAuth {
+                return Ok(account);
+            }
+            let Some(newer) = account.claude_credentials_raw.as_ref() else {
+                return Ok(account);
+            };
+            if *newer != credentials {
+                credentials = newer.clone();
+                result = if token_is_expired(&credentials) {
+                    refresh_oauth_credentials(&credentials).await
+                } else {
+                    Ok(None)
+                };
+            }
+        }
+        match result {
             Ok(Some(refreshed)) => {
                 // Persist rotated credentials before the separate usage request can
                 // fail or time out, and update bound CLI instances off the async runtime.
@@ -3613,6 +3480,10 @@ pub async fn refresh_account_quota(account_id: &str) -> Result<ClaudeAccount, St
             }
             Ok(None) => {}
             Err(error) => {
+                logger::log_warn(&format!(
+                    "[Claude Quota] OAuth 续期失败: account_id={}",
+                    account_id
+                ));
                 account.quota_error = Some(ClaudeQuotaErrorInfo {
                     code: Some("refresh_failed".to_string()),
                     message: error,

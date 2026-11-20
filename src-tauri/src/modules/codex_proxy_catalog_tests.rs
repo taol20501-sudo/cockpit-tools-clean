@@ -1,4 +1,26 @@
 use super::*;
+
+#[path = "codex_proxy_catalog_live_tests.rs"]
+mod live_tests;
+
+#[test]
+fn parser_upgrade_refreshes_in_background_once_then_backs_off_on_failure() {
+    let mut source = fixture();
+    source.parser_version = PARSER_VERSION - 1;
+    source.updated_at = 100;
+    source.last_attempt_at = Some(100);
+    assert_eq!(due_sources(&[source.clone()], 101), vec![source.id.clone()]);
+    source.last_attempt_at = Some(101);
+    assert!(due_sources(&[source.clone()], 102).is_empty());
+    assert_eq!(
+        due_sources(&[source.clone()], 101 + REFRESH_INTERVAL_MS),
+        vec![source.id.clone()]
+    );
+    source.parser_version = PARSER_VERSION;
+    source.updated_at = 102;
+    source.last_attempt_at = Some(102);
+    assert!(due_sources(&[source], 103).is_empty());
+}
 struct Temp(PathBuf);
 impl Temp {
     fn new() -> Self {
@@ -31,6 +53,50 @@ fn fixture() -> Source {
         usage: None,
         parser_version: PARSER_VERSION,
     }
+}
+
+#[tokio::test]
+async fn network_settings_update_bound_accounts_without_reselecting_nodes() {
+    use crate::models::codex::{CodexAccount, CodexAccountIndex, CodexAccountSummary, CodexTokens};
+    use crate::modules::{codex_account, codex_proxy_runtime};
+
+    let _env = crate::modules::test_support::env_lock()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let temp = Temp::new();
+    let _dir = DataDir::set(&temp.0);
+    let source = fixture();
+    let mut index = CodexAccountIndex::new();
+    let mut snapshots = BTreeMap::new();
+    for (id, source_id) in [("network-bound", source.id.as_str()), ("network-other", "other")] {
+        let raw = binding::encode(source_id, &source.name, &source.catalog.nodes[0].id,
+            &source.catalog, &BTreeMap::new()).unwrap();
+        let mut account = CodexAccount::new(id.into(), format!("{id}@example.test"), CodexTokens {
+            access_token: "access".into(), id_token: "id".into(), refresh_token: Some("refresh".into()),
+        });
+        account.egress_proxy_url = Some(raw.clone());
+        codex_account::save_account(&account).unwrap();
+        index.accounts.push(CodexAccountSummary {
+            id: account.id, email: account.email, plan_type: None, subscription_active_until: None,
+            created_at: account.created_at, last_used: account.last_used,
+        });
+        snapshots.insert(id, raw);
+    }
+    codex_account::save_account_index(&index).unwrap();
+
+    let network = super::super::codex_proxy_network::NetworkOptions {
+        ipv6: Some(false),
+        ..Default::default()
+    };
+    codex_proxy_runtime::sync_source_network(&source.id, network).await.unwrap();
+    let read_snapshot = |id| codex_account::load_account(id).unwrap().egress_proxy_url.unwrap();
+    let updated = read_snapshot("network-bound");
+    assert_eq!(binding::decode(&updated).unwrap().network.ipv6, Some(false));
+    assert_eq!(
+        binding::outbounds(&updated).unwrap(),
+        binding::outbounds(&snapshots["network-bound"]).unwrap()
+    );
+    assert_eq!(read_snapshot("network-other"), snapshots["network-other"]);
 }
 
 #[tokio::test]
@@ -289,7 +355,7 @@ impl Drop for DataDir {
         restore_env("COCKPIT_TOOLS_DATA_DIR", self.data.take());
     }
 }
-/// 策略测试用的订阅来源：Alpha / Beta / Gamma 可用，TLS 因跳过证书校验未获授权而不可用。
+/// 策略测试用的订阅来源：普通节点与声明证书例外的 TLS 节点均可直接使用。
 fn subscription_fixture() -> Source {
     Source {
         id: "subscription-id".into(),
@@ -338,7 +404,7 @@ fn choices(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
 }
 fn selectable_catalog() -> ParsedCatalog {
     parser::parse(
-        "proxies:\n  - {name: Alpha, type: trojan, server: alpha.example, port: 443, password: private-alpha}\n  - {name: Beta, type: trojan, server: beta.example, port: 443, password: private-beta}\n  - {name: TLS, type: hysteria2, server: tls.example, port: 443, password: private-tls, skip-cert-verify: true}\nproxy-groups:\n  - {name: Manual, type: select, proxies: [TLS, Beta, Alpha]}\n  - {name: Auto, type: url-test, proxies: [Alpha, Beta]}\n  - {name: Broken, type: url-test, proxies: [TLS]}\n  - {name: Nested, type: select, proxies: [Alpha]}\n  - {name: Outer, type: url-test, proxies: [Nested]}",
+        "proxies:\n  - {name: Alpha, type: trojan, server: alpha.example, port: 443, password: private-alpha}\n  - {name: Beta, type: trojan, server: beta.example, port: 443, password: private-beta}\n  - {name: TLS, type: hysteria2, server: tls.example, port: 443, password: private-tls, config-path: /private/unsupported}\nproxy-groups:\n  - {name: Manual, type: select, proxies: [TLS, Beta, Alpha]}\n  - {name: Auto, type: url-test, proxies: [Alpha, Beta]}\n  - {name: Broken, type: url-test, proxies: [TLS]}\n  - {name: Nested, type: select, proxies: [Alpha]}\n  - {name: Outer, type: url-test, proxies: [Nested]}",
     )
     .unwrap()
 }
@@ -476,6 +542,7 @@ fn strategy_defaults_accept_every_strategy_group_kind() {
             .iter()
             .filter(|node| node.error.is_none())
             .map(|node| strategy::StrategyNode {
+                dependencies: None,
                 name: node.name.clone(),
                 protocol: node.protocol.clone(),
                 outbound: node.outbound.clone().unwrap(),
@@ -506,13 +573,10 @@ fn strategy_defaults_accept_every_strategy_group_kind() {
             "{kind}"
         );
         assert!(strategy::group_supported(strategy::KIND, kind), "{kind}");
-        if !matches!(kind, "select" | "url-test") {
-            assert_eq!(
-                default_error("subscription", &catalog, &group, &selections),
-                Some("CATALOG_INVALID"),
-                "订阅来源不得因为策略来源放宽而接受 {kind}"
-            );
-        }
+        assert!(
+            default_error("subscription", &catalog, &group, &selections).is_none(),
+            "{kind}"
+        );
     }
 }
 /// 刷新或权限变化后默认项失效只清除并标记，绝不静默换成别的节点。
@@ -741,7 +805,7 @@ fn catalog_read_recovers_derived_group_availability_without_rewriting_saved_data
 }
 
 #[test]
-fn retained_legacy_nodes_revalidate_without_granting_tls_permission_or_writing() {
+fn retained_legacy_nodes_accept_declared_tls_exceptions_without_writing() {
     let _env = crate::modules::test_support::env_lock()
         .lock()
         .unwrap_or_else(|e| e.into_inner());
@@ -750,15 +814,16 @@ fn retained_legacy_nodes_revalidate_without_granting_tls_permission_or_writing()
     let file = temp.0.join("catalog.json");
     let mut source = subscription_fixture();
     source.parser_version = 0;
+    source.auto_update = false;
     let tls = source
         .catalog
         .nodes
         .iter_mut()
         .find(|node| node.name == "TLS")
         .unwrap();
-    tls.error = Some("PROXY_UNSUPPORTED_OPTION".into());
+    tls.error = Some("PROXY_TLS_INSECURE".into());
     source.catalog.nodes[0].error = Some("PROXY_UNSUPPORTED_OPTION".into());
-    // A separate source contains an existing explicit permission.
+    // A second source confirms compatibility with previously accepted records.
     let mut approved = source.clone();
     approved.id = "approved".into();
     approved
@@ -781,13 +846,14 @@ fn retained_legacy_nodes_revalidate_without_granting_tls_permission_or_writing()
         "reading does not migrate or rewrite storage"
     );
     assert!(loaded.sources[0].catalog.nodes[0].error.is_none());
-    assert_eq!(
-        loaded.sources[0].catalog.nodes[3].error.as_deref(),
-        Some("PROXY_TLS_INSECURE")
+    assert!(loaded.sources[0].catalog.nodes[3].error.is_none());
+    assert!(
+        loaded.sources[0].auto_update,
+        "legacy false cannot disable valid subscription updates"
     );
     assert!(
         loaded.sources[1].catalog.nodes[3].error.is_none(),
-        "keep an existing explicit permission"
+        "keep a previously accepted node available"
     );
     assert!(view(&loaded)
         .sources
@@ -804,16 +870,20 @@ fn legacy_missing_definitions_request_explicit_refresh_but_current_rejections_do
     let mut current = legacy.clone();
     current.parser_version = PARSER_VERSION;
     current.id = "current".into();
+    let mut previous = legacy.clone();
+    previous.parser_version = 1;
+    previous.id = "previous".into();
     let mut serialized = serde_json::to_value(&legacy).unwrap();
     serialized.as_object_mut().unwrap().remove("parser_version");
     let legacy: Source = serde_json::from_value(serialized).unwrap();
     let store = Store {
-        sources: vec![legacy, current],
+        sources: vec![legacy, current, previous],
         ..Store::default()
     };
     let public = view(&store);
     assert!(public.sources[0].needs_refresh);
     assert!(!public.sources[1].needs_refresh);
+    assert!(public.sources[2].needs_refresh);
     assert!(!public.sources[0].nodes[3].supported);
     let json = serde_json::to_string(&public).unwrap();
     assert!(!json.contains("private-"));
@@ -827,31 +897,17 @@ fn group_permission_fixture() -> Source {
 }
 
 #[test]
-fn group_diagnostics_identify_tls_members_without_claiming_a_cycle() {
+fn group_diagnostics_accept_tls_exceptions_without_permission_issues() {
     let source = group_permission_fixture();
     let public = view(&Store {
         sources: vec![source],
         ..Store::default()
     });
     let group = &public.sources[0].groups[1];
-    assert!(!group.supported);
-    assert_eq!(group.error.as_deref(), Some("PROXY_TLS_INSECURE"));
-    assert_eq!(
-        group
-            .issues
-            .iter()
-            .map(|issue| (issue.name.as_str(), issue.error.as_str()))
-            .collect::<Vec<_>>(),
-        vec![
-            ("AT&T", "PROXY_TLS_INSECURE"),
-            ("Starlink", "PROXY_TLS_INSECURE")
-        ]
-    );
-    assert_eq!(
-        group.insecure_node_ids.len(),
-        2,
-        "shared descendants are not repeated"
-    );
+    assert!(group.supported);
+    assert!(group.error.is_none());
+    assert!(group.issues.is_empty());
+    assert!(group.insecure_node_ids.is_empty());
     assert_eq!(
         group.test_url.as_deref(),
         Some("https://check.example/group")
@@ -861,7 +917,7 @@ fn group_diagnostics_identify_tls_members_without_claiming_a_cycle() {
 }
 
 #[test]
-fn group_tls_permission_is_atomic_revision_checked_and_scoped_to_descendants() {
+fn legacy_group_tls_endpoint_is_revision_checked_and_cannot_disable_nodes() {
     let _env = crate::modules::test_support::env_lock()
         .lock()
         .unwrap_or_else(|e| e.into_inner());
@@ -905,11 +961,11 @@ fn group_tls_permission_is_atomic_revision_checked_and_scoped_to_descendants() {
                     .unwrap();
             assert!(allowed.sources[0].groups[0].supported);
             assert!(allowed.sources[0].groups[1].supported);
-            assert!(!allowed.sources[0].groups[2].supported);
+            assert!(allowed.sources[0].groups[2].supported);
             assert!(allowed.sources[0].nodes[1].supported && allowed.sources[0].nodes[2].supported);
             assert!(
-                !allowed.sources[0].nodes[3].supported,
-                "other groups are untouched"
+                allowed.sources[0].nodes[3].supported,
+                "other groups also accept their node-declared exceptions"
             );
             assert!(allowed.sources[0].groups[1].insecure_node_ids.is_empty());
             let binding = snapshot(source_id.clone(), group_id.clone(), BTreeMap::new())
@@ -937,8 +993,8 @@ fn group_tls_permission_is_atomic_revision_checked_and_scoped_to_descendants() {
             )
             .await
             .unwrap();
-            assert!(!revoked.sources[0].groups[1].supported);
-            assert_eq!(revoked.sources[0].groups[1].insecure_node_ids.len(), 2);
+            assert!(revoked.sources[0].groups[1].supported);
+            assert!(revoked.sources[0].groups[1].insecure_node_ids.is_empty());
         });
     assert!(
         binding::decode(&old_binding).is_ok(),
@@ -1003,8 +1059,8 @@ fn latency_uses_selected_group_url_only_for_its_own_subtree() {
         "CATALOG_INVALID"
     );
     assert!(
-        latency_target_url(&catalog, &catalog.nodes[1].id, Some(&us.id)).is_err(),
-        "pending permission cannot start a probe"
+        latency_target_url(&catalog, &catalog.nodes[1].id, Some(&us.id)).is_ok(),
+        "declared certificate exceptions can be probed directly"
     );
     assert!(latency_target_url(&catalog, &catalog.nodes[0].id, Some("missing")).is_err());
     for url in [
@@ -1027,7 +1083,7 @@ fn latency_uses_selected_group_url_only_for_its_own_subtree() {
 }
 
 #[test]
-fn latency_checks_only_target_reachability_while_group_permissions_remain_strict() {
+fn latency_checks_target_reachability_without_bypassing_group_structure() {
     let catalog = parser::parse("proxies:\n  - {name: Alpha, type: http, server: one.example, port: 8080}\n  - {name: Outside, type: http, server: other.example, port: 8080}\n  - {name: Pending, type: hysteria2, server: pending.example, port: 443, password: private-password, skip-cert-verify: true}\nproxy-groups:\n  - {name: MissingSibling, type: select, proxies: [Missing, Alpha, Pending], url: https://check.example/missing}\n  - {name: CycleSibling, type: select, proxies: [Loop, Child], url: https://check.example/cycle}\n  - {name: Loop, type: select, proxies: [Loop]}\n  - {name: Child, type: select, proxies: [Alpha, Pending]}\n").unwrap();
     let alpha = &catalog.nodes[0].id;
     let outside = &catalog.nodes[1].id;
@@ -1057,13 +1113,13 @@ fn latency_checks_only_target_reachability_while_group_permissions_remain_strict
             "CATALOG_INVALID"
         );
         assert_eq!(
-            latency_target_url(&catalog, pending, Some(&group.id)).unwrap_err(),
-            "CATALOG_INVALID"
+            latency_target_url(&catalog, pending, Some(&group.id)).unwrap(),
+            expected_url
         );
         assert_eq!(
             parser::reachable_nodes(&catalog, &group.id).err().unwrap(),
             structural_error,
-            "bulk certificate permissions still require the complete valid subtree"
+            "group binding still requires the complete valid subtree"
         );
     }
     assert_eq!(
@@ -1074,13 +1130,14 @@ fn latency_checks_only_target_reachability_while_group_permissions_remain_strict
 }
 #[test]
 fn urls_and_names_fail_with_safe_errors() {
-    assert!(subscription_url("https://example.com/s?token=secret").is_ok());
-    for input in [
-        "http://example.com/s?token=secret",
-        "file:///private/secret",
-        "https://user:secret@example.com/s",
-        "https://example.com/s#secret",
+    for url in [
+        "https://example.com/s?token=secret",
+        "http://example.com/sub",
+        "https://user:secret@example.com/sub#name",
     ] {
+        assert!(subscription_url(url).is_ok());
+    }
+    for input in ["file:///private/secret"] {
         assert_eq!(subscription_url(input).unwrap_err(), "CATALOG_URL");
     }
     assert!(valid_name("美国节点").is_ok());
@@ -1279,6 +1336,86 @@ async fn real_subscription_download_reports_only_counts() {
     assert!(supported_groups > 0, "no supported groups");
 }
 
+#[tokio::test]
+async fn subscription_download_distinguishes_http_denial_server_error_and_redirect() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    for (status, headers, expected) in [
+        (401, "", "CATALOG_DOWNLOAD_DENIED"),
+        (403, "", "CATALOG_DOWNLOAD_DENIED"),
+        (503, "", "CATALOG_DOWNLOAD"),
+        (
+            302,
+            "Location: file:///private/secret-token\r\n",
+            "CATALOG_REDIRECT",
+        ),
+    ] {
+        let server = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = server.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            let (mut socket, _) = server.accept().await.unwrap();
+            let mut request = [0; 4096];
+            socket.read(&mut request).await.unwrap();
+            let body = "private response with secret-token";
+            socket.write_all(format!(
+                "HTTP/1.1 {status} Test\r\n{headers}Content-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()
+            ).as_bytes()).await.unwrap();
+        });
+        let client = subscription_client_builder()
+            .https_only(false)
+            .no_proxy()
+            .build()
+            .unwrap();
+        let url = url::Url::parse(&format!("http://{address}/secret-token")).unwrap();
+        let error = fetch_with_client(client, url.clone(), url.origin())
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(error, expected, "only fixed error codes may escape");
+        task.await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn subscription_download_classifies_tls_connection_closed_and_timeout() {
+    use tokio::io::AsyncReadExt;
+    for (tls, expected) in [(true, "CATALOG_DOWNLOAD_TLS"), (false, "CATALOG_TIMEOUT")] {
+        let server = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = server.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            let (mut socket, _) = server.accept().await.unwrap();
+            let mut request = [0; 4096];
+            socket.read(&mut request).await.unwrap();
+            if !tls {
+                std::future::pending::<()>().await;
+            }
+            // EOF during ClientHello is a typed TLS error, even when Display
+            // contains only a platform-specific connection-closed message.
+        });
+        let client = subscription_client_builder()
+            .https_only(tls)
+            .no_proxy()
+            .timeout(Duration::from_millis(if tls { 2000 } else { 100 }))
+            .build()
+            .unwrap();
+        let scheme = if tls { "https" } else { "http" };
+        let url = url::Url::parse(&format!("{scheme}://{address}/private-token")).unwrap();
+        let error = fetch_with_client(client, url.clone(), url.origin())
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(error, expected);
+        task.abort();
+    }
+}
+
+#[test]
+fn subscription_download_dns_and_unknown_causes_remain_fixed_codes() {
+    let dns = std::io::Error::other("dns error: failed to lookup address private-token");
+    assert_eq!(download_cause_code(Some(&dns)), "CATALOG_DOWNLOAD_DNS");
+    let other = std::io::Error::other("connection reset private-token");
+    assert_eq!(download_cause_code(Some(&other)), "CATALOG_DOWNLOAD");
+}
+
 #[test]
 fn subscription_titles_decode_official_metadata_and_reject_paths() {
     use base64::Engine as _;
@@ -1396,27 +1533,33 @@ fn unnamed_import_partial_opt_in_duplicates_and_rename_preserve_bindings() {
             assert!(!disk.contains("private-password"));
             assert!(!disk.contains("private-user"));
             assert_eq!(list().await.unwrap().sources.len(), 1);
-            let network=super::super::codex_proxy_network::NetworkOptions{doh:true,interface:"en0".into()};
+            let network = super::super::codex_proxy_network::NetworkOptions {
+                doh: true,
+                dns_servers: vec!["https://dns.example.test/dns-query".into()],
+                ipv6: Some(false),
+                interface: "en0".into(),
+            };
             let saved=set_network(id.clone(),renamed.sources[0].revision.clone(),network.clone()).await.unwrap();
             assert!(saved.sources[0].network.interface.is_empty());
             let snap=snapshot(id.clone(),stored.catalog.nodes[0].id.clone(),BTreeMap::new()).await.unwrap();
             assert!(binding::decode(&snap).unwrap().network.doh);
             assert!(binding::decode(&snap).unwrap().network.interface.is_empty());
+            assert_eq!(binding::decode(&snap).unwrap().network.ipv6, Some(false));
+            assert_eq!(binding::decode(&snap).unwrap().network.dns_servers, network.dns_servers);
             assert!(!binding::decode(&frozen).unwrap().network.doh);
             assert!(set_network(id.clone(),renamed.sources[0].revision.clone(),network).await.is_err());
             let config="proxies:\n  - {name: TLS, type: hysteria2, server: example.test, port: 443, password: private-pass, skip-cert-verify: true}\nproxy-groups:\n  - {name: Group, type: select, proxies: [TLS]}";
             let pending=parser::parse(config).unwrap();let node_id=pending.nodes[0].id.clone();
             mutate(&path().unwrap(),|store|{store.sources[0].catalog=pending.clone();Ok(())}).unwrap();
-            assert!(snapshot(id.clone(),node_id.clone(),BTreeMap::new()).await.is_err());
+            assert!(snapshot(id.clone(),node_id.clone(),BTreeMap::new()).await.is_ok());
             let allowed=set_insecure(id.clone(),node_id.clone(),saved.sources[0].revision.clone(),true).await.unwrap();
             assert!(allowed.sources[0].nodes[0].supported);assert!(allowed.sources[0].groups[0].supported);
             let approved=snapshot(id.clone(),node_id.clone(),BTreeMap::new()).await.unwrap();
             assert_eq!(binding::outbounds(&approved).unwrap()[0]["proxy"]["skip-cert-verify"],true);
-            let old=source(&id).await.unwrap().catalog;
-            let mut same=pending.clone();preserve_permissions(&old,&mut same).unwrap();assert!(same.nodes[0].error.is_none());
-            let mut changed=pending.clone();changed.nodes[0].outbound.as_mut().unwrap()["proxy"]["password"]=serde_json::json!("different");preserve_permissions(&old,&mut changed).unwrap();assert_eq!(changed.nodes[0].error.as_deref(),Some("PROXY_TLS_INSECURE"));
+            let mut same=pending.clone();parser::revalidate_retained_nodes(&mut same);revalidate_groups(&mut same).unwrap();assert!(same.nodes[0].error.is_none());
+            let mut changed=pending.clone();changed.nodes[0].outbound.as_mut().unwrap()["proxy"]["password"]=serde_json::json!("different");parser::revalidate_retained_nodes(&mut changed);revalidate_groups(&mut changed).unwrap();assert!(changed.nodes[0].error.is_none());
             let revoked=set_insecure(id.clone(),node_id.clone(),allowed.sources[0].revision.clone(),false).await.unwrap();
-            assert!(!revoked.sources[0].nodes[0].supported);assert!(snapshot(id,node_id,BTreeMap::new()).await.is_err());
+            assert!(revoked.sources[0].nodes[0].supported);assert!(snapshot(id,node_id,BTreeMap::new()).await.is_ok());
             assert_eq!(binding::outbounds(&approved).unwrap()[0]["proxy"]["skip-cert-verify"],true);
 
         });
@@ -2142,7 +2285,7 @@ async fn strategy_update_never_replaces_a_vanished_source_node_with_its_copy() {
         "CATALOG_CHANGED"
     );
 
-    // 节点仍在但未获授权（跳过证书校验）：保持 CATALOG_INVALID。
+    // 节点仍在但包含禁止的直连绕过参数：保持 CATALOG_INVALID。
     mutate(&path().unwrap(), |store| {
         store
             .sources
@@ -2150,7 +2293,7 @@ async fn strategy_update_never_replaces_a_vanished_source_node_with_its_copy() {
             .find(|entry| entry.id == source.id)
             .unwrap()
             .catalog = parser::parse(
-            "proxies:\n  - {name: TLS, type: hysteria2, server: tls.example, port: 443, password: private-tls, skip-cert-verify: true}\n",
+            "proxies:\n  - {name: TLS, type: hysteria2, server: tls.example, port: 443, password: private-tls, config-path: /private/unsupported}\n",
         )
         .unwrap();
         Ok(())
@@ -2360,7 +2503,10 @@ async fn strategy_save_rejects_invalid_input_without_touching_the_store() {
     let _dir = DataDir::set(&temp.0);
     let source = subscription_fixture();
     mutate(&path().unwrap(), |store| {
-        store.sources.push(subscription_fixture());
+        let mut stored_source = subscription_fixture();
+        stored_source.catalog.nodes[3].outbound.as_mut().unwrap()["proxy"]["config-path"] =
+            serde_json::json!("/private/unsupported");
+        store.sources.push(stored_source);
         Ok(())
     })
     .unwrap();
@@ -2720,7 +2866,7 @@ async fn strategy_update_keeps_the_id_and_removal_drops_it_from_the_view() {
     assert!(stored().sources.iter().any(|s| s.id == source.id));
 }
 
-/// 策略来源没有 URL，永远不进入订阅自动刷新队列，也不能打开自动更新。
+/// 策略来源没有 URL，永远不进入订阅自动刷新队列。
 #[tokio::test]
 async fn strategy_sources_never_enter_the_auto_refresh_queue() {
     let _lock = crate::modules::test_support::env_lock()
@@ -2780,6 +2926,82 @@ async fn strategy_sources_never_enter_the_auto_refresh_queue() {
             .unwrap()
             .auto_update
     );
+}
+
+#[test]
+fn auto_refresh_ignores_legacy_opt_out_and_preserves_retry_interval_and_url_boundaries() {
+    let now = 2 * REFRESH_INTERVAL_MS;
+    let mut enabled = fixture();
+    enabled.id = "enabled".into();
+    enabled.auto_update = true;
+    let mut legacy_disabled = enabled.clone();
+    legacy_disabled.id = "legacy-disabled".into();
+    legacy_disabled.auto_update = false;
+    let mut recent_failure = legacy_disabled.clone();
+    recent_failure.id = "recent-failure".into();
+    recent_failure.error = Some("CATALOG_TIMEOUT".into());
+    recent_failure.last_attempt_at = Some(now - REFRESH_INTERVAL_MS + 1);
+    let mut due_retry = recent_failure.clone();
+    due_retry.id = "due-retry".into();
+    due_retry.last_attempt_at = Some(now - REFRESH_INTERVAL_MS);
+    let mut invalid_url = enabled.clone();
+    invalid_url.id = "invalid-url".into();
+    invalid_url.url = Some("file:///private/subscription".into());
+    let mut manual = enabled.clone();
+    manual.id = "manual".into();
+    manual.kind = "manual".into();
+    let mut no_url = enabled.clone();
+    no_url.id = "no-url".into();
+    no_url.url = None;
+    let sources = vec![
+        enabled,
+        legacy_disabled,
+        recent_failure,
+        due_retry,
+        invalid_url,
+        manual,
+        no_url,
+    ];
+    assert_eq!(
+        due_sources(&sources, now),
+        ["enabled", "legacy-disabled", "due-retry"]
+    );
+    assert!(
+        view(&Store {
+            sources,
+            ..Store::default()
+        })
+        .sources[1]
+            .auto_update
+    );
+}
+
+#[tokio::test]
+async fn legacy_subscription_toggle_cannot_disable_automatic_refresh() {
+    let _lock = crate::modules::test_support::env_lock()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let temp = Temp::new();
+    let _dir = DataDir::set(&temp.0);
+    let source = fixture();
+    let id = source.id.clone();
+    mutate(&path().unwrap(), |store| {
+        store.sources.push(source);
+        Ok(())
+    })
+    .unwrap();
+    let before = fs::read(path().unwrap()).unwrap();
+    let loaded = read(&path().unwrap()).unwrap();
+    assert!(loaded.sources[0].auto_update);
+    assert_eq!(
+        fs::read(path().unwrap()).unwrap(),
+        before,
+        "loading old flags never writes a migration"
+    );
+    let catalog = set_auto_update(id.clone(), false).await.unwrap();
+    assert!(catalog.sources[0].auto_update);
+    let stored = read(&path().unwrap()).unwrap();
+    assert_eq!(due_sources(&stored.sources, 2 * REFRESH_INTERVAL_MS), [id]);
 }
 
 /// 订阅用量头：只认已知键与十进制数字，缺失或非法字段一律降级为“没有数据”。
@@ -2882,4 +3104,42 @@ fn usage_is_exposed_only_for_subscription_sources() {
     // 序列化后的公开视图只带脱敏数字字段，不包含响应头原文。
     assert!(public.contains("\"usage\":{"), "{public}");
     assert!(!public.contains("subscription-userinfo"), "{public}");
+}
+
+#[path = "codex_proxy_subscription_tls_tests.rs"]
+mod tls_subscription;
+
+#[tokio::test]
+async fn subscription_cross_origin_redirect_drops_url_basic_auth() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let first = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let second = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let from = first.local_addr().unwrap();
+    let to = second.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        for (index, listener) in [first, second].into_iter().enumerate() {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            while !request.ends_with(b"\r\n\r\n") {
+                request.push(socket.read_u8().await.unwrap());
+                assert!(request.len() < 8192);
+            }
+            let request = String::from_utf8(request).unwrap().to_ascii_lowercase();
+            assert_eq!(request.contains("authorization: basic "), index == 0);
+            let response = if index == 0 {
+                format!("HTTP/1.1 302 Found\r\nLocation: http://{to}/subscription\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+            } else {
+                "HTTP/1.1 200 OK\r\nContent-Length: 11\r\nConnection: close\r\n\r\nproxies: []"
+                    .into()
+            };
+            socket.write_all(response.as_bytes()).await.unwrap();
+        }
+    });
+    let url = url::Url::parse(&format!("http://synthetic:password@{from}/sub")).unwrap();
+    let client = subscription_client_builder().no_proxy().build().unwrap();
+    let downloaded = fetch_with_client(client, url.clone(), url.origin())
+        .await
+        .unwrap();
+    assert_eq!(downloaded.body, "proxies: []");
+    server.await.unwrap();
 }
