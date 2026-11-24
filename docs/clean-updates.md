@@ -6,6 +6,8 @@ do not override these Clean safeguards.
 - `Sync Upstream` checks upstream main every three hours (GitHub schedules may be delayed).
 - It merges upstream code, preserves the Clean application identity and updater
   public key, and runs `scripts/verify-clean-edition.cjs` before pushing.
+- The scheduled merge preserves Clean's GitHub workflows, composite actions and
+  release workflow tests. Review upstream CI changes separately before porting them.
 - Known sponsor sections in the top-level READMEs and referral parameters in
   the APIKEY registration constant are normalized before a three-way merge.
   Upstream domain changes and ordinary documentation changes still merge.
